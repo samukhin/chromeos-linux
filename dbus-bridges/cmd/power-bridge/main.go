@@ -253,11 +253,7 @@ func (p *powerManager) setScreenBrightness(percent float64) {
 }
 
 func systemctlAction(action string) {
-	systemctl := "systemctl"
-	if _, err := os.Stat("/run/current-system/sw/bin/systemctl"); err == nil {
-		systemctl = "/run/current-system/sw/bin/systemctl"
-	}
-	if err := exec.Command(systemctl, action).Run(); err != nil {
+	if err := exec.Command("systemctl", action).Run(); err != nil {
 		log.Printf("systemctl %s: %v", action, err)
 	}
 }
@@ -403,9 +399,6 @@ func readFloatFile(path string) (float64, error) {
 
 func applyXrandrBrightness(percent float64) error {
 	xrandr := "xrandr"
-	if _, err := os.Stat("/run/current-system/sw/bin/xrandr"); err == nil {
-		xrandr = "/run/current-system/sw/bin/xrandr"
-	}
 	outputs, err := connectedXrandrOutputs(xrandr)
 	if err != nil {
 		return err

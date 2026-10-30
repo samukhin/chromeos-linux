@@ -2,9 +2,13 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -66,13 +70,58 @@ func (s *sessionManager) StartSessionEx(accountID, uniqueID string, chromeOwnerK
 	return nil
 }
 
+// Ash signals "sign out" by calling StopSession / StopSessionWithReason on
+// org.chromium.SessionManager. On real ChromeOS that hands control back to the
+// login manager; here there is no login screen, so the correct behaviour is to
+// shut the whole session down. The session script publishes its pid to
+// $XDG_RUNTIME_DIR/chromeos-linux-session.pid and installs a TERM trap that
+// tears down Chrome, sommelier, Xwayland and (if it started it) Xorg — so we
+// just signal it and let that cleanup run. Without this, logout left Chrome
+// alive on a black screen and the user had to kill everything by hand.
+func requestSessionShutdown(reason string) {
+	pid, ok := sessionScriptPID()
+	if !ok {
+		log.Printf("%s: no live session pid file — nothing to shut down", reason)
+		return
+	}
+	log.Printf("%s: signalling session script (pid %d) to shut down", reason, pid)
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		log.Printf("%s: kill %d: %v", reason, pid, err)
+	}
+}
+
+func sessionScriptPID() (int, bool) {
+	var candidates []string
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		candidates = append(candidates, filepath.Join(dir, "chromeos-linux-session.pid"))
+	}
+	// Fallback when the bridge's env lacks XDG_RUNTIME_DIR but runs as the same
+	// user: the runtime dir is always /run/user/<uid>.
+	candidates = append(candidates, fmt.Sprintf("/run/user/%d/chromeos-linux-session.pid", os.Getuid()))
+	for _, p := range candidates {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+			// Confirm it is actually alive so we never signal a recycled pid.
+			if err := syscall.Kill(pid, 0); err == nil {
+				return pid, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func (s *sessionManager) StopSession(uniqueID string) (bool, *dbus.Error) {
 	log.Println("StopSession")
+	requestSessionShutdown("StopSession")
 	return true, nil
 }
 
 func (s *sessionManager) StopSessionWithReason(reason uint32) *dbus.Error {
 	log.Printf("StopSessionWithReason: %d", reason)
+	requestSessionShutdown("StopSessionWithReason")
 	return nil
 }
 

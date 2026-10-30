@@ -50,33 +50,61 @@ const (
 
 var appDirs []string
 
+// xdgDataDirs returns $XDG_DATA_DIRS, split, with the freedesktop default
+// used when the environment does not set it.
+func xdgDataDirs() []string {
+	dirs := os.Getenv("XDG_DATA_DIRS")
+	if dirs == "" {
+		dirs = "/usr/local/share:/usr/share"
+	}
+	var out []string
+	for _, d := range strings.Split(dirs, ":") {
+		if d = strings.TrimSpace(d); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// xdgDataDirsEnv is the XDG_DATA_DIRS value handed to launched apps: the
+// session's data dirs plus the user's own.
+func xdgDataDirsEnv() string {
+	dirs := xdgDataDirs()
+	if home := os.Getenv("HOME"); home != "" {
+		dirs = append([]string{filepath.Join(home, ".local/share")}, dirs...)
+	}
+	return strings.Join(dirs, ":")
+}
+
 func init() {
-	home := os.Getenv("HOME")
-	user := os.Getenv("USER")
-	appDirs = []string{
-		"/run/current-system/sw/share/applications",
+	seenDirs := map[string]bool{}
+	addDir := func(p string) {
+		if p != "" && !seenDirs[p] {
+			seenDirs[p] = true
+			appDirs = append(appDirs, p)
+		}
+	}
+	for _, d := range xdgDataDirs() {
+		addDir(filepath.Join(d, "applications"))
+	}
+	for _, d := range []string{
 		"/usr/share/applications",
 		"/usr/local/share/applications",
 		"/etc/xdg/applications",
+	} {
+		addDir(d)
 	}
-	if home != "" {
-		appDirs = append(appDirs, home+"/.local/share/applications")
-	}
-	if user != "" {
-		appDirs = append(appDirs, "/etc/profiles/per-user/"+user+"/share/applications")
+	if home := os.Getenv("HOME"); home != "" {
+		addDir(filepath.Join(home, ".local/share/applications"))
 	}
 
 	extraPaths := []string{
-		"/run/current-system/sw/bin",
 		"/usr/local/bin",
 		"/usr/bin",
 		"/bin",
 	}
-	if home != "" {
-		extraPaths = append(extraPaths, home+"/.nix-profile/bin")
-	}
-	if user != "" {
-		extraPaths = append(extraPaths, "/etc/profiles/per-user/"+user+"/bin")
+	if home := os.Getenv("HOME"); home != "" {
+		extraPaths = append(extraPaths, filepath.Join(home, ".local/bin"))
 	}
 	envPath := os.Getenv("PATH")
 	seen := map[string]bool{}
@@ -479,10 +507,14 @@ func launchApp(app desktopApp) error {
 		"PATH=" + appPath,
 		"GDK_BACKEND=x11",
 		"QT_QPA_PLATFORM=xcb",
-		"XDG_DATA_DIRS=/run/opengl-driver/share:/run/current-system/sw/share:/usr/share",
+		"XDG_DATA_DIRS=" + xdgDataDirsEnv(),
 		"XDG_RUNTIME_DIR=" + xdgRuntimeDir(),
 	}
-	cmd.Env = append(overrides, os.Environ()...)
+	// Overrides go LAST: os/exec de-duplicates env keys in favour of the final
+	// occurrence, so if these came first the inherited DISPLAY=:0 (etc.) from
+	// os.Environ() would win and apps would land on the host X server instead of
+	// the :10 Xwayland they must render into.
+	cmd.Env = append(os.Environ(), overrides...)
 	return cmd.Start()
 }
 
@@ -507,7 +539,18 @@ func (v *vmConcierge) StartVm(req []byte, fds []dbus.UnixFD) ([]byte, *dbus.Erro
 func (v *vmConcierge) GetVmLaunchAllowed(req []byte) ([]byte, *dbus.Error) {
 	learnOwnerID("GetVmLaunchAllowed", decodeStringFields(req))
 	log.Printf("GetVmLaunchAllowed called")
-	return appendBool(nil, 1, true), nil // allowed = true
+	// CrostiniManager::OnCheckVmLaunchAllowed does
+	// is_vm_launch_allowed_ = response->allowed(), overwriting the `true`
+	// default with whatever we send. If that reads false, every Crostini
+	// launch is refused with the SAME "Virtualization is not supported on
+	// this device" reason the /dev/kvm gate uses, so one failure masks the
+	// other. This proto is lite (no field names recoverable from the
+	// binary), and field 1 may be `success` (as in other concierge
+	// responses) rather than `allowed`, so set BOTH bool fields true: gate 2
+	// then passes whether `allowed` is field 1 or field 2.
+	b := appendBool(nil, 1, true)
+	b = appendBool(b, 2, true)
+	return b, nil
 }
 
 func (v *vmConcierge) ListVms(req []byte) ([]byte, *dbus.Error) {
@@ -592,60 +635,43 @@ func getDesktopIcon(id string) string {
 }
 
 func findIconFile(iconName string, size int) []byte {
-	home := os.Getenv("HOME")
-	user := os.Getenv("USER")
+	bases := xdgDataDirs()
+	if home := os.Getenv("HOME"); home != "" {
+		bases = append(bases, filepath.Join(home, ".local/share"))
+	}
 
 	sizes := []int{size, 64, 128, 48, 32, 256}
 	seen := map[string]bool{}
 	for _, s := range sizes {
-		paths := []string{
-			fmt.Sprintf("/run/current-system/sw/share/icons/hicolor/%dx%d/apps/%s.png", s, s, iconName),
-			fmt.Sprintf("/usr/share/icons/hicolor/%dx%d/apps/%s.png", s, s, iconName),
-			fmt.Sprintf("/run/current-system/sw/share/pixmaps/%s.png", iconName),
-			fmt.Sprintf("/usr/share/pixmaps/%s.png", iconName),
-		}
-		if user != "" {
-			paths = append(paths,
-				fmt.Sprintf("/etc/profiles/per-user/%s/share/icons/hicolor/%dx%d/apps/%s.png", user, s, s, iconName),
-				fmt.Sprintf("/etc/profiles/per-user/%s/share/pixmaps/%s.png", user, iconName))
-		}
-		if home != "" {
-			paths = append(paths,
-				fmt.Sprintf("%s/.local/share/icons/hicolor/%dx%d/apps/%s.png", home, s, s, iconName),
-				fmt.Sprintf("%s/.local/share/pixmaps/%s.png", home, iconName))
-		}
-		if s == sizes[0] {
-			paths = append(paths,
-				fmt.Sprintf("/run/current-system/sw/share/icons/hicolor/scalable/apps/%s.svg", iconName),
-				fmt.Sprintf("/usr/share/icons/hicolor/scalable/apps/%s.svg", iconName))
-			if user != "" {
+		for _, base := range bases {
+			paths := []string{
+				filepath.Join(base, "icons", "hicolor", fmt.Sprintf("%dx%d", s, s), "apps", iconName+".png"),
+				filepath.Join(base, "pixmaps", iconName+".png"),
+			}
+			if s == sizes[0] {
 				paths = append(paths,
-					fmt.Sprintf("/etc/profiles/per-user/%s/share/icons/hicolor/scalable/apps/%s.svg", user, iconName))
+					filepath.Join(base, "icons", "hicolor", "scalable", "apps", iconName+".svg"))
 			}
-			if home != "" {
-				paths = append(paths,
-					fmt.Sprintf("%s/.local/share/icons/hicolor/scalable/apps/%s.svg", home, iconName))
-			}
-		}
-		for _, path := range paths {
-			if seen[path] {
-				continue
-			}
-			seen[path] = true
-			data, err := os.ReadFile(path)
-			if err != nil {
-				continue
-			}
-			if strings.HasSuffix(path, ".svg") {
-				cmd := exec.Command("rsvg-convert", "--width", fmt.Sprintf("%d", size),
-					"--height", fmt.Sprintf("%d", size), "-f", "png", path)
-				pngData, err := cmd.Output()
-				if err == nil && len(pngData) > 0 {
-					return pngData
+			for _, path := range paths {
+				if seen[path] {
+					continue
+				}
+				seen[path] = true
+				data, err := os.ReadFile(path)
+				if err != nil {
+					continue
+				}
+				if strings.HasSuffix(path, ".svg") {
+					cmd := exec.Command("rsvg-convert", "--width", fmt.Sprintf("%d", size),
+						"--height", fmt.Sprintf("%d", size), "-f", "png", path)
+					pngData, err := cmd.Output()
+					if err == nil && len(pngData) > 0 {
+						return pngData
+					}
+					return data
 				}
 				return data
 			}
-			return data
 		}
 	}
 	return nil

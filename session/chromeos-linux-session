@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# ChromeOS Ash desktop session on stock Linux.
+#
+# Ported from the `chromeosLinuxSession` package in the old flake.nix:
+# prepares the profile, brings up sommelier/Xwayland, injects the Terminal UI
+# and runs the patched Ash Chrome in a restart loop.
+#
+# Runs entirely from the repository tree — no Nix store paths, no
+# /run/current-system, no /run/opengl-driver.
+set -u
+
+ASH_ROOT="${ASH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+BIN="$ASH_ROOT/dist/bin"
+CHROME="$ASH_ROOT/dist/chrome/chromeos-ash"
+SOMMELIER="$ASH_ROOT/dist/sommelier/bin/sommelier"
+PROFILE="${ASH_PROFILE_DIR:-/var/lib/ash-profile}"
+TEST_USER="${ASH_LOGIN_PROFILE:-test-user}"
+
+VM_DISPLAY_BOUNDS="${ASH_DISPLAY_SIZE:-1920x1080}"
+LOGIN_USER="${ASH_LOGIN_USER:-linux@local}"
+
+log() { printf '[session] %s\n' "$*" >&2; }
+die() { printf '[session] error: %s\n' "$*" >&2; exit 1; }
+
+XORG_PID=""          # non-empty only if THIS script started Xorg (never kill an inherited display)
+XORG_AUTH=""         # cookie file handed to THAT Xorg; removed with it (startx does the same)
+chrome_pid=""        # live Chrome, so a single kill/teardown can reap it
+sommelier_bg=""      # the Xwayland/sommelier supervisor subshell
+fast_fail=0          # consecutive quick Chrome failures, to break the respawn loop
+
+# Is the X display Chrome needs still there? Logout/host shutdown can remove the
+# socket; respawning Chrome into a dead display is exactly what caused the old
+# infinite "platform failed to initialize" respawn spin.
+display_alive() {
+  local d="${DISPLAY:-}" n
+  case "$d" in *:*) ;; *) return 1 ;; esac
+  n="${d##*:}"; n="${n%%.*}"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ -S "/tmp/.X11-unix/X$n" ]
+}
+
+# Between restarts: reap the compositor (sommelier + Xwayland) but KEEP Xorg so
+# the next iteration can reuse it. Deliberately does not touch XORG_PID.
+stop_compositor() {
+  [ -n "$sommelier_bg" ] && kill "$sommelier_bg" 2>/dev/null
+  sommelier_bg=""
+  pkill -x sommelier 2>/dev/null || true
+  pkill -x Xwayland 2>/dev/null || true
+  return 0
+}
+
+# Full teardown on EXIT/INT/TERM. Without this, killing the session leaked
+# Chrome, sommelier and Xwayland (start-session.sh only pkills dist/bin/), which
+# is why a logout used to need a pile of manual kills in the TTY.
+cleanup() {
+  [ -n "$chrome_pid" ] && kill "$chrome_pid" 2>/dev/null
+  stop_compositor
+  if [ -n "$XORG_PID" ]; then
+    kill "$XORG_PID" 2>/dev/null
+    XORG_PID=""
+    # Our cookie file only served that Xorg; drop it like startx does.
+    [ -n "$XORG_AUTH" ] && rm -f "$XORG_AUTH"
+    XORG_AUTH=""
+  fi
+  # Remove the pid file so session-bridge never signals a dead script.
+  [ -n "${SESSION_PID_FILE:-}" ] && rm -f "$SESSION_PID_FILE"
+  return 0
+}
+
+# --- environment -----------------------------------------------------------
+
+ensure_runtime_dir() {
+  if [ -d "/run/user/$(id -u)" ]; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  else
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/xdg-runtime-$(id -u)}"
+    mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+    chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+  fi
+  export XDG_RUNTIME_DIR
+}
+
+setup_display_auth() {
+  # Prefer the real cookie, fall back to LightDM's copy (as the Nix module did
+  # from its display-setup-script), and only then open the display up.
+  if [ -n "${XAUTHORITY:-}" ] && [ -r "${XAUTHORITY}" ]; then
+    cp "${XAUTHORITY}" /tmp/ash-xauth 2>/dev/null || true
+  elif [ -r /var/run/lightdm/root/:0 ]; then
+    cp /var/run/lightdm/root/:0 /tmp/ash-xauth 2>/dev/null || true
+  else
+    xhost +local: >/dev/null 2>&1 || xhost + >/dev/null 2>&1 || true
+  fi
+  [ -e /tmp/ash-xauth ] || : > /tmp/ash-xauth
+  chmod 644 /tmp/ash-xauth 2>/dev/null || true
+}
+
+# First FREE display number: free means neither the lock file nor the socket
+# exists — the same rule /usr/bin/startx uses when picking its display. Neither
+# this script nor startx may assume :0: a real session here has landed on :1.
+# Returns 1 if :0-:63 are all taken.
+first_free_display() {
+  local n
+  for ((n = 0; n < 64; n++)); do
+    if [ ! -e "/tmp/.X${n}-lock" ] && [ ! -S "/tmp/.X11-unix/X${n}" ]; then
+      printf '%s' "$n"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Fallback: only reached if we are running with NO $DISPLAY at all (normally
+# start-session.sh has already re-exec'd us under startx, which sets one). Used
+# to force ":0 -ac"; both were wrong — :0 collides with a busy display, and -ac
+# opens the server to every local process. Now we mirror startx exactly: mint a
+# MIT-MAGIC-COOKIE, hand it to the server via -auth (access control ON), and
+# export XAUTHORITY so setup_display_auth() below copies the cookie to
+# /tmp/ash-xauth for Chrome. Without a cookie xhost could not even connect to
+# open the display later (it authenticates too), so the cookie is what makes the
+# no--ac path work.
+start_x_if_needed() {
+  if [ -n "${DISPLAY:-}" ]; then
+    log "using existing X display $DISPLAY"
+    return 0
+  fi
+  if ! command -v Xorg >/dev/null 2>&1 && ! command -v X >/dev/null 2>&1; then
+    die "no DISPLAY and no Xorg to start — log into an X session first, or install xserver-xorg"
+  fi
+  local xbin n authfile cookie i
+  xbin="$(command -v Xorg || command -v X)"
+  n="$(first_free_display)" || die "no free X display (:0-:63 all taken)"
+  command -v mcookie >/dev/null 2>&1 ||
+    die "mcookie missing — cannot start X with access control (install util-linux)"
+  command -v xauth  >/dev/null 2>&1 ||
+    die "xauth missing — cannot start X with access control (install xorg-xauth)"
+  authfile="$PROFILE/serverauth.$$"
+  cookie="$(mcookie)"
+  rm -f "$authfile"
+  xauth -q -f "$authfile" add ":$n" . "$cookie" ||
+    die "could not write $authfile — cannot start X"
+  chmod 600 "$authfile" 2>/dev/null || true
+  export XAUTHORITY="$authfile"
+  XORG_AUTH="$authfile"
+  log "no DISPLAY, starting $xbin :$n (log: $PROFILE/xorg.log)"
+  "$xbin" ":$n" -auth "$authfile" -nolisten tcp >"${PROFILE}/xorg.log" 2>&1 &
+  XORG_PID=$!
+  for i in $(seq 1 50); do
+    if [ -S "/tmp/.X11-unix/X${n}" ]; then
+      export DISPLAY=":$n"
+      log "X server is up on :$n (log: $PROFILE/xorg.log)"
+      return 0
+    fi
+    sleep 0.2
+  done
+  die "failed to start an X server on :$n — see $PROFILE/xorg.log"
+}
+
+detect_display_bounds() {
+  if [ -n "${ASH_DISPLAY_BOUNDS:-}" ] && printf '%s' "$ASH_DISPLAY_BOUNDS" | grep -Eq '^[0-9]+x[0-9]+$'; then
+    printf '%s\n' "$ASH_DISPLAY_BOUNDS"
+    return
+  fi
+
+  local bounds
+  bounds="$(xrandr --current 2>/dev/null | awk '
+    / connected primary/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9]+x[0-9]+[+][0-9]+[+][0-9]+/) {
+          sub(/[+].*/, "", $i)
+          found = 1
+          print $i
+          exit
+        }
+      }
+    }
+    / connected/ && fallback == "" {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9]+x[0-9]+[+][0-9]+[+][0-9]+/) {
+          split($i, parts, "+")
+          fallback = parts[1]
+        }
+      }
+    }
+    END { if (!found && fallback != "") print fallback }
+  ')"
+  if printf '%s' "$bounds" | grep -Eq '^[0-9]+x[0-9]+$'; then
+    printf '%s\n' "$bounds"
+    return
+  fi
+  printf '%s\n' "$VM_DISPLAY_BOUNDS"
+}
+
+apply_display_bounds() {
+  local mode=$1 output
+  printf '%s' "$mode" | grep -Eq '^[0-9]+x[0-9]+$' || return 0
+  if [ -n "${ASH_XRANDR_OUTPUT:-}" ]; then
+    output="$ASH_XRANDR_OUTPUT"
+  else
+    output="$(xrandr --current 2>/dev/null | awk '/ connected primary/ { print $1; exit }')"
+    if [ -z "$output" ]; then
+      output="$(xrandr --current 2>/dev/null | awk '/ connected/ { print $1; exit }')"
+    fi
+  fi
+  [ -n "$output" ] || return 0
+  xrandr --output "$output" --mode "$mode" 2>/dev/null ||
+    log "note: could not set $output to $mode (continuing)"
+}
+
+# --- profile ---------------------------------------------------------------
+
+prepare_profile() {
+  mkdir -p "$PROFILE" || die "cannot create profile dir $PROFILE (run scripts/setup-system.sh once)"
+  mkdir -p "$PROFILE/$TEST_USER"
+  export CHROMEOS_SESSION_LOG_DIR="$PROFILE/$TEST_USER/log"
+  mkdir -p "$CHROMEOS_SESSION_LOG_DIR"
+
+  # Skip OOBE and make Chrome treat this profile as cleanly shut down.
+  touch "$PROFILE/First Run"
+  touch "$PROFILE/.oobe_completed"
+  if [ ! -f "$PROFILE/Local State" ]; then
+    printf '%s\n' '{"OOBE":{"oobe_complete":true},"help_app":{"showed_in_oobe":true}}' \
+      > "$PROFILE/Local State"
+  fi
+  rm -f "$PROFILE/$TEST_USER/AccountManagerTokens.bin" \
+        "$PROFILE/$TEST_USER/trusted_vault.pb"
+
+  perl -MJSON::PP -0777 -i -pe '
+    my $j = eval { decode_json($_) };
+    if ($j) {
+      delete $j->{sync}{cached_persistent_auth_error};
+      delete $j->{sync}{gaia_id};
+      delete $j->{sync}{transport_data_per_account};
+      $j->{google}{services}{consented_to_sync} = JSON::PP::false if ref $j->{google}{services} eq "HASH";
+      $j->{signin}{sync_paused_start_time} = "" if ref $j->{signin} eq "HASH";
+      delete $j->{multidevice_setup};
+      $j->{crostini}{enabled} = JSON::PP::true;
+      $j->{crostini}{linux_packages_enabled} = JSON::PP::true;
+      $j->{profile}{exit_type} = "Normal";
+      $j->{profile}{exited_cleanly} = JSON::PP::true;
+      $j->{sessions}{event_log} = [];
+      $_ = encode_json($j);
+    }
+  ' "$PROFILE/$TEST_USER/Preferences" 2>/dev/null || true
+
+  perl -MJSON::PP -0777 -i -pe '
+    my $j = eval { decode_json($_) };
+    if ($j) {
+      delete $j->{signin}{active_accounts};
+      delete $j->{signin}{active_accounts_last_emitted};
+      $j->{profile}{info_cache}{$ENV{ASH_LOGIN_PROFILE}}{is_consented_primary_account} = JSON::PP::false
+        if ref $j->{profile}{info_cache}{$ENV{ASH_LOGIN_PROFILE}} eq "HASH";
+      $_ = encode_json($j);
+    }
+  ' "$PROFILE/Local State" 2>/dev/null || true
+}
+
+# --- main loop -------------------------------------------------------------
+
+for tool in xrandr xrdb curl perl awk pgrep pkill; do
+  command -v "$tool" >/dev/null 2>&1 ||
+    { echo "[session] missing '$tool'" >&2; exit 1; }
+done
+[ -x "$CHROME" ]   || die "patched chrome missing — run: make chrome"
+[ -x "$SOMMELIER" ] || die "sommelier missing — run: make sommelier"
+[ -x "$BIN/register-apps" ] || die "bridges missing — run: make bridges"
+command -v Xwayland >/dev/null 2>&1 ||
+  log "WARNING: Xwayland not in PATH — Linux apps will not render (install xwayland)"
+
+export ASH_LOGIN_PROFILE="$TEST_USER"
+prepare_profile
+ensure_runtime_dir
+start_x_if_needed
+setup_display_auth
+
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY=/tmp/ash-xauth
+export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+log "runtime=$XDG_RUNTIME_DIR display=$DISPLAY profile=$PROFILE"
+
+# Reap Chrome/compositor/Xorg(ours) on any teardown path — a plain `kill` of
+# this script must not leak them (that was the "long list of kills in the TTY").
+trap cleanup EXIT
+trap 'log "interrupted"; exit 130' INT
+trap 'log "terminated";  exit 143' TERM
+
+# Publish our pid so session-bridge can request a clean shutdown. When the user
+# signs out, Ash calls StopSessionWithReason on org.chromium.SessionManager; the
+# bridge signals THIS script (SIGTERM) instead of leaving Chrome alive on a black
+# screen. cleanup() removes the file on the way out.
+SESSION_PID_FILE="$XDG_RUNTIME_DIR/chromeos-linux-session.pid"
+printf '%s\n' "$$" >"$SESSION_PID_FILE" || log "WARNING: could not write $SESSION_PID_FILE"
+
+while true; do
+  rm -f "$XDG_RUNTIME_DIR/wayland-0" "$XDG_RUNTIME_DIR/wayland-0.lock" \
+        "$XDG_RUNTIME_DIR/wayland-1" "$XDG_RUNTIME_DIR/wayland-1.lock" \
+        /tmp/.X10-lock /tmp/.X11-unix/X10 2>/dev/null || true
+
+  mkdir -p "$PROFILE/$TEST_USER"
+  "$BIN/register-apps" "$PROFILE/$TEST_USER/Preferences" >&2 || true
+
+  # Terminal UI injection (waits for the CDP port, then reloads the page).
+  perl "$ASH_ROOT/session/terminal-inject.pl" "$ASH_ROOT/terminal/terminal-ui.js" \
+    >/dev/null 2>&1 &
+
+  # Xwayland :10 in front of the Ash-hosted compositor.
+  (
+    while true; do
+      while [ ! -S "$XDG_RUNTIME_DIR/wayland-0" ]; do sleep 0.5; done
+      until curl -fsS --max-time 1 http://127.0.0.1:9222/json/version >/dev/null 2>&1; do
+        sleep 0.5
+      done
+      pkill -x Xwayland 2>/dev/null || true
+      rm -f "$XDG_RUNTIME_DIR/wayland-1" "$XDG_RUNTIME_DIR/wayland-1.lock" \
+            /tmp/.X10-lock /tmp/.X11-unix/X10
+      (
+        for _ in $(seq 1 10); do
+          DISPLAY=:10 xrdb -merge /dev/null 2>/dev/null && {
+            printf '%s\n' \
+              'XTerm*background: black' \
+              'XTerm*foreground: white' \
+              '*background: black' \
+              '*foreground: white' | DISPLAY=:10 xrdb -merge 2>/dev/null || true
+            break
+          }
+          sleep 0.5
+        done
+      ) &
+      SOMMELIER_DISPLAY=wayland-0 \
+      WAYLAND_DISPLAY=wayland-0 \
+      XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        "$SOMMELIER" \
+          --noop-driver \
+          -X \
+          --socket=wayland-1 \
+          --x-display=10 \
+          --xwayland-path="$(command -v Xwayland || echo /usr/bin/Xwayland)" \
+          --vm-identifier=termina \
+          --no-exit-with-child \
+          -- sleep infinity \
+          2>>"$PROFILE/sommelier.log" || true
+      sleep 1
+    done
+  ) &
+  sommelier_bg=$!
+
+  apply_display_bounds "${ASH_DISPLAY_BOUNDS:-}"
+  ASH_HOST_WINDOW_BOUNDS="$(detect_display_bounds)"
+
+  login_flags=()
+  if [ "${ASH_DIRECT_LOGIN:-1}" = "1" ]; then
+    login_flags+=(--login-user="$LOGIN_USER" --login-profile="$TEST_USER")
+  elif [ "${ASH_LOGIN_MANAGER:-0}" = "1" ]; then
+    login_flags+=(--login-manager --oobe-skip-to-login)
+  fi
+
+  log "starting Ash (bounds=$ASH_HOST_WINDOW_BOUNDS)"
+  chrome_start=$(date +%s)
+  "$CHROME" \
+    --ash-dev-shortcuts \
+    --no-sandbox \
+    --disable-setuid-sandbox \
+    --disable-gpu-sandbox \
+    --disable-stack-profiler \
+    --disable-mojo-broker \
+    --enable-wayland-server \
+    --wayland-server-socket=wayland-0 \
+    --enable-features=Crostini \
+    --disable-features=SamplingProfiler,AccountConsistency,SigninInterception,SampleSystemWebApp,PhoneHub,PhoneHubCameraRoll,PhoneHubNotifications,PhoneHubTaskContinuation,EcheSWA,NearbyShare \
+    --disable-sync \
+    --disable-gaia-services \
+    --disable-signin-scoped-device-id \
+    --allow-failed-policy-fetch-for-test \
+    --ignore-user-profile-mapping-for-tests \
+    --no-first-run \
+    --remote-debugging-port=9222 \
+    --ignore-gpu-blocklist \
+    --x11-display="$DISPLAY" \
+    --user-data-dir="$PROFILE" \
+    "${login_flags[@]}" \
+    --ozone-platform=x11 \
+    --ash-host-window-bounds="$ASH_HOST_WINDOW_BOUNDS" \
+    --force-device-scale-factor=1 \
+    2>>"$PROFILE/ash.log" &
+  chrome_pid=$!
+  # wait (not a foreground run) so the INT/TERM traps fire promptly; a plain
+  # foreground child would defer the trap until Chrome itself exited.
+  wait "$chrome_pid"
+  chrome_code=$?
+  chrome_pid=""
+  uptime=$(( $(date +%s) - chrome_start ))
+
+  stop_compositor
+
+  # --- decide: restart, or end the session cleanly --------------------------
+  # A clean exit (code 0) is how Chrome reports a real sign-out. Previously we
+  # ignored the code and respawned unconditionally, so logging out just spun up
+  # a Chrome with no display to draw on — the black screen that never ended.
+  if [ "$chrome_code" -eq 0 ]; then
+    log "Chrome exited cleanly (code 0) — treating as sign-out; ending session"
+    break
+  fi
+  # The display we need is gone (logout/host X shut down). Respawning here is
+  # what produced the endless "platform failed to initialize" loop.
+  if ! display_alive; then
+    log "display $DISPLAY is gone — cannot restart; ending session"
+    break
+  fi
+  # Guard against a genuine crash-loop: give up after a few quick failures
+  # instead of respawning forever. A session that stayed up for a while resets
+  # the counter, so a lone late crash still gets a normal restart.
+  if [ "$uptime" -lt 30 ]; then
+    fast_fail=$((fast_fail + 1))
+  else
+    fast_fail=0
+  fi
+  if [ "$fast_fail" -ge 3 ]; then
+    log "Chrome died ${fast_fail}x in a row within 30s — giving up; ending session (see $PROFILE/ash.log)"
+    break
+  fi
+  delay=$(( fast_fail * 2 ))
+  log "chrome exited (code $chrome_code, uptime ${uptime}s); restarting in ${delay}s"
+  sleep "$delay"
+done
+
+log "session ended"
+exit 0

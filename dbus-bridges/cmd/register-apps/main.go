@@ -17,19 +17,32 @@ import (
 var appDirs []string
 
 func init() {
-	home := os.Getenv("HOME")
-	user := os.Getenv("USER")
-	appDirs = []string{
-		"/run/current-system/sw/share/applications",
+	// Honour $XDG_DATA_DIRS first, then the usual fixed locations.
+	dirs := os.Getenv("XDG_DATA_DIRS")
+	if dirs == "" {
+		dirs = "/usr/local/share:/usr/share"
+	}
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			appDirs = append(appDirs, p)
+		}
+	}
+	for _, d := range strings.Split(dirs, ":") {
+		if d = strings.TrimSpace(d); d != "" {
+			add(filepath.Join(d, "applications"))
+		}
+	}
+	for _, d := range []string{
 		"/usr/share/applications",
 		"/usr/local/share/applications",
 		"/etc/xdg/applications",
+	} {
+		add(d)
 	}
-	if home != "" {
-		appDirs = append(appDirs, home+"/.local/share/applications")
-	}
-	if user != "" {
-		appDirs = append(appDirs, "/etc/profiles/per-user/"+user+"/share/applications")
+	if home := os.Getenv("HOME"); home != "" {
+		add(filepath.Join(home, ".local/share/applications"))
 	}
 }
 

@@ -1,10 +1,18 @@
+# Build outputs
+dist/
+.cache/
+chromeos-bin/chrome/
+chromeos-bin/.stage/
+
+# Go build artifacts (compiled binaries)
+dbus-bridges/bin/
+dbus-bridges/vendor/
+dbus-bridges/*-bridge
+dbus-bridges/mojo-stub
+
+# Obsolete Nix / upstream artefacts
 nixos.qcow2
 result
 result-*
 **/__pycache__/
 chromium-src/
-
-# Go build artifacts (compiled binaries)
-dbus-bridges/bin/
-dbus-bridges/*-bridge
-dbus-bridges/mojo-stub
