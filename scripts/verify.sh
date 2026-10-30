@@ -49,6 +49,60 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
   else
     fail "terminal stub patch missing"
   fi
+
+  # Три GPU-патча из build-chrome.sh (зачем они — см. там же и в README).
+  # Смещения считаем от символов, а не держим в константах: при обновлении
+  # снапшота символы сдвинутся вместе с кодом.
+  if have nm && have objdump; then
+    read -r text_vma text_off < <(
+      LC_ALL=C objdump -h "$ASH_ROOT/dist/chrome/chrome" |
+        awk '$2==".text"{ print "0x"$4, "0x"$6 }') || true
+    [ -n "${text_vma:-}" ] || fail ".text section not readable"
+    delta=$(( ${text_off:-0} - ${text_vma:-0} ))
+
+    check_gpu_patch() { # <label> <symbol regex> <extra offset> <6 bytes>
+      local va off got
+      # Без exit в awk: ранний выход дал бы nm SIGPIPE, а set -e подхватил
+      # бы 141 и убил verify на середине. Первый матч берём в shell'е.
+      va=$(nm -C "$ASH_ROOT/dist/chrome/chrome" | SYM_PATTERN="$2" \
+           awk '$0 ~ ENVIRON["SYM_PATTERN"] { print "0x"$1 }')
+      va=${va%%$'\n'*}
+      [ -n "$va" ] || { fail "$1: symbol not found"; return; }
+      off=$(( va + delta + ${3:-0} ))
+      got=$(dd if="$ASH_ROOT/dist/chrome/chrome" bs=1 skip="$off" count=6 \
+              2>/dev/null | od -An -tx1 | tr -d ' \n') || true
+      if [ "$got" = "$4" ]; then
+        ok "$1"
+      else
+        fail "$1: bytes '$got' != '$4' at $off"
+      fi
+    }
+
+    check_gpu_patch "IsSharedImageFormatSupported -> true" \
+      ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(' \
+      0 b801000000c3
+    check_gpu_patch "GetNativePixmapSupportType -> kX11Pixmap" \
+      ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)' \
+      0 b802000000c3
+    check_gpu_patch "NativePixmapEGLX11Binding::Create -> BGRX check dropped" \
+      ' t ui::NativePixmapEGLX11Binding::Create\(' \
+      132 909090909090
+  else
+    echo "  skip: nm/objdump not installed"
+  fi
+
+  # libminigbm.so обязан быть нашим шимом, а не оригиналом снапшота:
+  # оригинал при сборке переименовывается в .orig.
+  if grep -qF 'gbm_bo_import(type=' "$ASH_ROOT/dist/chrome/libminigbm.so" 2>/dev/null; then
+    ok "minigbm shim installed"
+  else
+    fail "dist/chrome/libminigbm.so is not the minigbm shim (make chrome)"
+  fi
+  if [ -e "$ASH_ROOT/dist/chrome/libminigbm.so.orig" ]; then
+    ok "pristine libminigbm.so kept as .orig"
+  else
+    fail "dist/chrome/libminigbm.so.orig missing"
+  fi
 fi
 
 echo "== dist/sommelier =="

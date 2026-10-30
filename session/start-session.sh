@@ -105,6 +105,20 @@ if [ "$MOJO" = "1" ]; then
   [ -x "$(bridge_bin mojo-stub)" ] || die "missing binary for 'mojo-stub' — run: make bridges"
 fi
 
+# --- log rotation -----------------------------------------------------------
+# Session logs are opened with >> and never truncated, so a long-lived session
+# grows them without bound (mojo-stub alone writes ~130 MB/day of referral
+# chatter). Rotate anything over the cap BEFORE the bridges/session open them
+# for append; a stale "*.log.1" from the previous run is simply overwritten.
+LOG_CAP_MB=5
+for f in "$LOGS"/*.log; do
+  [ -f "$f" ] || continue
+  if [ "$(du -m "$f" 2>/dev/null | cut -f1)" -ge "$LOG_CAP_MB" ] 2>/dev/null; then
+    mv -f "$f" "$f.1" 2>/dev/null || true
+    log "rotated $(basename "$f") (> ${LOG_CAP_MB}MB)"
+  fi
+done
+
 # --- bridges ---------------------------------------------------------------
 
 # Watchdog: restart the bridge, backing off when it dies immediately (which

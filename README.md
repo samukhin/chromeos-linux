@@ -218,7 +218,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 2. Прогоняет `register-apps` — пишет Linux-приложения в лаунчер Ash.
 3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), открывает `chrome-untrusted://terminal/`, кладёт `terminal/terminal-ui.js` в `localStorage.t` и перезагружает страницу. Это срабатывает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
 4. Поднимает в фоне sommelier + Xwayland на `:10` (ждёт появления `wayland-0` и ответа CDP, выставляет чёрно-белые цвета xterm через `xrdb`).
-5. Определяет границы окна Ash через `xrandr` и запускает Chrome с закреплённым набором флагов (`--enable-wayland-server`, `--ozone-platform=x11`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`).
+5. Определяет границы окна Ash через `xrandr` и запускает Chrome с закреплённым набором флагов (`--enable-wayland-server`, `--ozone-platform=x11`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`, GPU-блок `--ignore-gpu-blocklist` + `--disable-gpu-sandbox` + `--enable-logging=stderr` — последний вместе с no-op `RedirectChromeLogging` и есть то, что кладёт ERROR'ы в `ash.log`).
 6. Когда Chrome вышел — убивает sommelier/Xwayland, ждёт остаточных процессов `chrome` и начинает заново.
 
 ### Дисплейные режимы
@@ -259,16 +259,21 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | Терминальный стаб | `chrome.terminalPrivate.openVmshellProcess(...)` → `eval(localStorage.t||"")` | Terminal SWA пытается стартовать VM-шелл и падает |
 | Расслабление CSP | `'wasm-unsafe-eval'` → `'unsafe-eval'` (10 мест) | инжектированный UI терминала не выполняется |
 | `DisplayConfigurator::Init` | прыжок через нативную настройку дисплея | крэш на X11 (нет `NativeDisplayDelegate`) |
-| `WaylandDmabufFeedbackManager` | версия 0, dmabuf-пробы пропускаются | зависания/крэш на не-ChromeOS GPU |
 | `RunPendingConfiguration` | `ret` (no-op) | крэш при смене конфигурации дисплея |
 | `RedirectChromeLogging` | `ret` (no-op) | Chrome уводит логи в ChromeOS-путь |
 | `OnDisconnect` | `ret` (no-op) | крэш при таймауте mojo-канала |
 | `HasInternalDisplay` | всегда `true` | нет ползунка яркости |
 | `IsSystemBlurEnabled` | всегда `true` | blur панели/шторки гейтится не на GPU, а на ОЗУ: `chromeos::features::IsSystemBlurEnabled()` — это буквально `AmountOfTotalPhysicalMemory() > 4GiB` из `/proc/meminfo`, без FeatureList и без флага. На хостах ≤4 ГБ (гости VirtualBox, типовые Haswell-ноутбуки) панель и шторка рисуются непрозрачными, хотя композитор blur умеет рисовать на чём угодно (`viz::SoftwareRenderer::GetBackdropFilterShader` есть). С патчем — blur при любом объёме RAM; на малорамных хостах это стоит части FPS в анимациях |
 | Раскладка RU/EN | `OzonePlatformX11::InitializeUI` вместо `StubKeyboardLayoutEngine` собирает пару `XkbEvdevCodes` + `XkbKeyboardLayoutEngine` (как DRM-платформа) и регистрирует её в `KeyboardLayoutEngineManager`, а thunk на месте мёртвого `Stub::Lookup` перенаправляет `StubInputController::SetCurrentLayoutByName` в зарегистрированный движок | смена RU/EN в шторке двигает только индикатор в трее: набор текста остаётся US (нужны xkb-данные из `xkb-data` / `xorg-xkbdata`) |
+| `IsSharedImageFormatSupported` | всегда `true` | exo отдаёт `BGRX_8888`, а проверка пропускает только `BGRA_8888` → `CanImportNativePixmap` говорит «нет» и `OzoneImageBackingFactory` не регистрируется: `Could not find SharedImageBackingFactory` |
+| `GetNativePixmapSupportType` | всегда `kX11Pixmap` (2) | выбирается ветка `kDMABuf`, требующая `EGL_EXT_image_dma_buf_import`, которой у ANGLE здесь нет → импорт не создаётся |
+| `NativePixmapEGLX11Binding::Create` | вырезан встроенный чек `format == kBGRA_8888` (NOP на `je`) | тот же чек, но вызываемый уже **внутри** `Create`: отказ приходит как `ProduceSkiaGanesh failed to create GL representation` (в release это только VLOG, в логе тишина) → белые окна |
+| `PopulateMappableDrmFormatsForExo` | из набора кандидатов убраны RGB-порядочные форматы: в rodata-таблице `RGBA_8888`→`BGRA_8888`, `RGBX_8888`→`BGRX_8888`, плюс `jne`→`jmp` пропускает условные `RGBA_F16` и `RGBA_1010102` | exo рекламирует в dmabuf-фидбеке `AB24`/`XB24`/`AB30`/`AB4H` — память R,G,B,A, а импорт идёт через X11-визуал depth-32 (память B,G,R,A), где fourcc теряется → **красный уходит в синий** во всех wayland-клиентах, рисующих через dmabuf (helium, Qt). shm-клиенты (GTK, Xwayland) не страдают — их память и так B,G,R,A |
 | crashpad-wrapper | всегда добавляет `--database` | падение на старте crashpad-handler'а |
 
 Чего патч **не** делает: он не трогает интерпретатор и RPATH. Снапшот уже использует `/lib64/ld-linux-x86-64.so.2` и `RUNPATH=$ORIGIN`, поэтому patchelf не нужен вообще — `ldd` на обычном дистрибутиве всё резолвит, а `libminigbm.so` подхватывается из каталога бинарника.
+
+Отдельно от патчей бинарника собирается **шим `libminigbm.so`** (`scripts/minigbm_shim.c`) — Chrome слинкован против ChromeOS-овского minigbm, а на хосте есть только Mesa `libgbm`, и они не сходятся в двух местах: биты usage (у minigbm есть биты, которых нет у Mesa) и коды типа импорта (`GBM_BO_IMPORT_FD_MODIFIER` = `0x5505` у minigbm против `0x5504` у Mesa → `default: return NULL`). Шим кладётся **вместо** оригинала (он остаётся рядом как `libminigbm.so.orig`), резолвит 19 точек входа в `libgbm.so.1` через `dlopen`, транслирует тип импорта, маскирует usage, при неудаче падает обратно на `modifier=0`, затем на legacy `FD`-импорт и пишет трассировку в `/tmp/gbm-shim.log`. Без шима GPU-процесс не находит backing'и для `SharedImage` — см. таблицу GPU-патчей выше, они дополняют его, а не заменяют.
 
 Отдельно собирается `libdisplayfix.so` (`scripts/displayfix.c`) — крошечный shim, который лаунчер кладёт в `LD_PRELOAD`. Он всегда ставит `XAUTHORITY=/tmp/ash-xauth`, а если `DISPLAY` пуст — ставит `:0` и пишет диагностику в `/tmp/xwrap.log`. Shim молчит, если чинить нечего (иначе лог раздулся бы от каждой дочерней процессии Chrome).
 
@@ -300,6 +305,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * Работает Linux-сантехника: выбор файлов, xdg-desktop-portal-gtk, polkit-промпты, gnome-keyring.
 * Работает **нативный лок-экран Ash** (`Ctrl+Shift+L`) и разлочка **любым паролем** (см. «Лок-экран и разлочка»).
 * Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — см. патч «Раскладка RU/EN».
+* Linux-приложения рендерятся через GPU: sommelier запускает Xwayland с `--force-drm-device` и `--enable-linux-dmabuf`, поэтому клиенты получают `zwp_linux_dmabuf_v1`, а путь dmabuf → exo → `OzoneImageBacking` закрыт тремя GPU-патчами бинарника вместе с шимом `libminigbm.so` (см. «Патчи бинарника»). `glxgears` на `:10` держит ~60 FPS, и сессия при этом не подвисает. **`--glamor` намеренно НЕ передаётся** — почему, см. «Сырые места».
 
 ## Сырые места
 
@@ -311,11 +317,11 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | Интеграция Linux-приложений в лаунчер | `.desktop`-файлы пишутся в настройки Crostini, но запускаться могут не все (большинство — да) |
 | Эмуляция терминала | Базовый VT100 хватает на fastfetch; для работы бери нормальный терминал |
 | Аудио-узлы | Громкость работает, но узлы захардкожены (Speaker/Headphone/Mic), реального discovery PipeWire нет |
-| Рендер «управляемых» Linux-приложений | X11-приложения на `DISPLAY=:10` идут через wl_shm, без аппаратного ускорения |
 | Яркость / SUSPEND | `power-bridge` работает от вашего пользователя: на запись в `/sys/class/backlight/*/brightness` нужны права (добавьте себя в группу `video`), suspend зависит от polkit |
 | Гостевой профиль | `/home/chronos/user` — обычная директория, а не cryptohome |
 | Лок-экран | Настоящий, но **разлочивается любым паролем** (в т.ч. пустым): `session-bridge` отдаёт фиктивный `StartAuthSessionReply` с password-фактором `local-password` и всегда успешный `AuthenticateAuthFactor`. Системная соль — константа из моста. `ListAuthFactors` возвращает пусто, поэтому в логе безвредный warning `lock_contents_view.cc:937` (поле ввода пароля показывается дефолтно) |
 | Трей-иконки приложений | StatusNotifierItem не реализован |
+| `--glamor` у Xwayland (ускорение самого X-сервера) | **Намеренно выключен.** Бисекция по одному флагу: без glamor превью OBS стабильно, с ним — мерцание (chrome композитит поверхность с альфой=0: xterm просвечивает насквозь и кадры накапливаются ×1→×2→×3), а железный OBS вообще не показывает картинку; патч opaque-региона в sommelier не помог, триггер лежит внутри glamor. Без glamor Xwayland работает с `-shm` и отдаёт непрозрачные `XRGB8888`-буферы — поэтому и стабильно. Теряется только ускорение внутренних 2D-операций самого X-сервера (скроллинг/копии гигантских окон); клиентский GPU-рендер (OBS, glxgears, видео) от glamor не зависит и остаётся железным |
 
 ## Лок-экран и разлочка
 

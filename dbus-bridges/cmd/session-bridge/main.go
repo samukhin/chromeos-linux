@@ -205,6 +205,13 @@ func (s *sessionManager) IsScreenLocked() (bool, *dbus.Error) {
 	return s.isLocked(), nil
 }
 
+// QueryAdbSideload — there is no adb sideloading on this setup; answering
+// false (like session_manager with sideloading disabled) is a valid reply and
+// silences the UnknownMethod logged by SessionManagerClient.
+func (s *sessionManager) QueryAdbSideload() (bool, *dbus.Error) {
+	return false, nil
+}
+
 func (s *sessionManager) HandleLockScreenShown() *dbus.Error {
 	log.Println("HandleLockScreenShown — screen locked")
 	s.setLocked(true)

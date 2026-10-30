@@ -158,6 +158,40 @@ func (m *shillManager) SetDNSProxyDOHProviders(dnsProxySetup map[string]dbus.Var
 	return nil
 }
 
+// GetNetworksForGeolocation feeds the geolocation whitelist. Empty dict is a
+// valid answer ("no networks to report") and keeps GeolocationHandler from
+// logging UnknownMethod on every Wi-Fi state change.
+// Shill's real reply is always a NON-empty a{sv} whose keys are
+// kGeoWifiAccessPointsProperty / kGeoCellTowersProperty, each holding an
+// aa{sv} of access points (shill manager.cc:2813-2820). Ash parses it with
+// dbus::PopDataAsValue: a literally empty a{sv} takes an edge case in
+// PopArray -> PopDictionaryEntries and yields a NONE value, which the client
+// reports as "Failed to get Geolocation data". Two keys with empty lists
+// unambiguously decode to a DictValue and mean "no devices".
+// Key strings verified against the constants in the chrome binary
+// (shill::kGeoWifiAccessPointsProperty == "wifiAccessPoints", etc).
+func (m *shillManager) GetNetworksForGeolocation() (map[string]dbus.Variant, *dbus.Error) {
+	log.Printf("GetNetworksForGeolocation: 0 APs, 0 cell towers")
+	return map[string]dbus.Variant{
+		"wifiAccessPoints": dbus.MakeVariant([]map[string]dbus.Variant{}),
+		"cellTowers":       dbus.MakeVariant([]map[string]dbus.Variant{}),
+	}, nil
+}
+
+// EnableTechnology(technology) — the system already owns the radios; accept the
+// request so NetworkHandler does not see an error.
+func (m *shillManager) EnableTechnology(tech string) *dbus.Error {
+	log.Printf("Manager.EnableTechnology: %s (no-op)", tech)
+	return nil
+}
+
+// RequestScan(technology) — NetworkManager is polled on its own, so there is
+// nothing to trigger here.
+func (m *shillManager) RequestScan(tech string) *dbus.Error {
+	log.Printf("Manager.RequestScan: %s (no-op)", tech)
+	return nil
+}
+
 func (m *shillManager) ConnectService(props map[string]dbus.Variant) (dbus.ObjectPath, *dbus.Error) {
 	return "/service/0", nil
 }
@@ -367,7 +401,14 @@ func (s *shillService) GetProperties() (map[string]dbus.Variant, *dbus.Error) {
 		props["Connectable"] = dbus.MakeVariant(s.info.state != "idle")
 		props["SecurityClass"] = dbus.MakeVariant("none")
 		props["Mode"] = dbus.MakeVariant("managed")
-		props["SSID"] = dbus.MakeVariant(s.info.name)
+		// shill_property_util.cc GetNameFromProperties logs "No SSID set" for a
+		// WiFi service whose SSID is empty, and the network list then shows an
+		// unnamed network. Never hand out an empty one.
+		ssid := s.info.name
+		if ssid == "" {
+			ssid = "ChromeOS-Linux"
+		}
+		props["SSID"] = dbus.MakeVariant(ssid)
 	}
 	return props, nil
 }
@@ -383,6 +424,12 @@ func (d *shillDevice) GetProperties() (map[string]dbus.Variant, *dbus.Error) {
 		"Name":      dbus.MakeVariant(d.info.name),
 		"Powered":   dbus.MakeVariant(d.info.powered),
 		"Scanning":  dbus.MakeVariant(d.info.scanning),
+		// NetworkDeviceHandlerImpl logs "Failed to get support property ..." for
+		// every device that lacks this flag, which happens on each device poll.
+		"MACAddressRandomizationSupported": dbus.MakeVariant(false),
+		// Read the same way as MACAddressRandomizationSupported above; a missing
+		// bool logs "Failed to get support property WakeOnWiFiSupported".
+		"WakeOnWiFiSupported": dbus.MakeVariant(false),
 	}, nil
 }
 
@@ -426,7 +473,13 @@ func queryNM(conn *dbus.Conn) (string, []serviceInfo, []deviceInfo, error) {
 	if err != nil {
 		return "offline", nil, nil, fmt.Errorf("NM state: %w", err)
 	}
-	managerState := nmToShillState(stateVar.Value().(uint32))
+	// Comma-ok: a wrong-typed State property must not panic (a panic here
+	// escapes godbus's handleCall, which has no recover, and kills the bridge).
+	nmState, ok := stateVar.Value().(uint32)
+	if !ok {
+		return "offline", nil, nil, fmt.Errorf("NM State: unexpected type %T", stateVar.Value())
+	}
+	managerState := nmToShillState(nmState)
 
 	devices, nmDevicePaths := queryNMDevices(conn, nm)
 	nmDeviceIndex := make(map[dbus.ObjectPath]int)
@@ -594,15 +647,18 @@ func main() {
 	}
 	defer conn.Close()
 
-	reply, err := conn.RequestName(shillBusName, dbus.NameFlagDoNotQueue)
-	if err != nil || reply != dbus.RequestNameReplyPrimaryOwner {
-		log.Fatalf("request name %s: err=%v reply=%v", shillBusName, err, reply)
-	}
-
+	// Export BEFORE taking the bus name: while the name is owned but the
+	// objects are not exported yet, Ash's early calls (GetNetworksForGeolocation
+	// on session start) fail with UnknownMethod instead of waiting.
 	mgr := &shillManager{conn: conn, state: "offline"}
 	conn.Export(mgr, managerPath, managerIface)
 
 	conn.Export(&shillProfile{}, "/profile/default", profileIface)
+
+	reply, err := conn.RequestName(shillBusName, dbus.NameFlagDoNotQueue)
+	if err != nil || reply != dbus.RequestNameReplyPrimaryOwner {
+		log.Fatalf("request name %s: err=%v reply=%v", shillBusName, err, reply)
+	}
 
 	log.Printf("registered %s", shillBusName)
 

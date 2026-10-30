@@ -35,13 +35,29 @@ sub rx {
 }
 sub rv {
   my $s = shift; rx($s, 1); my $b = ord(rx($s, 1)); my $l = $b & 127;
-  $l = unpack("n", rx($s, 2)) if $l == 126; rx($s, $l);
+  $l = unpack("n", rx($s, 2)) if $l == 126;
+  $l = unpack("Q>", rx($s, 8)) if $l == 127;
+  rx($s, $l);
 }
 sub ws {
   my ($s, $t) = @_; my $l = length($t);
   my @m = map { int(rand(256)) } 1 .. 4;
-  my $h = $l < 126 ? pack("CC", 0x81, 0x80 | $l) : pack("CCn", 0x81, 0xfe, $l);
-  syswrite($s, $h . pack("C4", @m) . join("", map { chr(ord(substr($t, $_, 1)) ^ $m[$_ % 4]) } 0 .. $l - 1));
+  # 7-bit, 16-bit and (for payloads >= 64 KiB) 64-bit lengths. Without the
+  # 64-bit branch a too-long terminal-ui.js silently truncates the frame and
+  # the terminal never injects.
+  my $h = $l < 126    ? pack("CC", 0x81, 0x80 | $l)
+         : $l < 65536 ? pack("CCn", 0x81, 0xfe, $l)
+         :              pack("CCQ>", 0x81, 0xff, $l);
+  my $f = $h . pack("C4", @m)
+        . join("", map { chr(ord(substr($t, $_, 1)) ^ $m[$_ % 4]) } 0 .. $l - 1);
+  # syswrite may emit fewer bytes than asked on a large frame; loop until the
+  # whole frame is out, else Chrome sees a torn frame.
+  my $off = 0;
+  while ($off < length($f)) {
+    my $n = syswrite($s, $f, length($f) - $off, $off);
+    die "terminal-inject: write failed\n" unless defined $n && $n > 0;
+    $off += $n;
+  }
 }
 sub cdp {
   my ($s, $m, $p, $sid) = @_;

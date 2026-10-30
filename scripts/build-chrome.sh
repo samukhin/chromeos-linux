@@ -120,10 +120,19 @@ va=$(sym_va ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display:
 verify_and_patch "DisplayConfigurator::Init (skip native display config)" \
   "$(va_to_offset "$va" "$DELTA" 13)" "807f2101753749" '\351\070\000\000\000\220\220'
 
-va=$(sym_va ' exo::wayland::WaylandDmabufFeedbackManager::WaylandDmabufFeedbackManager\(exo::Display\*\)')
-verify_and_patch "WaylandDmabufFeedbackManager (no dmabuf probing)" \
-  "$(va_to_offset "$va" "$DELTA" 112)" "e8fdd63d08488bb80001000048" \
-  '\111\307\107\010\000\000\000\000\351\137\004\000\000'
+# WaylandDmabufFeedbackManager: the patch that used to live here zeroed the
+# version field at this+8 and skipped the gpu::Capabilities probe that fills
+# the dmabuf format/modifier table. Consequences of each state, all measured:
+#   version 0 -> Server::Initialize() skips wl_global_create() for
+#                zwp_linux_dmabuf_v1 entirely: the host advertises no dmabuf
+#                and every client stays on wl_shm (the original behaviour);
+#   version 4 -> the global appears, but SendFeedback() then NULL-derefs the
+#                never-filled format table (SEGV in ash.log) the moment a
+#                client asks for default feedback;
+#   unpatched -> the probe runs and fills the table. This is the state under
+#                test now. If it reproduces the original non-ChromeOS
+#                crash/hang, restore the patch (git restore this file).
+# Original bytes at constructor+112 for reference: e8fdd63d08488bb80001000048
 
 va=$(sym_va ' display::DisplayConfigurator::RunPendingConfiguration\(\)')
 verify_and_patch "RunPendingConfiguration (no-op)" \
@@ -203,6 +212,85 @@ verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
   "$((0x1020b20))" \
   "204f8315000000000800000000000000dec0190700000000" \
   '\040\117\203\025\000\000\000\000\010\000\000\000\000\000\000\000\100\011\001\016\000\000\000\000'
+
+# --- GPU: ozone X11 pixmap import ------------------------------------------
+# Without these, X11 clients on the sommelier display get white windows and a
+# GPU log full of "OzoneImageBacking::ProduceSkiaGanesh failed to create GL
+# representation" (774x per session). Three separate blockers, all on the
+# NativePixmap -> GL path that OzoneImageBacking uses; exo hands us
+# BGRX_8888, and ANGLE here has no EGL_EXT_image_dma_buf_import.
+
+# 1) NativePixmapEGLX11Binding::IsSharedImageFormatSupported -> true. The
+#    original only accepts BGRA_8888, so CanImportNativePixmap() said no to
+#    the BGRX surfaces exo actually produces. vaddr 0x78e1fee, prologue
+#    "push %rbp; mov %rsp,%rbp; sub $0x10,%rsp" -> "mov $1,%eax; ret".
+va=$(sym_va ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(')
+verify_and_patch "IsSharedImageFormatSupported (accept BGRX)" \
+  "$(va_to_offset "$va" "$DELTA")" "554889e54883" '\270\001\000\000\000\303'
+
+# 2) GetNativePixmapSupportType -> kX11Pixmap (2). It prefers kDMABuf when
+#    EGL_EXT_image_dma_buf_import is present, which ANGLE never exposes here,
+#    and CanImportNativeGLXPixmap() only asks dri3/glx, not GL. vaddr
+#    0x78e688e, same prologue -> "mov $2,%eax; ret".
+va=$(sym_va ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)')
+verify_and_patch "GetNativePixmapSupportType (kX11Pixmap)" \
+  "$(va_to_offset "$va" "$DELTA")" "554889e5e8af" '\270\002\000\000\000\303'
+
+# 3) Inside NativePixmapEGLX11Binding::Create: an inlined
+#    gl::IsFormatSupported(format) rejects kBGRX_8888 ("je -> 'format is
+#    unsupported'" VLOG, nothing in the release log). NOP the branch — the
+#    caller already vetted the format in patch 1. Create+132, vaddr 0x78e223a.
+va=$(sym_va ' t ui::NativePixmapEGLX11Binding::Create\(')
+verify_and_patch "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
+  "$(va_to_offset "$va" "$DELTA" 132)" "0f84a2000000" \
+  '\220\220\220\220\220\220'
+
+# 4) exo must not advertise RGB-order dmabuf formats (AB24/XB24/AB30/AB4H).
+#    Ash imports every client dmabuf through the X11-pixmap path (patch 2),
+#    where the fourcc is lost and the channel order comes from the depth-32
+#    X visual (memory B,G,R,A). A buffer whose memory is R,G,R,A -> R and B
+#    swap: "red becomes blue" in every wayland-native client (helium, Qt).
+#    shm clients and Xwayland are unaffected because their memory already is
+#    B,G,R,A.
+#
+#    gpu::gles2::PopulateMappableDrmFormatsForExo() is the last writer of
+#    gpu::Capabilities::drm_formats_and_modifiers (offset 0x18) — the map
+#    WaylandDmabufFeedbackManager copies into its format table, so it drives
+#    both the advertised zwp_linux_dmabuf_feedback format_table and the
+#    IsFormatSupported() check behind zwp_linux_dmabuf.create_buffer. It
+#    remove_if()s every fourcc whose SharedImageFormat is not in a local
+#    candidate set and, if nothing survives, re-seeds the map from that set.
+#    Make the candidate set BGR-order:
+#      - the rodata SIF list it memcpy's: RGBA_8888 -> BGRA_8888,
+#        RGBX_8888 -> BGRX_8888 (AR24/XR24 then also survive the filter and
+#        get seeded, so clients still get a 32-bit colour format);
+#      - skip the two conditional RGB-order candidates, RGBA_F16 (AB4H) and
+#        RGBA_1010102 (AB30), by turning their "feature off -> skip" jne into
+#        an unconditional jmp.
+#    PopulateVkDrmFormatsAndModifiers()/PopulateDRMCapabilities() run first
+#    and can insert AB24/XB24 straight from the driver — the remove_if above
+#    is what drops them again.
+verify_and_patch "exo dmabuf candidates (RGBA_8888 -> BGRA_8888)" \
+  "$((0x337b0c4))" "0100000000000000" '\001\000\000\000\002\000\000\000'
+verify_and_patch "exo dmabuf candidates (RGBX_8888 -> BGRX_8888)" \
+  "$((0x337b0cc))" "010000000c000000" '\001\000\000\000\015\000\000\000'
+verify_and_patch "exo dmabuf candidates (skip RGBA_F16)" \
+  "$((0xed67f39))" "7513" '\353\023'
+verify_and_patch "exo dmabuf candidates (skip RGBA_1010102)" \
+  "$((0xed67f88))" "7513" '\353\023'
+
+# --- libminigbm shim (Mesa stand-in) ---------------------------------------
+# Chrome is built against ChromeOS' minigbm, whose usage bits and import type
+# codes differ from Mesa's (GBM_BO_IMPORT_FD_MODIFIER: 0x5505 vs 0x5504), so
+# Mesa's gbm returns NULL and the GPU process never finds a shared image
+# backing. Swap the pristine snapshot aside and build the shim in its place;
+# it dlopens libgbm.so.1 at load time. See scripts/minigbm_shim.c.
+[ -f "$OUT/libminigbm.so" ] || die "no pristine libminigbm.so in $OUT"
+mv "$OUT/libminigbm.so" "$OUT/libminigbm.so.orig"
+echo "kept pristine $OUT/libminigbm.so.orig"
+"${CC:-cc}" -shared -fPIC -O2 -o "$OUT/libminigbm.so" \
+  "$ASH_ROOT/scripts/minigbm_shim.c" -ldl
+echo "built minigbm shim -> $OUT/libminigbm.so ($(stat -c%s "$OUT/libminigbm.so") bytes)"
 
 # --- crashpad handler ------------------------------------------------------
 

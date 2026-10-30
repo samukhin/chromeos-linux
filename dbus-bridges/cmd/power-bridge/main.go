@@ -200,6 +200,28 @@ func (p *powerManager) HasAmbientLightSensor() (bool, *dbus.Error) {
 	return false, nil
 }
 
+// SetBatterySaverModeState takes a serialized SetBatterySaverModeStateRequest.
+// There is no battery saver on this setup, so the request is only logged: an
+// empty reply (success) keeps Ash from retrying and logging UnknownMethod on
+// every battery poll.
+func (p *powerManager) SetBatterySaverModeState(req []byte) *dbus.Error {
+	log.Printf("SetBatterySaverModeState: %d bytes (no-op)", len(req))
+	return nil
+}
+
+// GetAmbientLightSensorEnabled answers "no ambient light sensor" so Ash stops
+// polling for a state it can never get.
+func (p *powerManager) GetAmbientLightSensorEnabled() (bool, *dbus.Error) {
+	return false, nil
+}
+
+// GetKeybardAmbientLightSensorEnabled — "Keybard" is Chromium's own typo (the
+// real D-Bus member; see SetKeyboardAmbientLightSensorEnabled next to it in the
+// chrome binary). Answers "no keyboard ALS" so Ash stops polling it.
+func (p *powerManager) GetKeybardAmbientLightSensorEnabled() (bool, *dbus.Error) {
+	return false, nil
+}
+
 func (p *powerManager) HasKeyboardBacklight() (bool, *dbus.Error) {
 	return false, nil
 }

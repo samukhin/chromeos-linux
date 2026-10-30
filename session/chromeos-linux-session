@@ -323,6 +323,32 @@ while true; do
           sleep 0.5
         done
       ) &
+      # GPU path. --noop-driver leaves drm_fd == -1, so without an explicit
+      # device there is no ctx.gbm and every dmabuf gate stays shut: Xwayland
+      # is spawned with -shm and clients only ever see wl_shm.
+      #   --force-drm-device      opens the render node directly, bypassing
+      #                           open_virtgpu (which matches virtio-gpu only);
+      #                           sets ctx.gbm/drm — without it neither flag
+      #                           below has any effect;
+      #   --enable-linux-dmabuf   advertise zwp_linux_dmabuf_v1 to our own
+      #                           clients — gated on ctx.gbm, hence the flag
+      #                           above; direct-rendering clients (OBS,
+      #                           glxgears) then export dmabuf buffers that
+      #                           chrome imports directly (zero copy);
+      #   --xwayland-gl-driver-path
+      #                           LIBGL_DRIVERS_PATH baked in at build time is
+      #                           /opt/google/cros-containers/lib, which does
+      #                           not exist here, so Xwayland would find no DRI
+      #                           drivers without this hint.
+      #
+      # Deliberately NOT passed: --glamor (it would drop -shm from Xwayland's
+      # command line and switch it to GPU rendering). Bisected as the flicker
+      # switch: without it the OBS preview is stable; adding it back makes the
+      # preview flicker — chrome blends a surface whose alpha byte is 0, so the
+      # xterm shows through and frames accumulate (x2/x3) — and hardware OBS
+      # goes blank. The opaque-region patch in sommelier did not help, so the
+      # trigger sits inside glamor itself. Client-side GPU rendering does NOT
+      # depend on --glamor: OBS and glxgears stay hardware-accelerated here.
       SOMMELIER_DISPLAY=wayland-0 \
       WAYLAND_DISPLAY=wayland-0 \
       XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
@@ -334,6 +360,9 @@ while true; do
           --xwayland-path="$(command -v Xwayland || echo /usr/bin/Xwayland)" \
           --vm-identifier=termina \
           --no-exit-with-child \
+          --force-drm-device="${ASH_DRM_DEVICE:-/dev/dri/renderD128}" \
+          --enable-linux-dmabuf \
+          --xwayland-gl-driver-path=/usr/lib/dri \
           -- sleep infinity \
           2>>"$PROFILE/sommelier.log" || true
       sleep 1
@@ -372,6 +401,7 @@ while true; do
     --no-first-run \
     --remote-debugging-port=9222 \
     --ignore-gpu-blocklist \
+    --enable-logging=stderr \
     --x11-display="$DISPLAY" \
     --user-data-dir="$PROFILE" \
     "${login_flags[@]}" \

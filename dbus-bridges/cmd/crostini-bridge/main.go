@@ -332,9 +332,18 @@ func decodeStringFields(data []byte) map[uint64]string {
 		switch wireType {
 		case 0:
 			_, n = decodeVarint(data[i:])
+			if n == 0 {
+				return fields // malformed varint: bail, don't spin
+			}
 			i += n
 		case 2:
 			length, n := decodeVarint(data[i:])
+			// Guard: n==0 (malformed varint) leaves i stuck in an infinite
+			// loop; length > len(data) makes int(length) negative on overflow
+			// and panics data[i:end] (low > high). Both mean a corrupt frame.
+			if n == 0 || length > uint64(len(data)) {
+				return fields
+			}
 			i += n
 			end := i + int(length)
 			if end <= len(data) {
@@ -369,10 +378,18 @@ func decodeUint64Fields(data []byte) map[uint64]uint64 {
 		switch wireType {
 		case 0:
 			v, n := decodeVarint(data[i:])
+			if n == 0 {
+				return fields // malformed varint: bail, don't spin
+			}
 			i += n
 			fields[fieldNum] = v
 		case 2:
 			length, n := decodeVarint(data[i:])
+			// Guard: n==0 would spin forever; length > len(data) overflows
+			// int() negative and would make data[i:] panic below.
+			if n == 0 || length > uint64(len(data)) {
+				return fields
+			}
 			i += n
 			i += int(length)
 		case 1:
@@ -515,7 +532,13 @@ func launchApp(app desktopApp) error {
 	// os.Environ() would win and apps would land on the host X server instead of
 	// the :10 Xwayland they must render into.
 	cmd.Env = append(os.Environ(), overrides...)
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// Reap the child when it exits: without Wait() every launched app would
+	// linger as a zombie under this bridge until the session ends.
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 type vmConcierge struct {
@@ -579,6 +602,17 @@ func (v *vmConcierge) StopVm(req []byte) ([]byte, *dbus.Error) {
 	log.Printf("StopVm called")
 	markSessionStopped()
 	return appendBool(nil, 1, true), nil // success = true
+}
+
+// SetVmCpuRestriction takes a serialized SetVmCpuRestrictionRequest and returns
+// a serialized SetVmCpuRestrictionResponse. CPU pinning is not applied here, so
+// an empty response (all fields at defaults, i.e. no error) is enough for
+// ConciergeHelperService to stop logging UnknownMethod.
+func (v *vmConcierge) SetVmCpuRestriction(req []byte) ([]byte, *dbus.Error) {
+	log.Printf("SetVmCpuRestriction: %d bytes (no-op)", len(req))
+	// SetVmCpuRestrictionResponse { bool success = 1; } — ConciergeHelperService
+	// logs "Failed to call SetVmCpuRestriction" unless success reads true.
+	return appendBool(nil, 1, true), nil
 }
 
 func (v *vmConcierge) CreateDiskImage(req []byte, fds []dbus.UnixFD) ([]byte, *dbus.Error) {
@@ -821,6 +855,20 @@ type debugdStub struct{}
 func (d *debugdStub) SetSchedulerConfigurationV2(configName string, lockPolicy bool) (bool, uint32, *dbus.Error) {
 	log.Printf("debugd.SetSchedulerConfigurationV2 configName=%q lockPolicy=%v", configName, lockPolicy)
 	return true, 0, nil
+}
+
+// GetPerfOutputV2(quipper_args, disable_cpu_idle, out_fd) returns a session id
+// for the (never started) perf run. The caller only needs a non-zero handle it
+// can later pass to StopPerf; the data file it passed stays empty.
+func (d *debugdStub) GetPerfOutputV2(quipperArgs []string, disableCPUIdle bool, outFD dbus.UnixFD) (uint64, *dbus.Error) {
+	log.Printf("debugd.GetPerfOutputV2 args=%v disableCPUIdle=%v (no perf run)", quipperArgs, disableCPUIdle)
+	return 1, nil
+}
+
+// StopPerf is the counterpart of GetPerfOutputV2; there is no run to stop.
+func (d *debugdStub) StopPerf(sessionID uint64) *dbus.Error {
+	log.Printf("debugd.StopPerf session=%d (no-op)", sessionID)
+	return nil
 }
 
 type imageLoader struct{}

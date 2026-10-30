@@ -99,6 +99,11 @@ func (c *crasControl) SetInputMute(muted bool) *dbus.Error {
 	c.mu.Lock()
 	c.st.inputMuted = muted
 	c.mu.Unlock()
+	v := "0"
+	if muted {
+		v = "1"
+	}
+	pactl("set-source-mute", "@DEFAULT_SOURCE@", v)
 	return nil
 }
 
@@ -111,6 +116,14 @@ func (c *crasControl) SetInputNodeGain(nodeID uint64, gain int32) *dbus.Error {
 }
 
 func (c *crasControl) SwapLeftRight(nodeID uint64, swap bool) *dbus.Error {
+	return nil
+}
+
+// SetDisplayRotation(node_id, rotation) — audio routing does not depend on the
+// display orientation here; accept the call so CrasAudioHandler stops logging
+// UnknownMethod.
+func (c *crasControl) SetDisplayRotation(nodeID uint64, rotation uint32) *dbus.Error {
+	log.Printf("SetDisplayRotation: node=%d rotation=%d (no-op)", nodeID, rotation)
 	return nil
 }
 
