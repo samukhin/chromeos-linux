@@ -473,13 +473,11 @@ func queryNM(conn *dbus.Conn) (string, []serviceInfo, []deviceInfo, error) {
 	if err != nil {
 		return "offline", nil, nil, fmt.Errorf("NM state: %w", err)
 	}
-	// Comma-ok: a wrong-typed State property must not panic (a panic here
-	// escapes godbus's handleCall, which has no recover, and kills the bridge).
-	nmState, ok := stateVar.Value().(uint32)
+	stateVal, ok := stateVar.Value().(uint32)
 	if !ok {
-		return "offline", nil, nil, fmt.Errorf("NM State: unexpected type %T", stateVar.Value())
+		return "offline", nil, nil, fmt.Errorf("NM state: unexpected type %T", stateVar.Value())
 	}
-	managerState := nmToShillState(nmState)
+	managerState := nmToShillState(stateVal)
 
 	devices, nmDevicePaths := queryNMDevices(conn, nm)
 	nmDeviceIndex := make(map[dbus.ObjectPath]int)

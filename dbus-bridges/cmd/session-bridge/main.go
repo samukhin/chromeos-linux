@@ -353,8 +353,8 @@ func (u *userDataAuth) StartAuthSession(req []byte) ([]byte, *dbus.Error) {
 
 	factorWithStatus := append([]byte{0x0a, byte(len(factor))}, factor...) // .auth_factor
 
-	reply := append([]byte{0x12, byte(len(id))}, id...) // .auth_session_id
-	reply = append(reply, 0x18, 0x01)                   // .user_exists = true
+	reply := append([]byte{0x12, byte(len(id))}, id...)      // .auth_session_id
+	reply = append(reply, 0x18, 0x01)                        // .user_exists = true
 	reply = append(reply, 0x4a, byte(len(factorWithStatus))) // field 9 (tag (9<<3)|2)
 	reply = append(reply, factorWithStatus...)
 

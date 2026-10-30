@@ -118,7 +118,7 @@ DELTA=$(text_delta)
 
 va=$(sym_va ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display::NativeDisplayDelegate')
 verify_and_patch "DisplayConfigurator::Init (skip native display config)" \
-  "$(va_to_offset "$va" "$DELTA" 13)" "807f2101753749" '\351\070\000\000\000\220\220'
+  "$(va_to_offset "$va" "$DELTA" 13)" "75474889fb80bf" '\351\104\000\000\000\220\220'
 
 # WaylandDmabufFeedbackManager: the patch that used to live here zeroed the
 # version field at this+8 and skipped the gpu::Capabilities probe that fills
@@ -180,7 +180,7 @@ ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(
 # new[] size for the combined block: XkbKeyboardLayoutEngine (0xc8, same as
 # the DRM platform) + XkbEvdevCodes converter (0x10) = 0xd8, was 0x20.
 verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 381)" "20" '\330'
+  "$(va_to_offset "$ui_va" "$DELTA" 431)" "20" '\330'
 
 # Replace the StubKeyboardLayoutEngine construction with:
 #   lea 0xc8(%rax),%rdi / mov %rax,%r14 / call XkbEvdevCodesC1 /
@@ -188,30 +188,73 @@ verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
 #   mov %r14,0x20(%rbx) / mov %r14,%rdi
 # then falls through into the existing SetKeyboardLayoutEngine call.
 verify_and_patch "OzonePlatformX11::InitializeUI (real Xkb engine)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 390)" \
-  "4989c64889c7e8a9ce7206488b7b204c8973204885ff740a488b07ff50084c8b73204c89f7" \
-  '\110\215\270\310\000\000\000\111\211\306\350\353\317\162\006\114\211\367\111\215\266\310\000\000\000\350\020\320\162\006\114\211\163\040\114\211\367'
+  "$(va_to_offset "$ui_va" "$DELTA" 440)" \
+  "4989c64889c7e8b98a3e07488b43204c8973204885c0740d488b084889c7ff51084c8b7320" \
+  '\110\215\270\310\000\000\000\111\211\306\350\015\214\076\007\114\211\367\111\215\266\310\000\000\000\350\062\214\076\007\114\211\163\040\114\211\367'
 
 # Overwrite the (now dead) StubKeyboardLayoutEngine::Lookup with a thunk
 # for StubInputController::SetCurrentLayoutByName(name, callback):
-#   load keyboard_layout_engine_; when set, tail-jump to
-#   engine->SetCurrentLayoutByName (vptr+0x20, identical signature), else
-#   jump back into the original stub body. The stub engine is no longer
-#   constructed after the patch above, so its Lookup is unreachable.
+#   mov rax,[keyboard_layout_engine_]; test rax,rax; je fallback;
+#   mov rdi,rax; mov rax,[rax]; jmp [rax+0x20]   <- XkbKeyboardLayoutEngine
+#                                                   ::SetCurrentLayoutByName
+#   fallback: jmp original StubInputController::SetCurrentLayoutByName body.
+# Slot offsets are relative to vptr (= 'vtable for' symbol + 0x10: offset-to-
+# top + RTTI precede the virtual functions), so SetCurrentLayoutByName sits at
+# symbol+0x30 == vptr+0x20. vptr+0x30 is UsesISOLevel5Shift — a silent no-op
+# that never runs the callback, which hid the bug (no failure logs at all).
+# keyboard_layout_engine_ is a plain .bss global (type 'b'), so the
+# RIP-relative load is correct. The stub engine is no longer constructed
+# after the patch above, so its Lookup is unreachable.
 lookup_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::Lookup\(')
 verify_and_patch "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
   "$(va_to_offset "$lookup_va" "$DELTA")" \
-  "554889e5488b4708488b7f10" \
-  '\110\213\005\201\042\022\010\110\205\300\164\011\110\211\307\110\213\000\377\140\040\351\204\267\030\371'
+  "554889e54c8b4f104d85c974" \
+  '\110\213\005\313\155\204\010\110\205\300\164\011\110\211\307\110\213\000\377\140\040\351\102\375\073\370'
 
-# Redirect the StubInputController vtable slot (vptr+0x80,
-# .rela.dyn entry for 0x15834f20, R_X86_64_RELATIVE addend 0x719c0de) to
-# the thunk: verify the whole 24-byte relocation, write it with the new
-# addend (thunk VA 0xe010940).
+# Redirect the real StubInputController vtable slot for
+# SetCurrentLayoutByName (vptr+0x80, .rela.dyn entry at file 0x128df08,
+# R_X86_64_RELATIVE addend 0x779704a = the stub body) to the thunk:
+# verify the whole 24-byte relocation, write it with the new addend
+# (thunk VA 0xf3d72ee = StubKeyboardLayoutEngine::Lookup).
 verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
-  "$((0x1020b20))" \
-  "204f8315000000000800000000000000dec0190700000000" \
-  '\040\117\203\025\000\000\000\000\010\000\000\000\000\000\000\000\100\011\001\016\000\000\000\000'
+  "$((0x128df08))" \
+  "484c3f170000000008000000000000004a70790700000000" \
+  '\110\114\077\027\000\000\000\000\010\000\000\000\000\000\000\000\356\162\075\017\000\000\000\000'
+
+# --- hide demo system web apps from the launcher ---------------------------
+# SystemWebAppManager::CreateInstallOptionsForSystemApp sets
+# add_to_launcher = delegate->ShouldShowInLauncher(). For the demo SWAs below
+# that slot (vptr+0x50 == 'vtable for' symbol+0x60) inherits the ICF-merged
+# "return true" stub (0x6cde980), so every one of them lands in the launcher
+# menu. Redirect the .rela.dyn addend to a "xor %eax,%eax; ret" gadget
+# (0x6cdb607) so ShouldShowInLauncher() returns false: the app stays
+# installed (media-app keeps working as a file viewer, chrome:// URLs still
+# open) but is not added to the launcher. To restore an app, revert the
+# corresponding line here.
+# Each record is r_offset(8) | r_info(8=R_X86_64_RELATIVE) | addend(8);
+# verify all 24 bytes, then write the record with the new addend.
+swa_hide() { # <name> <rela-file-offset> <expected-hex-24> <printf-fmt-24>
+  verify_and_patch "hide SWA from launcher: $1" "$2" "$3" "$4"
+}
+# gadget VA 0x6cdb607 -> addend LE 07b6cd0600000000
+swa_hide "Галерея (media-app)"      "$((0x1d26820))" \
+  "3873901700000000080000000000000080e9cd0600000000" \
+  '\070\163\220\027\000\000\000\000\010\000\000\000\000\000\000\000\007\266\315\006\000\000\000\000'
+swa_hide "Sample System Web App"    "$((0x1d216f0))" \
+  "d853901700000000080000000000000080e9cd0600000000" \
+  '\330\123\220\027\000\000\000\000\010\000\000\000\000\000\000\000\007\266\315\006\000\000\000\000'
+swa_hide "Возможности (help-app)"   "$((0x1d22770))" \
+  "8859901700000000080000000000000080e9cd0600000000" \
+  '\210\131\220\027\000\000\000\000\010\000\000\000\000\000\000\000\007\266\315\006\000\000\000\000'
+swa_hide "Камера (camera-app)"      "$((0x1d1d088))" \
+  "d03a901700000000080000000000000080e9cd0600000000" \
+  '\320\072\220\027\000\000\000\000\010\000\000\000\000\000\000\000\007\266\315\006\000\000\000\000'
+swa_hide "Скринкаст (projector)"    "$((0x1d1fef0))" \
+  "584b901700000000080000000000000080e9cd0600000000" \
+  '\130\113\220\027\000\000\000\000\010\000\000\000\000\000\000\000\007\266\315\006\000\000\000\000'
+swa_hide "Игры и приложения (mall)" "$((0x1d20df0))" \
+  "a850901700000000080000000000000080e9cd0600000000" \
+  '\250\120\220\027\000\000\000\000\010\000\000\000\000\000\000\000\007\266\315\006\000\000\000\000'
 
 # --- GPU: ozone X11 pixmap import ------------------------------------------
 # Without these, X11 clients on the sommelier display get white windows and a
@@ -226,7 +269,7 @@ verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
 #    "push %rbp; mov %rsp,%rbp; sub $0x10,%rsp" -> "mov $1,%eax; ret".
 va=$(sym_va ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(')
 verify_and_patch "IsSharedImageFormatSupported (accept BGRX)" \
-  "$(va_to_offset "$va" "$DELTA")" "554889e54883" '\270\001\000\000\000\303'
+  "$(va_to_offset "$va" "$DELTA")" "554889e55de9" '\270\001\000\000\000\303'
 
 # 2) GetNativePixmapSupportType -> kX11Pixmap (2). It prefers kDMABuf when
 #    EGL_EXT_image_dma_buf_import is present, which ANGLE never exposes here,
@@ -234,7 +277,7 @@ verify_and_patch "IsSharedImageFormatSupported (accept BGRX)" \
 #    0x78e688e, same prologue -> "mov $2,%eax; ret".
 va=$(sym_va ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)')
 verify_and_patch "GetNativePixmapSupportType (kX11Pixmap)" \
-  "$(va_to_offset "$va" "$DELTA")" "554889e5e8af" '\270\002\000\000\000\303'
+  "$(va_to_offset "$va" "$DELTA")" "554889e5e8bf" '\270\002\000\000\000\303'
 
 # 3) Inside NativePixmapEGLX11Binding::Create: an inlined
 #    gl::IsFormatSupported(format) rejects kBGRX_8888 ("je -> 'format is
@@ -242,7 +285,7 @@ verify_and_patch "GetNativePixmapSupportType (kX11Pixmap)" \
 #    caller already vetted the format in patch 1. Create+132, vaddr 0x78e223a.
 va=$(sym_va ' t ui::NativePixmapEGLX11Binding::Create\(')
 verify_and_patch "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
-  "$(va_to_offset "$va" "$DELTA" 132)" "0f84a2000000" \
+  "$(va_to_offset "$va" "$DELTA" 132)" "0f855e020000" \
   '\220\220\220\220\220\220'
 
 # 4) exo must not advertise RGB-order dmabuf formats (AB24/XB24/AB30/AB4H).
@@ -261,23 +304,25 @@ verify_and_patch "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
 #    remove_if()s every fourcc whose SharedImageFormat is not in a local
 #    candidate set and, if nothing survives, re-seeds the map from that set.
 #    Make the candidate set BGR-order:
-#      - the rodata SIF list it memcpy's: RGBA_8888 -> BGRA_8888,
-#        RGBX_8888 -> BGRX_8888 (AR24/XR24 then also survive the filter and
-#        get seeded, so clients still get a 32-bit colour format);
-#      - skip the two conditional RGB-order candidates, RGBA_F16 (AB4H) and
-#        RGBA_1010102 (AB30), by turning their "feature off -> skip" jne into
-#        an unconditional jmp.
+#      - the rodata SIF blob it seeds the local flat_tree from (list at
+#        0x3521e1c: kBGR_565, kRGBA_8888, kRGBX_8888, two YUV entries):
+#        RGBA_8888 -> BGRA_8888, RGBX_8888 -> BGRX_8888 (AR24/XR24 then also
+#        survive the filter and get seeded, so clients still get a 32-bit
+#        colour format);
+#      - skip the two feature-gated RGB-order emplaces, kRGBA_F16 (AB4H) and
+#        kRGBA_1010102 (AB30), by turning their "feature off -> skip" jne
+#        into an unconditional jmp.
 #    PopulateVkDrmFormatsAndModifiers()/PopulateDRMCapabilities() run first
 #    and can insert AB24/XB24 straight from the driver — the remove_if above
 #    is what drops them again.
 verify_and_patch "exo dmabuf candidates (RGBA_8888 -> BGRA_8888)" \
-  "$((0x337b0c4))" "0100000000000000" '\001\000\000\000\002\000\000\000'
+  "$((0x3521e24))" "0100000000000000" '\001\000\000\000\002\000\000\000'
 verify_and_patch "exo dmabuf candidates (RGBX_8888 -> BGRX_8888)" \
-  "$((0x337b0cc))" "010000000c000000" '\001\000\000\000\015\000\000\000'
+  "$((0x3521e2c))" "010000000a000000" '\001\000\000\000\013\000\000\000'
 verify_and_patch "exo dmabuf candidates (skip RGBA_F16)" \
-  "$((0xed67f39))" "7513" '\353\023'
+  "$((0x1020418a))" "7513" '\353\023'
 verify_and_patch "exo dmabuf candidates (skip RGBA_1010102)" \
-  "$((0xed67f88))" "7513" '\353\023'
+  "$((0x102041d9))" "7513" '\353\023'
 
 # --- libminigbm shim (Mesa stand-in) ---------------------------------------
 # Chrome is built against ChromeOS' minigbm, whose usage bits and import type

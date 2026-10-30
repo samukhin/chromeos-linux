@@ -137,6 +137,36 @@ else
 fi
 stop_last
 
+echo "== stub (services absent on this host) =="
+start_bridge stub "$XDG_ENV"
+if wait_for_name "org.chromium.ResourceManager" "$TMP/stub.log"; then
+  ok "org.chromium.ResourceManager owned"
+else
+  bad "org.chromium.ResourceManager not owned — see $TMP/stub.log"
+fi
+for n in org.chromium.TpmManager org.chromium.CrosDisks \
+         org.chromium.BiometricsDaemon org.chromium.MachineLearning \
+         com.ubuntu.Upstart org.freedesktop.fwupd; do
+  if list_names | grep -qx "$n"; then
+    ok "$n owned"
+  else
+    bad "$n not owned"
+  fi
+done
+if out=$(dbus-send --system --print-reply --dest=org.chromium.Rgbkbd \
+    /org/chromium/Rgbkbd org.chromium.Rgbkbd.GetRgbKeyboardCapabilities 2>&1); then
+  ok "Rgbkbd.GetRgbKeyboardCapabilities -> $(echo "$out" | grep uint32 || echo "$out")"
+else
+  bad "Rgbkbd.GetRgbKeyboardCapabilities: $out"
+fi
+if out=$(dbus-send --system --print-reply --dest=org.chromium.CrosDisks \
+    /org/chromium/CrosDisks org.chromium.CrosDisks.EnumerateDevices 2>&1); then
+  ok "CrosDisks.EnumerateDevices -> $(echo "$out" | grep -c 'string' || echo 0) devices"
+else
+  bad "CrosDisks.EnumerateDevices: $out"
+fi
+stop_last
+
 echo "== session + UserDataAuth =="
 start_bridge session "$XDG_ENV"
 if wait_for_name "org.chromium.SessionManager" "$TMP/session.log"; then

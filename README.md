@@ -188,13 +188,14 @@ sudo ./scripts/setup-system.sh --user "$USER"
 |---|---|
 | D-Bus-политика | `/etc/dbus-1/system.d/chromeos-bridges.conf` — копия `session/dbus-policies/chromeos-bridges.conf` с подставленным пользователем; после изменения шина перезапускается |
 | Системные каталоги | `/etc/tmpfiles.d/chromeos-linux.conf` + `systemd-tmpfiles --create`: `/var/lib/ash-profile`, `/run/mojo`, `/home/chronos/user`, заглушки termina-DLC и VM-диска, `/var/log/chrome`, `/var/lib/metrics/...`, а также заглушка `/dev/kvm` — **только если KVM на хосте нет** (без неё Chrome считает, что виртуализации нет, и молча не открывает Linux-приложения; при наличии `/sys/class/misc/kvm` строка из конфига выбрасывается, а уже установленная заглушка снимается — она мешала бы udev создать настоящий device-node) |
-| Личность ОС | в `/etc/lsb-release` дописываются `DEVICETYPE=CHROMEBOOK` и `CHROMEOS_RELEASE_NAME=Chrome OS` (исходный файл сохраняется в `/etc/lsb-release.chromeos-linux.bak`) |
+| Личность ОС | в `/etc/lsb-release` дописываются `DEVICETYPE=CHROMEBOOK`, `CHROMEOS_RELEASE_NAME=Chrome OS` и `CHROMEOS_RELEASE_DESCRIPTION=Chrome OS (chromeos-linux)` (исходный файл сохраняется в `/etc/lsb-release.chromeos-linux.bak`) |
+| Часовой пояс | создаётся `/var/lib/timezone/localtime` → `$(readlink -f /etc/localtime)`: без него Ash читает TZ из ChromeOS-пути, не находит его и молча ставит `America/Los_Angeles` на часах шельфа. `/var` переживает перезагрузку, поэтому достаточно одного запуска |
 | Заглушки шелла | симлинки `vsh` и `crosh` → `session/stubs/shell-stub.sh` **и в `/usr/local/bin`, и в `/usr/bin`** (Ash терминала зовёт их по абсолютному пути `/usr/bin/vsh`, `PATH` не ищет — см. преflight в `doctor.sh`) |
 
 Опции:
 
 * `--user NAME` — под каким пользователем крутится Ash (по умолчанию `$SUDO_USER`);
-* `--undo` — убрать политику, tmpfiles и заглушки, восстановить `lsb-release` и заменённые `vsh`/`crosh`;
+* `--undo` — убрать политику, tmpfiles и заглушки, восстановить `lsb-release`, снять симлинк часового пояса и заменённые `vsh`/`crosh`;
 * `--no-mojo` — не прописывать `CHROMEOS_RELEASE_NAME` (см. [раздел про режим ChromeOS](#режим-chromeos-lsb-release-и-mojo));
 * `--force` — заменить существующие заглушки `vsh`/`crosh` (в `/usr/local/bin` и `/usr/bin`; старые уходят в `.bak`).
 
@@ -305,7 +306,19 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * Работает Linux-сантехника: выбор файлов, xdg-desktop-portal-gtk, polkit-промпты, gnome-keyring.
 * Работает **нативный лок-экран Ash** (`Ctrl+Shift+L`) и разлочка **любым паролем** (см. «Лок-экран и разлочка»).
 * Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — см. патч «Раскладка RU/EN».
-* Linux-приложения рендерятся через GPU: sommelier запускает Xwayland с `--force-drm-device` и `--enable-linux-dmabuf`, поэтому клиенты получают `zwp_linux_dmabuf_v1`, а путь dmabuf → exo → `OzoneImageBacking` закрыт тремя GPU-патчами бинарника вместе с шимом `libminigbm.so` (см. «Патчи бинарника»). `glxgears` на `:10` держит ~60 FPS, и сессия при этом не подвисает. **`--glamor` намеренно НЕ передаётся** — почему, см. «Сырые места».
+* Linux-приложения рендерятся через GPU: sommelier запускает Xwayland с `--force-drm-device` и `--enable-linux-dmabuf`, поэтому клиенты получают `zwp_linux_dmabuf_v1`, а путь dmabuf → exo → `OzoneImageBacking` закрыт тремя GPU-патчами бинарника вместе с шимом `libminigbm.so` (см. «Патчи бинарника»). `glxgears` на `:10` держит ~60 FPS, и сессия при этом не подвисает. **`--glamor` намеренно НЕ передаётся** — почему, см. «Сырые места». Сейчас временно включен, так как похоже проблема устарела
+
+## Терминал
+
+Нативного UI у Terminal SWA в этом снапшоте нет (bootstrap на 94 байта), поэтому UI живёт в `terminal/terminal-ui.js` и инжектируется в приложение. Это не однострочное поле, а самостоятельный VT/xterm-класс эмулятор на canvas, работающий локально через `chrome.terminalPrivate` (без инета, без VM):
+
+* Цвета: 16/256/truecolor SGR, bold/dim/italic/underline/inverse/strike.
+* Управляющие последовательности: курсор, стирание, вставка/удаление строк и символов, scroll-регионы, alt screen (`?1049` — htop/mc работают), DECCKM, автоперенос, табуляции, DEC special graphics, ответы DSR/DA, OSC-заголовки.
+* Скроллбэк 5000 строк (колесо мыши), широкие символы (CJK/эмодзи), комбинируемые знаки.
+* Выделение мышью (клик — слово, тройной — строка), копирование, вставка, bracketed paste, mouse tracking (X10/SGR) для TUI-приложений.
+* Шрифт: `Ctrl +` / `Ctrl -` / `Ctrl 0` (запоминается).
+
+Шорткаты: `Ctrl+Shift+C` — копировать, `Ctrl+Shift+V` / `Shift+Insert` — вставить, `Ctrl+/-/0` — размер шрифта.
 
 ## Сырые места
 
@@ -315,7 +328,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 |---|---|
 | Данные сети/аудио/батареи в трее | Реальные данные есть, но очень ограничены |
 | Интеграция Linux-приложений в лаунчер | `.desktop`-файлы пишутся в настройки Crostini, но запускаться могут не все (большинство — да) |
-| Эмуляция терминала | Базовый VT100 хватает на fastfetch; для работы бери нормальный терминал |
+| Эмуляция терминала | Полноценный VT/xterm-класс эмулятор на canvas (см. раздел «Терминал») |
 | Аудио-узлы | Громкость работает, но узлы захардкожены (Speaker/Headphone/Mic), реального discovery PipeWire нет |
 | Яркость / SUSPEND | `power-bridge` работает от вашего пользователя: на запись в `/sys/class/backlight/*/brightness` нужны права (добавьте себя в группу `video`), suspend зависит от polkit |
 | Гостевой профиль | `/home/chronos/user` — обычная директория, а не cryptohome |

@@ -215,13 +215,6 @@ func (p *powerManager) GetAmbientLightSensorEnabled() (bool, *dbus.Error) {
 	return false, nil
 }
 
-// GetKeybardAmbientLightSensorEnabled — "Keybard" is Chromium's own typo (the
-// real D-Bus member; see SetKeyboardAmbientLightSensorEnabled next to it in the
-// chrome binary). Answers "no keyboard ALS" so Ash stops polling it.
-func (p *powerManager) GetKeybardAmbientLightSensorEnabled() (bool, *dbus.Error) {
-	return false, nil
-}
-
 func (p *powerManager) HasKeyboardBacklight() (bool, *dbus.Error) {
 	return false, nil
 }

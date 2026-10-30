@@ -354,7 +354,7 @@ while true; do
       XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
         "$SOMMELIER" \
           --noop-driver \
-          -X \
+          -X --glamor \
           --socket=wayland-1 \
           --x-display=10 \
           --xwayland-path="$(command -v Xwayland || echo /usr/bin/Xwayland)" \

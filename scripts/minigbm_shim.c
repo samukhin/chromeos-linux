@@ -142,12 +142,6 @@ static void shim_log(const char *fmt, ...) {
   if (n <= 0) {
     return;
   }
-  /* vsnprintf returns the length it *wanted* to write; on truncation that can
-   * exceed sizeof(buf). Clamp before write(), otherwise we'd read past the
-   * end of our own 512-byte stack buffer. */
-  if ((size_t)n >= sizeof(buf)) {
-    n = (int)sizeof(buf) - 1;
-  }
   int fd = open(SHIM_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0666);
   if (fd < 0) {
     return;
@@ -268,73 +262,49 @@ struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
       (type == MINIGBM_IMPORT_FD_MODIFIER) ? MESA_IMPORT_FD_MODIFIER : type;
   uint64_t masked = mask_usage(flags);
 
-  /* buf's layout depends on the import type: the legacy GBM_BO_IMPORT_FD
-   * descriptor is only 20 bytes (shim_import_fd), whereas the modifier
-   * descriptor is 72 (shim_import_mod). Only the modifier path may read
-   * num_fds/modifier — doing so for the legacy path reads past the caller's
-   * buffer (out-of-bounds). */
-  const struct shim_import_mod *m = NULL;
-  if (mesa_type == MESA_IMPORT_FD_MODIFIER) {
-    m = (const struct shim_import_mod *)buf;
-  }
+  const struct shim_import_mod *m = (const struct shim_import_mod *)buf;
+  /* Only meaningful for the modifier descriptor; >= 1 plane and <= 4 planes
+   * is what Mesa's gbm_import_fd_modifier_data can address. */
+  int sane = (m->num_fds >= 1 && m->num_fds <= 4);
 
-  if (m) {
-    /* Only meaningful for the modifier descriptor; >= 1 plane and <= 4 planes
-     * is what Mesa's gbm_import_fd_modifier_data can address. */
-    int sane = (m->num_fds >= 1 && m->num_fds <= 4);
+  struct gbm_bo *bo =
+      p_bo_import ? p_bo_import(gbm, mesa_type, buf, (uint32_t)masked) : NULL;
 
-    struct gbm_bo *bo =
-        p_bo_import ? p_bo_import(gbm, mesa_type, buf, (uint32_t)masked) : NULL;
+  shim_log("[%d] gbm_bo_import(type=0x%x->0x%x flags=0x%x->0x%llx, "
+           "fmt=0x%08x %ux%u num_fds=%u mod=0x%llx) -> %s\n",
+           getpid(), type, mesa_type, flags, (unsigned long long)masked,
+           m->format, m->width, m->height, m->num_fds,
+           (unsigned long long)m->modifier, bo ? "BO" : "NULL");
 
-    shim_log("[%d] gbm_bo_import(type=0x%x->0x%x flags=0x%x->0x%llx, "
-             "fmt=0x%08x %ux%u num_fds=%u mod=0x%llx) -> %s\n",
-             getpid(), type, mesa_type, flags, (unsigned long long)masked,
-             m->format, m->width, m->height, m->num_fds,
-             (unsigned long long)m->modifier, bo ? "BO" : "NULL");
-
-    if (bo || mesa_type != MESA_IMPORT_FD_MODIFIER || !sane) {
-      return bo;
-    }
-
-    /* Retry: vmwgfx rejects DRM_FORMAT_MOD_INVALID imports, LINEAR it accepts. */
-    struct shim_import_mod linear = *m;
-    linear.modifier = 0;
-    bo = p_bo_import ? p_bo_import(gbm, MESA_IMPORT_FD_MODIFIER, &linear,
-                                   (uint32_t)masked)
-                     : NULL;
-    shim_log("[%d]   fallback modifier=0 -> %s\n", getpid(),
-             bo ? "BO" : "NULL");
-    if (bo) {
-      return bo;
-    }
-
-    /* Last resort: the legacy single-plane descriptor, rebuilt from the
-     * modifier descriptor's first plane. */
-    struct shim_import_fd legacy;
-    legacy.fd = m->fds[0];
-    legacy.width = m->width;
-    legacy.height = m->height;
-    legacy.stride = (uint32_t)m->strides[0];
-    legacy.format = m->format;
-    bo = p_bo_import ? p_bo_import(gbm, MESA_IMPORT_FD, &legacy,
-                                   (uint32_t)masked)
-                     : NULL;
-    shim_log("[%d]   fallback legacy FD(fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
-             getpid(), legacy.fd, legacy.width, legacy.height, legacy.stride,
-             legacy.format, bo ? "BO" : "NULL");
+  if (bo || mesa_type != MESA_IMPORT_FD_MODIFIER || !sane) {
     return bo;
   }
 
-  /* Legacy (or unknown) import type: buf is the 20-byte shim_import_fd. Log
-   * only its own fields — never the modifier descriptor's — and pass through. */
-  const struct shim_import_fd *fd_data = (const struct shim_import_fd *)buf;
-  struct gbm_bo *bo =
-      p_bo_import ? p_bo_import(gbm, mesa_type, buf, (uint32_t)masked) : NULL;
-  shim_log("[%d] gbm_bo_import(fd type=0x%x flags=0x%x->0x%llx, "
-           "fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
-           getpid(), type, flags, (unsigned long long)masked, fd_data->fd,
-           fd_data->width, fd_data->height, fd_data->stride, fd_data->format,
+  /* Retry: vmwgfx rejects DRM_FORMAT_MOD_INVALID imports, LINEAR it accepts. */
+  struct shim_import_mod linear = *m;
+  linear.modifier = 0;
+  bo = p_bo_import ? p_bo_import(gbm, MESA_IMPORT_FD_MODIFIER, &linear,
+                                 (uint32_t)masked)
+                   : NULL;
+  shim_log("[%d]   fallback modifier=0 -> %s\n", getpid(),
            bo ? "BO" : "NULL");
+  if (bo) {
+    return bo;
+  }
+
+  /* Last resort: the legacy single-plane descriptor. */
+  struct shim_import_fd legacy;
+  legacy.fd = m->fds[0];
+  legacy.width = m->width;
+  legacy.height = m->height;
+  legacy.stride = (uint32_t)m->strides[0];
+  legacy.format = m->format;
+  bo = p_bo_import ? p_bo_import(gbm, MESA_IMPORT_FD, &legacy,
+                                 (uint32_t)masked)
+                   : NULL;
+  shim_log("[%d]   fallback legacy FD(fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
+           getpid(), legacy.fd, legacy.width, legacy.height, legacy.stride,
+           legacy.format, bo ? "BO" : "NULL");
   return bo;
 }
 

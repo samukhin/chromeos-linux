@@ -576,6 +576,17 @@ func (v *vmConcierge) GetVmLaunchAllowed(req []byte) ([]byte, *dbus.Error) {
 	return b, nil
 }
 
+// SetVmCpuRestriction takes a serialized SetVmCpuRestrictionRequest and returns
+// a serialized SetVmCpuRestrictionResponse. CPU pinning is not applied here, so
+// an empty response (all fields at defaults, i.e. no error) is enough for
+// ConciergeHelperService to stop logging UnknownMethod.
+func (v *vmConcierge) SetVmCpuRestriction(req []byte) ([]byte, *dbus.Error) {
+	log.Printf("SetVmCpuRestriction: %d bytes (no-op)", len(req))
+	// SetVmCpuRestrictionResponse { bool success = 1; } — ConciergeHelperService
+	// logs "Failed to call SetVmCpuRestriction" unless success reads true.
+	return appendBool(nil, 1, true), nil
+}
+
 func (v *vmConcierge) ListVms(req []byte) ([]byte, *dbus.Error) {
 	learnOwnerID("ListVms", decodeStringFields(req))
 	log.Printf("ListVms called")
@@ -602,17 +613,6 @@ func (v *vmConcierge) StopVm(req []byte) ([]byte, *dbus.Error) {
 	log.Printf("StopVm called")
 	markSessionStopped()
 	return appendBool(nil, 1, true), nil // success = true
-}
-
-// SetVmCpuRestriction takes a serialized SetVmCpuRestrictionRequest and returns
-// a serialized SetVmCpuRestrictionResponse. CPU pinning is not applied here, so
-// an empty response (all fields at defaults, i.e. no error) is enough for
-// ConciergeHelperService to stop logging UnknownMethod.
-func (v *vmConcierge) SetVmCpuRestriction(req []byte) ([]byte, *dbus.Error) {
-	log.Printf("SetVmCpuRestriction: %d bytes (no-op)", len(req))
-	// SetVmCpuRestrictionResponse { bool success = 1; } — ConciergeHelperService
-	// logs "Failed to call SetVmCpuRestriction" unless success reads true.
-	return appendBool(nil, 1, true), nil
 }
 
 func (v *vmConcierge) CreateDiskImage(req []byte, fds []dbus.UnixFD) ([]byte, *dbus.Error) {

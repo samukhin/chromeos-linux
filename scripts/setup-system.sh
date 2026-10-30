@@ -121,6 +121,11 @@ if [ "$UNDO" = "1" ]; then
     mv -f "$LSB_BAK" "$LSB"
     note "restored $LSB"
   fi
+  # Only drop the TZ link if it is a symlink (never touch a real file/dir).
+  if [ -L /var/lib/timezone/localtime ]; then
+    rm -f /var/lib/timezone/localtime
+    note "removed /var/lib/timezone/localtime"
+  fi
   apply_dbus_policy
   note "removed policy, tmpfiles, stubs"
   exit 0
@@ -172,10 +177,7 @@ if [ -e /sys/class/misc/kvm ]; then
   # merely stats the path, but a real node costs nothing and keeps KVM usable:
   # build it from the driver's own major:minor.
   if ! [ -c /dev/kvm ] && [ -r /sys/class/misc/kvm/dev ]; then
-    # /sys/class/misc/kvm/dev holds "MAJOR:MINOR" as ONE colon-joined token,
-    # so split on ':' — a plain `read -r a b` splits on IFS whitespace and
-    # would feed mknod the literal "10:232" as the major ("invalid major").
-    IFS=: read -r kvm_major kvm_minor < /sys/class/misc/kvm/dev
+    read -r kvm_major kvm_minor < /sys/class/misc/kvm/dev
     if mknod -m 0666 /dev/kvm c "$kvm_major" "$kvm_minor" 2>/dev/null; then
       note "created /dev/kvm ($kvm_major:$kvm_minor) — udev/devtmpfs had skipped it"
     fi
@@ -212,12 +214,29 @@ fi
 mkdir -p "/var/lib/ash-profile/test-user"
 chown -R "$TARGET_USER:users" /var/lib/ash-profile
 
+# --- timezone ---------------------------------------------------------------
+# Ash reads its TZ from /var/lib/timezone/localtime (a symlink ChromeOS keeps
+# next to /etc/localtime). Without it Chrome logs
+# "Cannot read timezone symlink /var/lib/timezone/localtime" and silently
+# falls back to America/Los_Angeles for the shelf clock. Point it at the host's
+# resolved zone; /var persists across reboots, so one run is enough.
+if [ -e /etc/localtime ]; then
+  mkdir -p /var/lib/timezone
+  ln -sfn "$(readlink -f /etc/localtime)" /var/lib/timezone/localtime
+  note "linked /var/lib/timezone/localtime -> $(readlink -f /etc/localtime)"
+else
+  note "no /etc/localtime; skipping timezone link"
+fi
+
 # --- lsb-release -----------------------------------------------------------
 
 if [ "$MOJO" = "1" ]; then
   keys=(
     "DEVICETYPE=CHROMEBOOK"
     "CHROMEOS_RELEASE_NAME=Chrome OS"
+    # version_loader.cc reads this for Settings → About; without it Chrome
+    # logs "No LSB version key: CHROMEOS_RELEASE_DESCRIPTION" at startup.
+    "CHROMEOS_RELEASE_DESCRIPTION=Chrome OS (chromeos-linux)"
   )
 else
   keys=("DEVICETYPE=CHROMEBOOK")

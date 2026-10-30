@@ -27,7 +27,7 @@ else
 fi
 
 for b in shill-bridge cras-bridge power-bridge session-bridge crostini-bridge \
-         rmad-bridge mojo-stub register-apps; do
+         rmad-bridge stub-bridge mojo-stub register-apps; do
   [ -x "$ASH_ROOT/dist/bin/$b" ] || die "missing binary: dist/bin/$b"
 done
 
