@@ -58,7 +58,8 @@ fi
 echo "unpacking sources"
 rm -rf "$SRC"
 mkdir -p "$SRC"
-tar xzf "$TARBALL" -C "$SRC"
+tar xzf "$TARBALL" -C "$SRC" -m
+
 [ -f "$SRC/meson.build" ] || die "unexpected sommelier tarball layout"
 
 # Verify the unpacked content (the tarball itself is not reproducible).
@@ -75,7 +76,7 @@ cd "$SRC"
 # 1. Don't touch virtgpu when running with --noop-driver (no ChromeOS GPU).
 grep -q 'drm_fd = noop_driver ? -1 : open_virtgpu' sommelier.cc ||
   sed -i 's|drm_fd = open_virtgpu(\&drm_device);|drm_fd = noop_driver ? -1 : open_virtgpu(\&drm_device);|' sommelier.cc
-grep -q 'noop_driver ? -1 : open_virtgpu' sommelier.cc ||
+grep -q 'drm_fd = noop_driver ? -1 : open_virtgpu' sommelier.cc ||
   die "sommelier.cc patch failed (pattern not found)"
 
 # 2. Buffer/compositor patches: exo relabels XRGB8888 shm buffers to

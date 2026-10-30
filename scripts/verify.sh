@@ -35,10 +35,13 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
     ok "chrome: all shared libraries resolve"
   fi
 
-  interp=$(readelf -l "$ASH_ROOT/dist/chrome/chrome" |
+  # LC_ALL=C: readelf localizes that header ("Запрашиваемый интерпретатор
+  # программы:" under ru_RU), so the sed below would match nothing and the
+  # check would print <unreadable> on any non-English system.
+  interp=$(LC_ALL=C readelf -l "$ASH_ROOT/dist/chrome/chrome" |
            sed -n 's/.*Requesting program interpreter: \(.*\)\]$/\1/p' | head -1)
   ok "chrome interpreter: ${interp:-<unreadable>}"
-  rpath=$(readelf -d "$ASH_ROOT/dist/chrome/chrome" | awk -F'[][]' '/RPATH|RUNPATH/ { print $2; exit }')
+  rpath=$(LC_ALL=C readelf -d "$ASH_ROOT/dist/chrome/chrome" | awk -F'[][]' '/RPATH|RUNPATH/ { print $2; exit }')
   ok "chrome rpath: ${rpath:-<none>}"
 
   if grep -qF 'eval(localStorage.t||"")' "$ASH_ROOT/dist/chrome/chrome"; then

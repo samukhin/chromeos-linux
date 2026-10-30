@@ -19,7 +19,20 @@ die "usage: terminal-inject.pl <path/to/terminal-ui.js>\n" unless defined $ui &&
 
 my $mid = 1;
 
-sub rx { my ($s, $n) = @_; my $b = ""; while (length($b) < $n) { sysread($s, my $c, $n - length($b)); $b .= $c; } $b }
+sub rx {
+  my ($s, $n) = @_;
+  my $b = "";
+  while (length($b) < $n) {
+    my $got = sysread($s, my $c, $n - length($b));
+    # 0 = EOF (Chrome died/restarted mid-exchange), undef = socket error
+    # (ECONNRESET). Without this check $b never grows on a dead connection
+    # and the loop spins forever at 100% CPU — the injector is re-launched
+    # on every session restart, so leaked spins would pile up.
+    die "terminal-inject: connection lost (sysread failed or EOF)\n" unless $got;
+    $b .= $c;
+  }
+  $b;
+}
 sub rv {
   my $s = shift; rx($s, 1); my $b = ord(rx($s, 1)); my $l = $b & 127;
   $l = unpack("n", rx($s, 2)) if $l == 126; rx($s, $l);

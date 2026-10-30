@@ -9,7 +9,10 @@
 # /run/current-system, no /run/opengl-driver.
 set -u
 
-ASH_ROOT="${ASH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Shared ASH_ROOT + die/log/note, prefixed with "[session] ".
+ASH_MSG_PREFIX="[session] "
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/common.sh"
+
 BIN="$ASH_ROOT/dist/bin"
 CHROME="$ASH_ROOT/dist/chrome/chromeos-ash"
 SOMMELIER="$ASH_ROOT/dist/sommelier/bin/sommelier"
@@ -18,9 +21,6 @@ TEST_USER="${ASH_LOGIN_PROFILE:-test-user}"
 
 VM_DISPLAY_BOUNDS="${ASH_DISPLAY_SIZE:-1920x1080}"
 LOGIN_USER="${ASH_LOGIN_USER:-linux@local}"
-
-log() { printf '[session] %s\n' "$*" >&2; }
-die() { printf '[session] error: %s\n' "$*" >&2; exit 1; }
 
 XORG_PID=""          # non-empty only if THIS script started Xorg (never kill an inherited display)
 XORG_AUTH=""         # cookie file handed to THAT Xorg; removed with it (startx does the same)
@@ -123,11 +123,9 @@ start_x_if_needed() {
     log "using existing X display $DISPLAY"
     return 0
   fi
-  if ! command -v Xorg >/dev/null 2>&1 && ! command -v X >/dev/null 2>&1; then
-    die "no DISPLAY and no Xorg to start — log into an X session first, or install xserver-xorg"
-  fi
   local xbin n authfile cookie i
-  xbin="$(command -v Xorg || command -v X)"
+  xbin="$(command -v Xorg || command -v X)" || true
+  [ -n "$xbin" ] || die "no DISPLAY and no Xorg to start — log into an X session first, or install xserver-xorg"
   n="$(first_free_display)" || die "no free X display (:0-:63 all taken)"
   command -v mcookie >/dev/null 2>&1 ||
     die "mcookie missing — cannot start X with access control (install util-linux)"
@@ -379,7 +377,6 @@ while true; do
     "${login_flags[@]}" \
     --ozone-platform=x11 \
     --ash-host-window-bounds="$ASH_HOST_WINDOW_BOUNDS" \
-    --force-device-scale-factor=1 \
     2>>"$PROFILE/ash.log" &
   chrome_pid=$!
   # wait (not a foreground run) so the INT/TERM traps fire promptly; a plain

@@ -10,8 +10,6 @@
 
 Всё здесь — обычные shell-скрипты, Go и Meson: **Nix не нужен** (старая Nix-упаковка удалена). Целевые системы — x86_64 Ubuntu/Debian и Arch; ничего ультра-Ubuntu-specific в коде нет, требуются рабочие glibc, D-Bus и X.
 
-
-
 ## Содержание
 
 1. [Как это устроено](#как-это-устроено)
@@ -24,9 +22,10 @@
 8. [Патчи бинарника](#патчи-бинарника-applied-at-build-time)
 9. [Режим ChromeOS: lsb-release и mojo](#режим-chromeos-lsb-release-и-mojo)
 10. [Что работает / сырые места / что не работает](#что-работает)
-11. [Проверка и диагностика](#проверка-и-диагностика)
-12. [Обновление ревизии Chrome и хакинг](#обновление-ревизии-chrome)
-13. [Ограничения безопасности](#ограничения-безопасности)
+11. [Лок-экран и разлочка](#лок-экран-и-разлочка)
+12. [Проверка и диагностика](#проверка-и-диагностика)
+13. [Обновление ревизии Chrome и хакинг](#обновление-ревизии-chrome)
+14. [Ограничения безопасности](#ограничения-безопасности)
 
 ## Как это устроено
 
@@ -114,11 +113,11 @@ sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja gcc make
 ## Структура репозитория
 
 ```
-chromeos-bin/REVISION         пин ревизии снапшота ChromiumOS (1631797)
+chromeos-bin/REVISION         пин ревизии снапшота ChromiumOS (1670871)
 chromeos-bin/fetch.sh         скачивание + проверка контрольных сумм
 chromeos-bin/chrome/          распакованный снапшот (после make fetch, ~870 МБ)
 
-scripts/common.sh             общие хелперы (ASH_ROOT, die, need)
+scripts/common.sh             общие хелперы ВСЕХ скриптов: ASH_ROOT, die/log/note (с префиксом вызывающего), need/have
 scripts/build-chrome.sh       патчинг бинарника → dist/chrome/
 scripts/build-sommelier.sh    сборка sommelier → dist/sommelier/
 scripts/build-bridges.sh      сборка Go-бриджей → dist/bin/
@@ -131,7 +130,7 @@ scripts/smoke-test.sh         проверка бриджей на живой с
 session/start-session.sh      точка входа: бриджи + сессия
 session/chromeos-linux-session основной сессионный цикл
 session/terminal-inject.pl    инжект UI терминала по CDP
-session/chromeos-ash-open-url обработчик ссылок http/https/text-html
+session/chromeos-ash-open-url ручной helper: открывает URL в запущенном Ash через CDP (обработчиком по умолчанию НЕ регистрируется)
 session/dbus-policies/        D-Bus политика (исходник для setup-system.sh)
 session/tmpfiles.d/           шаблон tmpfiles (исходник для setup-system.sh)
 session/stubs/shell-stub.sh   заглушки vsh / crosh
@@ -188,7 +187,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | Шаг | Что появляется |
 |---|---|
 | D-Bus-политика | `/etc/dbus-1/system.d/chromeos-bridges.conf` — копия `session/dbus-policies/chromeos-bridges.conf` с подставленным пользователем; после изменения шина перезапускается |
-| Системные каталоги | `/etc/tmpfiles.d/chromeos-linux.conf` + `systemd-tmpfiles --create`: `/var/lib/ash-profile`, `/run/mojo`, `/home/chronos/user`, заглушки termina-DLC и VM-диска, `/var/log/chrome`, `/var/lib/metrics/...`, а также заглушка `/dev/kvm` (без неё Chrome считает, что виртуализации нет, и молча не открывает Linux-приложения) |
+| Системные каталоги | `/etc/tmpfiles.d/chromeos-linux.conf` + `systemd-tmpfiles --create`: `/var/lib/ash-profile`, `/run/mojo`, `/home/chronos/user`, заглушки termina-DLC и VM-диска, `/var/log/chrome`, `/var/lib/metrics/...`, а также заглушка `/dev/kvm` — **только если KVM на хосте нет** (без неё Chrome считает, что виртуализации нет, и молча не открывает Linux-приложения; при наличии `/sys/class/misc/kvm` строка из конфига выбрасывается, а уже установленная заглушка снимается — она мешала бы udev создать настоящий device-node) |
 | Личность ОС | в `/etc/lsb-release` дописываются `DEVICETYPE=CHROMEBOOK` и `CHROMEOS_RELEASE_NAME=Chrome OS` (исходный файл сохраняется в `/etc/lsb-release.chromeos-linux.bak`) |
 | Заглушки шелла | симлинки `vsh` и `crosh` → `session/stubs/shell-stub.sh` **и в `/usr/local/bin`, и в `/usr/bin`** (Ash терминала зовёт их по абсолютному пути `/usr/bin/vsh`, `PATH` не ищет — см. преflight в `doctor.sh`) |
 
@@ -198,6 +197,8 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * `--undo` — убрать политику, tmpfiles и заглушки, восстановить `lsb-release` и заменённые `vsh`/`crosh`;
 * `--no-mojo` — не прописывать `CHROMEOS_RELEASE_NAME` (см. [раздел про режим ChromeOS](#режим-chromeos-lsb-release-и-mojo));
 * `--force` — заменить существующие заглушки `vsh`/`crosh` (в `/usr/local/bin` и `/usr/bin`; старые уходят в `.bak`).
+
+> **Группа `users`.** Скрипт делает `chown "$USER:users"` профиля, а все каталоги из tmpfiles создаются с группой `users`. На Debian/Ubuntu она есть по умолчанию (`USERS_GROUP=users`), на части minimal-установок — нет. Если её не окажется, `setup-system` упадёт на `chown`/`systemd-tmpfiles` с `group 'users' does not exist`: создай её (`sudo groupadd users`) либо заранее поменяй группу во всех строках `session/tmpfiles.d/chromeos-linux.conf` (и в `chown` внутри `scripts/setup-system.sh`).
 
 Почему без systemd не обойтись «вручную»: политика D-Bus подхватывается только при старте демона. На systemd-less системе (или в контейнере) скрипт предупредит, что dbus надо перезапустить или перезагрузиться.
 
@@ -230,6 +231,8 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 Если на машине уже есть `wayland-0` (например, вы внутри другого Ash или Wayland-сессии) — старые сокеты удаляются, `--enable-wayland-server` Ash займёт этот слот.
 
+Перед подъёмом бриджей `start-session.sh` отцепляет всё дерево сессии от управляющего терминала (`exec setsid --wait`), чтобы чтение `/dev/tty` кем-либо из процессов сессии не могло остановить группой всю оболочку — подробности и разбор инцидента во врезке в «Типовых проблемах».
+
 ## Переменные окружения
 
 | Переменная | По умолчанию | Что делает |
@@ -261,6 +264,8 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | `RedirectChromeLogging` | `ret` (no-op) | Chrome уводит логи в ChromeOS-путь |
 | `OnDisconnect` | `ret` (no-op) | крэш при таймауте mojo-канала |
 | `HasInternalDisplay` | всегда `true` | нет ползунка яркости |
+| `IsSystemBlurEnabled` | всегда `true` | blur панели/шторки гейтится не на GPU, а на ОЗУ: `chromeos::features::IsSystemBlurEnabled()` — это буквально `AmountOfTotalPhysicalMemory() > 4GiB` из `/proc/meminfo`, без FeatureList и без флага. На хостах ≤4 ГБ (гости VirtualBox, типовые Haswell-ноутбуки) панель и шторка рисуются непрозрачными, хотя композитор blur умеет рисовать на чём угодно (`viz::SoftwareRenderer::GetBackdropFilterShader` есть). С патчем — blur при любом объёме RAM; на малорамных хостах это стоит части FPS в анимациях |
+| Раскладка RU/EN | `OzonePlatformX11::InitializeUI` вместо `StubKeyboardLayoutEngine` собирает пару `XkbEvdevCodes` + `XkbKeyboardLayoutEngine` (как DRM-платформа) и регистрирует её в `KeyboardLayoutEngineManager`, а thunk на месте мёртвого `Stub::Lookup` перенаправляет `StubInputController::SetCurrentLayoutByName` в зарегистрированный движок | смена RU/EN в шторке двигает только индикатор в трее: набор текста остаётся US (нужны xkb-данные из `xkb-data` / `xorg-xkbdata`) |
 | crashpad-wrapper | всегда добавляет `--database` | падение на старте crashpad-handler'а |
 
 Чего патч **не** делает: он не трогает интерпретатор и RPATH. Снапшот уже использует `/lib64/ld-linux-x86-64.so.2` и `RUNPATH=$ORIGIN`, поэтому patchelf не нужен вообще — `ldd` на обычном дистрибутиве всё резолвит, а `libminigbm.so` подхватывается из каталога бинарника.
@@ -293,6 +298,8 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * UPower кормит бридж питания состоянием батареи.
 * Яркость работает через sysfs с фолбэком на `xrandr`.
 * Работает Linux-сантехника: выбор файлов, xdg-desktop-portal-gtk, polkit-промпты, gnome-keyring.
+* Работает **нативный лок-экран Ash** (`Ctrl+Shift+L`) и разлочка **любым паролем** (см. «Лок-экран и разлочка»).
+* Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — см. патч «Раскладка RU/EN».
 
 ## Сырые места
 
@@ -305,15 +312,30 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | Эмуляция терминала | Базовый VT100 хватает на fastfetch; для работы бери нормальный терминал |
 | Аудио-узлы | Громкость работает, но узлы захардкожены (Speaker/Headphone/Mic), реального discovery PipeWire нет |
 | Рендер «управляемых» Linux-приложений | X11-приложения на `DISPLAY=:10` идут через wl_shm, без аппаратного ускорения |
-| Яркость / сусPEND | `power-bridge` работает от вашего пользователя: на запись в `/sys/class/backlight/*/brightness` нужны права (добавьте себя в группу `video`), suspend зависит от polkit |
+| Яркость / SUSPEND | `power-bridge` работает от вашего пользователя: на запись в `/sys/class/backlight/*/brightness` нужны права (добавьте себя в группу `video`), suspend зависит от polkit |
 | Гостевой профиль | `/home/chronos/user` — обычная директория, а не cryptohome |
+| Лок-экран | Настоящий, но **разлочивается любым паролем** (в т.ч. пустым): `session-bridge` отдаёт фиктивный `StartAuthSessionReply` с password-фактором `local-password` и всегда успешный `AuthenticateAuthFactor`. Системная соль — константа из моста. `ListAuthFactors` возвращает пусто, поэтому в логе безвредный warning `lock_contents_view.cc:937` (поле ввода пароля показывается дефолтно) |
 | Трей-иконки приложений | StatusNotifierItem не реализован |
+
+## Лок-экран и разлочка
+
+Реализован **нативный лок-экран Ash** с разлочкой без пароля (вариант A). Это настоящий lock-screen ChromeOS (`Ctrl+Shift+L`), а не заглушка: шторка, поле ввода пароля, анимации — всё рисует сам Ash.
+
+Как это устроено:
+
+* `session-bridge` обслуживает D-Bus-интерфейс `org.chromium.UserDataAuth` (`CryptohomeMiscInterface`) — тот же сервис/путь/интерфейс, куда Ash ходит за cryptohome.
+* **Пустой proto-ответ = успех.** `HasError` проверяет наличие поля `error`; ответ без него Ash читает как «ошибки нет». На этом построены `AuthenticateAuthFactor`, `ExtendAuthSession` и прочие методы.
+* `StartAuthSession` отвечает `user_exists=true` и одним password-фактором (type=1, label `local-password`), чтобы `OnStartAuthSession` наполнил `SessionAuthFactors`. Метка должна быть ровно `local-password` (`kCryptohomeLocalPasswordKeyLabel`), иначе `FindAnyPasswordFactor()` → nullptr → «Could not find Password key» (`auth_performer.cc:225`) и разлочка не проходит.
+* Фактор кладётся в **field 9** (`tag 0x4a`), а **не** field 5: `StartAuthSessionReply` содержит два повторных `AuthFactorWithStatus`, и итерирует Ash именно field 9 (у field 5 счётчик в offset `0x20`, у field 9 — в `0x58`; цикл `OnStartAuthSession` читает `0x58`).
+* `GetSystemSalt` возвращает фиксированную 20-байтную соль (salt = field 1). Ключ хешируется (`SALTED_SHA256_TOP_HALF`), но проверки пароля нет: любой введённый пароль (в т.ч. пустой) разлочивает.
+* Страховка от «застревания» на локе: `pkill -f "dist/chrome/chrome"` (делается руками — такого pkill в коде нет) убивает Chrome; он выходит с ненулевым кодом, и цикл перезапуска в `session/chromeos-linux-session` поднимает его заново через пару секунд (`start-session.sh` при этом просто ждёт сессию и бриджи не трогает). Лок-экран никогда не оставит вас запертым.
+
+`ListAuthFactors` возвращает пусто, поэтому при показе лок-экрана в `ash.log` попадает безвредный warning `lock_contents_view.cc:937 Unable to update auth factors…` — поле ввода пароля рисуется дефолтно, на разлочку он не влияет.
 
 ## Что не работает
 
 * Выбор, подключение и отключение Wi-Fi из интерфейса ChromeOS. Вообще, почти все настройки.
-* СусPEND.
-* Интеграция блокировки экрана.
+* SUSPEND.
 * Уведомления в центре уведомлений Ash.
 * Вход в аккаунт Google, синк, Phone Hub, Nearby Share и прочие сервисы, привязанные к аккаунту.
 
@@ -327,7 +349,7 @@ make test             # бриджи на реальной системной ш
 
 Блок `== session preflight ==` в `doctor.sh` ловит «тихие» поломки, которые иначе выглядят как «всё собралось, но почему-то не работает»:
 
-* **`/dev/kvm` отсутствует** → Chrome при старте сессии видит, что виртуализации нет, и **молча** отказывается открывать любые Linux-приложения (в UI нет ошибки — просто не открывается). Заглушки-файлы создаёт `setup-system.sh` (tmpfiles), пересоздаются при каждой перезагрузке.
+* **`/dev/kvm` отсутствует** → Chrome при старте сессии видит, что виртуализации нет, и **молча** отказывается открывать любые Linux-приложения (в UI нет ошибки — просто не открывается). Заглушки-файлы создаёт `setup-system.sh` (tmpfiles), пересоздаются при каждой перезагрузке — но **только на хостах без KVM**; если KVM есть, `setup-system.sh` заглушку не ставит (а заодно снимает уже установленную — она перекрывает настоящий device-node, и udev не может его создать), и `doctor.sh` это отдельно проверяет.
 * **`/usr/bin/vsh` / `/usr/bin/crosh` отсутствуют** → терминал падает с `failed to execvp /usr/bin/vsh`. Ash вызывает их по **абсолютному** пути, `PATH` не ищет, поэтому заглушка обязана лежать именно в `/usr/bin`.
 * **D-Bus-политика** не установлена → бриджи не могут занять имена `org.chromium.*`, и шина молча отклоняет всё.
 * **systemd-logind** неактивен → suspend/reboot из трея мертвы. Обычно за этим стоит мёртвый polkit: polkitd выходит в момент падения системной шины (теряет `org.freedesktop.PolicyKit1`, а `polkit.service` — static, без `Restart=`), после чего logind зависает, дожидаясь polkit-авторизации. Раньше `setup-system.sh` при каждом изменении политики делал `restart dbus` и ронял polkit вместе с шиной — теперь он применяет политику `reload`-ом (без разрыва соединений) и отдельно поднимает polkit.
@@ -355,12 +377,17 @@ make test             # бриджи на реальной системной ш
 | Бриджи пишут `not allowed to own … due to security policies` | политика не установлена или dbus её отбросил | `sudo ./scripts/setup-system.sh --user "$USER"`, перезапуск dbus/перезагрузка; `make verify` ловит это заранее |
 | `no DISPLAY and no Xorg to start` | запущено не из X-сеанса и нет `xserver-xorg` | запусти из терминала в X или поставь `xserver-xorg` |
 | Linux-приложения не рисуются | нет `Xwayland` в `$PATH` | поставь пакет `xwayland` |
-| Chrome вылетает сразу | смотри `ash.log`; либо снапшот не тот (только x86_64, только пин из `chromeos-bin/REVISION`) | сверь пины, `make fetch --force` не требуется, если пины сходятся |
+| Chrome вылетает сразу | смотри `ash.log`; либо снапшот не тот (только x86_64, только пин из `chromeos-bin/REVISION`) | сверь пины (`./chromeos-bin/fetch.sh --force` перескачает и напечатает sums; `make fetch` аргументов не принимает) |
 | `Pactl not found` / громкость не регулируется | нет `pulseaudio-utils` | поставь пакет |
 | Яркость не меняется | нет прав на sysfs | `sudo usermod -aG video $USER` и перелогинься |
+| `setup-system` падает: `chown … : users` / `group 'users' does not exist` | в системе нет группы `users` | `sudo groupadd users` (или поменяй группу в `session/tmpfiles.d/chromeos-linux.conf`) |
+| Linux-приложения не открываются, а `/dev/kvm` есть, но это обычный файл | заглушка перекрыла настоящий device-node KVM (модуль уже загружен) | `sudo ./scripts/setup-system.sh` — снимет заглушку и дёрнет udev; `doctor.sh` показывает это как `placeholder hides the real KVM device` |
 | Всё умерло после правки `session/dbus-policies/*.conf` | dbus < 1.15 молча отбрасывает **весь файл** при неизвестном атрибуте | см. врезку ниже |
+| Вся сессия зависла в состоянии `T` сразу после запуска GUI-приложения от root (`synaptic` через `pkexec`) | в сессии нет polkit-агента: pkexec спрашивает пароль текстовым агентом на управляющем терминале, а цепочка сессии — фоновая группа tty1, и ядро шлёт SIGTSTP/SIGTTIN во всю группу | см. врезку ниже |
 
 > **Врезка про D-Bus-политику.** Debian/Ubuntu поставляют dbus 1.14, который не знает, например, `receive_sender_prefix`. Ошибка разбора через `<includedir>` — это не предупреждение, а тихое удаление файла из конфигурации, после чего *ни одно* имя `org.chromium.*` занять нельзя. Поэтому: проверяйте правки политики через `make verify` (он реально поднимает `dbus-daemon` на файле) и держите в голове, что поддерживаются только классические атрибуты `own`, `own_prefix`, `send_destination`, `send_destination_prefix`, `send_interface`, `receive_sender`.
+
+> **Врезка про зависание всей сессии (состояние `T`).** Сессия, запущенная через `startx`, наследует управляющий терминал `/dev/tty1`, оставаясь при этом *фоновой* группой tty1 (foreground-группа — у самого xinit). Читать/писать `/dev/tty` из фоновой группы нельзя: ядро шлёт SIGTTIN/SIGTSTP **всей** группе. Типичный триггер — `pkexec` без запущенного polkit-агента: его внутренний текстовый агент лезет на терминал за паролем, и целиком встаёт всё — Chrome, бриджи, скрипты. Поэтому `session/start-session.sh` теперь делает `exec setsid --wait "$0"` сразу после startx-блока: всё дерево сессии уходит в отдельную сессию **без** управляющего терминала, чтение `/dev/tty` возвращает `ENXIO`, и посторонний читатель роняет только себя. `--wait` тут не косметика: без него, если процесс уже лидер группы, `setsid` форкается, родитель выходит, и xinit считает клиент мёртвым — с `--wait` родитель дожидается ребёнка и teardown startx работает как прежде. Чего это **не** лечит: без агента `pkexec` теперь быстро откажется с ошибкой вместо запроса пароля — агента запускай сам (`polkit-gnome-authentication-agent-1`, `lxpolkit`, что угодно своё; в скрипты он не добавлен). Восстановление после зависания (для запусков до этого фикса): `kill -KILL` на pkexec-цепочку (например `pkill -x synaptic-pkexec`), затем `kill -CONT -- -<PGID>`.
 
 ## Обновление ревизии Chrome
 

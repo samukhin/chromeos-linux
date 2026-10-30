@@ -16,12 +16,12 @@ REV="$(tr -d '[:space:]' < "$ASH_ROOT/chromeos-bin/REVISION")"
 
 URL="https://commondatastorage.googleapis.com/chromium-browser-snapshots/Linux_ChromiumOS_Full/$REV/chrome-chromeos.zip"
 
-# Integrity pins for snapshot 1631797 (x86_64).
+# Integrity pins for snapshot 1670871 (x86_64).
 #   size/md5  — Google Cloud Storage object metadata (authoritative)
 #   sha256    — computed from the downloaded bytes (cross-checks the md5)
-EXPECTED_SIZE=294110554
-EXPECTED_MD5=b13875f78d5e648e1bc0476c008f8da8
-EXPECTED_SHA256=7f4d0b1e6f7b7fbb421458fde2d22c33dd115c5012d3be3496d78b594c7c5781
+EXPECTED_SIZE=301819246
+EXPECTED_MD5=a715846dcec6234878b827b0ca37cc65
+EXPECTED_SHA256=bbdfa33e80989f2fb79f46b36ca1597553fe87f3d1457542fa9c072c512c4651
 
 STAGE="$ASH_ROOT/chromeos-bin/.stage"
 TARGET="$ASH_ROOT/chromeos-bin/chrome"

@@ -8,15 +8,15 @@
 # Usage: ./session/start-session.sh
 set -u
 
-ASH_ROOT="${ASH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Shared ASH_ROOT + die/log/note, prefixed with "[start-session] ".
+ASH_MSG_PREFIX="[start-session] "
+. "$(dirname "${BASH_SOURCE[0]}")/../scripts/common.sh"
+
 BIN="$ASH_ROOT/dist/bin"
 PROFILE="${ASH_PROFILE_DIR:-/var/lib/ash-profile}"
 TEST_USER="${ASH_LOGIN_PROFILE:-test-user}"
 LOGS="$PROFILE"
 MOJO="${ASH_MOJO:-1}"
-
-log()  { printf '[start-session] %s\n' "$*" >&2; }
-die()  { printf '[start-session] error: %s\n' "$*" >&2; exit 1; }
 
 # Self-launch an X server when there is no display yet, so this script can be
 # run directly (`./session/start-session.sh`) instead of `startx ./session/...`.
@@ -34,6 +34,26 @@ if [ -z "${DISPLAY:-}" ] && [ "${ASH_UNDER_STARTX:-0}" != "1" ]; then
   # -keeptty itself. Forcing ":0 vt1" would collide when :0 is busy (a real
   # session here once had to land on :1) or when not on tty1.
   exec startx "$ASH_ROOT/session/start-session.sh"
+fi
+
+# Detach the whole tree from the controlling terminal. Under startx/xinit the
+# session inherits /dev/tty1 while staying a BACKGROUND process group there
+# (xinit's own group is the foreground one), and a background group stops on
+# any tty read/write: with no polkit agent running, pkexec's internal text
+# agent prompts on the tty and the kernel delivers SIGTSTP/SIGTTIN to the
+# ENTIRE group — Chrome, bridges, everything freezes in state T. In a fresh
+# session with no ctty, /dev/tty reads fail with ENXIO instead.
+#
+# `--wait` covers the single case where setsid(1) must fork (we are already a
+# process group leader): the parent then waits for the child instead of
+# exiting, so startx/xinit still tracks the client to completion and its
+# teardown is unaffected. util-linux is already required (mcookie).
+if [ "${ASH_UNDER_SETSID:-0}" != "1" ]; then
+  command -v setsid >/dev/null 2>&1 ||
+    die "setsid missing — install util-linux"
+  export ASH_UNDER_SETSID=1
+  log "detaching from the controlling terminal (setsid)"
+  exec setsid --wait "$0" "$@"
 fi
 
 # dist/bin/<name>-bridge for the daemons, dist/bin/<name> for helpers like
@@ -95,7 +115,6 @@ start_bridge() {
   # Either dist/bin/<name>-bridge or dist/bin/<name> (mojo-stub).
   local bin
   bin=$(bridge_bin "$name")
-  [ -x "$bin" ] || die "no binary for '$name' — run: make bridges"
   (
     trap 'exit 0' INT TERM
     fast=0

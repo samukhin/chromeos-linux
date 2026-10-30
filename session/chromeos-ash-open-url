@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Open a URL (or local path) in the running Ash browser via CDP.
+# Open a URL (or local path) in the running Ash browser via CDP
+# (PUT http://localhost:9222/json/new?...).
 #
-# Installed as the desktop handler for http/https/text-html so links from
-# regular Linux apps open inside the ChromeOS shell.
+# A manual helper only: it is NOT registered as a desktop handler anywhere
+# (no .desktop file, no xdg-mime), so xdg-open/gio open will not route here.
+# Needs a live session — the CDP port exists only while Ash is running — and
+# exits 0 even when the open failed.
 set -u
 
 URL="${1:-}"

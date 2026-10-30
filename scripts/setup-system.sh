@@ -7,10 +7,9 @@
 #   sudo ./scripts/setup-system.sh --undo
 set -euo pipefail
 
-ASH_ROOT="${ASH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-
-die() { echo "setup-system: error: $*" >&2; exit 1; }
-note() { echo "setup-system: $*"; }
+# Shared ASH_ROOT + die/log/note/need/have, prefixed with "setup-system: ".
+ASH_MSG_PREFIX="setup-system: "
+. "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 # Apply a system D-Bus policy change.
 #
@@ -95,7 +94,7 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1; shift ;;
     --undo) UNDO=1; shift ;;
     -h|--help)
-      sed -n '2,9p' "$0"; exit 0 ;;
+      sed -n '2,7p' "$0"; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
 done
@@ -151,6 +150,46 @@ fi
 [ -f "$TMPFILES_SRC" ] || die "missing $TMPFILES_SRC"
 mkdir -p /etc/tmpfiles.d
 sed "s|@USER@|$TARGET_USER|g" "$TMPFILES_SRC" > "$TMPFILES_DST.new"
+
+# The /dev/kvm placeholder line is only for hosts WITHOUT KVM: Chrome merely
+# stats the path, so a regular file is enough. On a KVM-capable machine that
+# stub would race udev (the module may create the node after boot, and
+# tmpfiles would chmod/chown a REAL device node to 0666). /sys/class/misc/kvm
+# is the reliable signal — it appears with the driver, before the node does.
+if [ -e /sys/class/misc/kvm ]; then
+  # Drop the whole "Crostini gate" comment block plus the f /dev/kvm line.
+  sed -i '/^# Crostini gate:/,/^f \/dev\/kvm/d' "$TMPFILES_DST.new"
+  if [ -f /dev/kvm ]; then
+    # Our stub sits where the device belongs, so udev can never create it.
+    rm -f /dev/kvm
+  fi
+  if ! [ -c /dev/kvm ] && command -v udevadm >/dev/null 2>&1; then
+    udevadm trigger --subsystem-match=misc --sysname-match=kvm 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+  fi
+  # udev/devtmpfs often still skips the node when a placeholder file used to
+  # sit at that path (devtmpfs only creates it at registration time). Chrome
+  # merely stats the path, but a real node costs nothing and keeps KVM usable:
+  # build it from the driver's own major:minor.
+  if ! [ -c /dev/kvm ] && [ -r /sys/class/misc/kvm/dev ]; then
+    # /sys/class/misc/kvm/dev holds "MAJOR:MINOR" as ONE colon-joined token,
+    # so split on ':' — a plain `read -r a b` splits on IFS whitespace and
+    # would feed mknod the literal "10:232" as the major ("invalid major").
+    IFS=: read -r kvm_major kvm_minor < /sys/class/misc/kvm/dev
+    if mknod -m 0666 /dev/kvm c "$kvm_major" "$kvm_minor" 2>/dev/null; then
+      note "created /dev/kvm ($kvm_major:$kvm_minor) — udev/devtmpfs had skipped it"
+    fi
+  fi
+  if [ -c /dev/kvm ]; then
+    note "KVM present: /dev/kvm placeholder dropped; real device node in place"
+  elif touch /dev/kvm 2>/dev/null; then
+    # Last resort: a regular file at the path still passes Chrome's stat().
+    note "KVM driver present but no device node possible; left a placeholder at /dev/kvm"
+  else
+    note "KVM present: /dev/kvm placeholder line dropped from $TMPFILES_DST, but no device node yet"
+    note "         (try: sudo modprobe kvm_intel|kvm_amd; sudo udevadm trigger --sysname-match=kvm)"
+  fi
+fi
 if [ -f "$TMPFILES_DST" ] && cmp -s "$TMPFILES_DST.new" "$TMPFILES_DST"; then
   rm -f "$TMPFILES_DST.new"
 else
@@ -218,11 +257,9 @@ for dir in /usr/local/bin /usr/bin; do
       else
         note "WARNING: $dest exists and is not ours — leaving it alone (--force to replace)"
       fi
-    elif [ -L "$dest" ]; then
-      ln -sf "$ASH_ROOT/session/stubs/shell-stub.sh" "$dest"
     else
+      [ -L "$dest" ] || note "installed $dest"
       ln -sf "$ASH_ROOT/session/stubs/shell-stub.sh" "$dest"
-      note "installed $dest"
     fi
   done
 done

@@ -16,15 +16,6 @@ check() {                     # check <cmd> <needed-for> <apt pkg> <pacman pkg>
   fi
 }
 
-pkg() {                       # pkg <pc-name> <apt pkg> <pacman pkg>
-  if pkg-config --exists "$1" 2>/dev/null; then
-    printf '  ok      %-16s pkg-config %s\n' "$1" "$1"
-  else
-    printf '  MISSING %-16s pkg-config %s  -> apt: %s | pacman: %s\n' "$1" "$1" "$2" "$3"
-    status=1
-  fi
-}
-
 echo "== build =="
 check go            "Go compiler (bridges)"        golang-go        go
 check meson         "sommelier build"              meson            meson
@@ -59,13 +50,25 @@ check rsvg-convert  "launcher icons (SVG)"         librsvg2-bin     librsvg
 check dbus-daemon   "system bus"                   dbus-daemon      dbus
 check nmcli        "networking (shill bridge)"    networkmanager   networkmanager
 echo -n "  check   libXcomposite.so.1  (libxcomposite1 / libxcomposite): "
-if ldd dist/chrome/chrome 2>/dev/null | grep -q "not found"; then
+if ldd "$ASH_ROOT/dist/chrome/chrome" 2>/dev/null | grep -q "not found"; then
   echo "MISSING -> apt: libxcomposite1 | pacman: libxcomposite"
   status=1
-elif [ -e dist/chrome/chrome ]; then
+elif [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
   echo "ok"
 else
   echo "(build chrome first)"
+fi
+
+# XkbKeyboardLayoutEngine builds layouts (RU/EN quick-settings chip) through
+# libxkbcommon, which reads its rules/keymap files from this directory. The
+# shared lib itself is a DT_NEEDED of chrome (covered by the ldd check above),
+# but without the data files every layout lookup silently falls back to US.
+echo -n "  check   /usr/share/X11/xkb  (xkb data files for RU/EN typing): "
+if [ -d /usr/share/X11/xkb ]; then
+  echo "ok"
+else
+  echo "MISSING -> apt: xkb-data | pacman: xorg-xkbdata"
+  status=1
 fi
 
 # Session preflight: durable runtime STATE that decides whether the session
@@ -81,9 +84,18 @@ ps_miss() { printf '  MISSING %-14s %s  -> %s\n' "$1" "$2" "$3"; status=1; }
 
 # Crostini gate: Chrome stats /dev/kvm at session start and, if absent, refuses
 # EVERY Linux app launch with "Virtualization is not supported on this device"
-# (no error in the UI — apps just don't open). A placeholder file is enough.
-if [ -e /dev/kvm ]; then
-  ps_ok "/dev/kvm" "Crostini gate: launcher apps can open"
+# (no error in the UI — apps just don't open). A placeholder file is enough —
+# but only on hosts WITHOUT KVM: a regular file where the real device belongs
+# hides it from udev forever, so apps break for a different, silent reason.
+if [ -c /dev/kvm ]; then
+  ps_ok "/dev/kvm" "real KVM node (Crostini gate open)"
+elif [ -e /sys/class/misc/kvm ]; then
+  # The driver is loaded but /dev/kvm is not a device node: either our
+  # placeholder from an earlier setup, or udev has not created the node yet.
+  ps_miss "/dev/kvm" "placeholder hides the real KVM device (driver is loaded)" \
+          "sudo ./scripts/setup-system.sh  (drops the stub and triggers udev)"
+elif [ -e /dev/kvm ]; then
+  ps_ok "/dev/kvm" "Crostini gate: launcher apps can open (placeholder)"
 else
   ps_miss "/dev/kvm" "apps will NOT open (Crostini blocked)" \
           "sudo ./scripts/setup-system.sh  (reboot also recreates it via tmpfiles)"

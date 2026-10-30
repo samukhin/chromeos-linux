@@ -9,7 +9,10 @@
 #   ./scripts/smoke-test.sh
 set -u
 
-ASH_ROOT="${ASH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Shared ASH_ROOT + die/log/note, prefixed with "smoke-test: ".
+ASH_MSG_PREFIX="smoke-test: "
+. "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
 BIN="$ASH_ROOT/dist/bin"
 TIMEOUT="${ASH_SMOKE_TIMEOUT:-6}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ash-smoke.XXXXXX")"
@@ -31,7 +34,7 @@ cleanup() {
     rm -rf "$TMP"
   else
     echo
-    echo "smoke-test: bridge logs kept in $TMP"
+    note "bridge logs kept in $TMP"
     local f
     for f in "$TMP"/*.log; do
       [ -s "$f" ] || continue
@@ -68,12 +71,12 @@ wait_for_name() {          # wait_for_name <bus name> <logfile> -> 0 if it shows
 start_bridge() {           # start_bridge <name> [env VAR=VAL ...]
   local name=$1
   shift
-  if [ ! -x "$BIN/$name" ] && [ ! -x "$BIN/$name-bridge" ]; then
+  local bin="$BIN/$name"
+  [ -x "$bin" ] || bin="$BIN/$name-bridge"
+  if ! [ -x "$bin" ]; then
     bad "$name: binary missing (run: make bridges)"
     return 1
   fi
-  local bin="$BIN/$name"
-  [ -x "$bin" ] || bin="$BIN/$name-bridge"
   env "$@" "$bin" >"$TMP/$name.log" 2>&1 &
   pids+=($!)
 }
@@ -84,12 +87,11 @@ stop_last() {
   wait "$pid" 2>/dev/null
 }
 
-[ -S /run/dbus/system_bus_socket ] || {
-  echo "smoke-test: no system D-Bus socket at /run/dbus/system_bus_socket" >&2
-  echo "            start it first (systemctl start dbus / dbus-daemon --system --fork)" >&2
-  exit 1
-}
-command -v dbus-send >/dev/null 2>&1 || { echo "smoke-test: dbus-send missing" >&2; exit 1; }
+if ! [ -S /run/dbus/system_bus_socket ]; then
+  log "no system D-Bus socket at /run/dbus/system_bus_socket"
+  die "start it first (systemctl start dbus / dbus-daemon --system --fork)"
+fi
+have dbus-send || die "dbus-send missing"
 
 echo "== policy =="
 if grep -qs 'org.chromium.flimflam' /etc/dbus-1/system.d/*.conf; then
