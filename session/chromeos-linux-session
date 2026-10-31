@@ -297,8 +297,10 @@ while true; do
   "$BIN/register-apps" "$PROFILE/$TEST_USER/Preferences" >&2 || true
 
   # Terminal UI injection (waits for the CDP port, then reloads the page).
+  # Not silenced: a silent miss here used to leave the terminal window white
+  # with no way to tell which step failed — the log names the step.
   perl "$ASH_ROOT/session/terminal-inject.pl" "$ASH_ROOT/terminal/terminal-ui.js" \
-    >/dev/null 2>&1 &
+    >>"$PROFILE/terminal-inject.log" 2>&1 &
 
   # Xwayland :10 in front of the Ash-hosted compositor.
   (
