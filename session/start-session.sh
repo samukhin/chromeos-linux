@@ -64,7 +64,7 @@ bridge_bin() {
   printf '%s' "$bin"
 }
 
-BRIDGES=(shill cras power session crostini rmad)
+BRIDGES=(shill cras power session crostini rmad stub)
 watchdogs=()
 session_pid=""
 
@@ -159,6 +159,7 @@ for name in shill cras session crostini rmad; do
   start_bridge "$name" "${PULSE_ENV[@]}"
 done
 start_bridge power            # backlight/suspend paths want privileges; see README
+start_bridge stub             # one-shot D-Bus stubs for daemons this setup lacks
 if [ "$MOJO" = "1" ]; then
   start_bridge mojo-stub
 fi

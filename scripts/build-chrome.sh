@@ -45,7 +45,7 @@ verify_and_patch() {
   [ -n "$offset" ] || { fail_or_warn "$mode" "$what: symbol/offset not found"; return 0; }
 
   got=$(dd if="$CHROME" bs=1 skip="$offset" count="$(payload_len "$fmt")" 2>/dev/null |
-        od -An -tx1 | tr -d ' \n')
+        od -An -v -tx1 | tr -d ' \n')
   want=$expected
   prefix=${got:0:${#expected}}
 
@@ -63,6 +63,35 @@ fail_or_warn() {
     die "$2"
   fi
   echo "WARNING: $2" >&2
+}
+
+# Same lookup, but silently empty when the symbol is absent: for patches that
+# only some snapshots need (the code simply does not exist yet in older ones).
+sym_va_opt() {
+  nm -C "$CHROME" | SYM_PATTERN="$1" \
+        awk '$0 ~ ENVIRON["SYM_PATTERN"] { print "0x"$1; exit }'
+}
+
+# Hex string -> printf octal-escape format (payloads whose bytes we compute,
+# e.g. relative jump displacements, cannot be literals in the script).
+hex_to_fmt() {
+  awk -v h="$1" 'BEGIN {
+    for (i = 1; i <= length(h); i += 2)
+      printf "\\%03o", strtonum("0x" substr(h, i, 2))
+  }'
+}
+
+# rel32 for `jmp <target>` at <site>: bytes of (target - (site + 5)) as hex.
+# Accepts decimal or 0x-hex arguments (awk's -v does not parse 0x literals,
+# hence the explicit strtonum).
+rel32_hex() { # <target_va> <next_ip_va>
+  awk -v t="$1" -v n="$2" 'BEGIN {
+    if (t ~ /^0x/) t = strtonum(t)
+    if (n ~ /^0x/) n = strtonum(n)
+    d = t - n
+    if (d < 0) d += 4294967296
+    for (i = 0; i < 4; i++) printf "%02x", int(d / (256 ^ i)) % 256
+  }'
 }
 
 # Symbol address as 0x... from GNU nm (demangled). Fails loudly unless soft.
@@ -116,14 +145,25 @@ done < <(grep -Fboa "'wasm-unsafe-eval'" "$CHROME" || true)
 DELTA=$(text_delta)
 [ -n "$DELTA" ] || die ".text section not found in $CHROME"
 
-va=$(sym_va ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display::NativeDisplayDelegate')
+# The libc++ ABI namespace demangles as `std::Cr` here and `std::__Cr` in
+# later snapshots, so keep the namespace out of the pattern. The checked
+# bytes are `cmpb $0,0x21(%rdi) / je +0x38` plus the next opcode; the patch
+# turns that conditional skip into an unconditional jump to the same target
+# (Init+0x4b, the delegate-cleanup epilogue).
+va=$(sym_va ' display::DisplayConfigurator::Init\(std::.*unique_ptr<display::NativeDisplayDelegate')
 verify_and_patch "DisplayConfigurator::Init (skip native display config)" \
-  "$(va_to_offset "$va" "$DELTA" 13)" "807f2101753749" '\351\070\000\000\000\220\220'
+  "$(va_to_offset "$va" "$DELTA" 13)" "807f2100743848" '\351\071\000\000\000\220\220'
 
-va=$(sym_va ' exo::wayland::WaylandDmabufFeedbackManager::WaylandDmabufFeedbackManager\(exo::Display\*\)')
-verify_and_patch "WaylandDmabufFeedbackManager (no dmabuf probing)" \
-  "$(va_to_offset "$va" "$DELTA" 112)" "e8fdd63d08488bb80001000048" \
-  '\111\307\107\010\000\000\000\000\351\137\004\000\000'
+# Only newer snapshots have WaylandDmabufFeedbackManager, so on an older
+# binary there is no dmabuf probing to disable.
+dmabuf_va=$(sym_va_opt ' exo::wayland::WaylandDmabufFeedbackManager::WaylandDmabufFeedbackManager\(exo::Display\*\)')
+if [ -n "$dmabuf_va" ]; then
+  verify_and_patch "WaylandDmabufFeedbackManager (no dmabuf probing)" \
+    "$(va_to_offset "$dmabuf_va" "$DELTA" 112)" "e8fdd63d08488bb80001000048" \
+    '\111\307\107\010\000\000\000\000\351\137\004\000\000'
+else
+  echo "skipped WaylandDmabufFeedbackManager patch (symbol not in this snapshot)"
+fi
 
 va=$(sym_va ' display::DisplayConfigurator::RunPendingConfiguration\(\)')
 verify_and_patch "RunPendingConfiguration (no-op)" \
@@ -133,28 +173,15 @@ va=$(sym_va ' ash::RedirectChromeLogging\(base::CommandLine const&\)')
 verify_and_patch "RedirectChromeLogging (no-op)" \
   "$(va_to_offset "$va" "$DELTA")" "55" '\303'
 
-va=$(sym_va ' ash::mojo_service_manager::.*::OnDisconnect\(')
+# The service manager moved from chromeos:: to ash:: between snapshots;
+# the leading space keeps the pattern off RemoteSetImpl<...>::OnDisconnect.
+va=$(sym_va ' (chromeos|ash)::mojo_service_manager::.*::OnDisconnect\(')
 verify_and_patch "OnDisconnect (no-op)" \
   "$(va_to_offset "$va" "$DELTA")" "55" '\303'
 
 va=$(sym_va ' display::HasInternalDisplay\(\)' soft)
 verify_and_patch "HasInternalDisplay (returns true)" \
   "$(va_to_offset "$va" "$DELTA")" "55" '\260\001\303' soft
-
-# System UI blur (shelf, quick settings, hotseat) is gated on RAM, not GPU:
-# chromeos::features::IsSystemBlurEnabled() is literally
-#   return base::SysInfo::AmountOfTotalPhysicalMemory() > 4GiB;   (0x100000000)
-# read from /proc/meminfo, with no FeatureList or command-line override.
-# So on a <=4 GiB host (VirtualBox guests, typical Haswell laptops) the panel
-# and quick settings render opaque even though the compositor draws backdrop
-# filters fine on any GPU — viz::SoftwareRenderer has its own
-# GetBackdropFilterShader, so no hardware is actually required. Force it true
-# so blur works regardless of installed RAM. Costs some FPS on small-RAM hosts.
-# Prologue: push %rbp; mov %rsp,%rbp; call ... -> mov $1,%eax; ret (no push, so
-# the stack stays balanced).
-va=$(sym_va ' chromeos::features::IsSystemBlurEnabled\(\)')
-verify_and_patch "IsSystemBlurEnabled (always true, blur on any RAM)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\270\001\000\000\000\303'
 
 # --- keyboard layout engine (RU/EN quick-settings chip drives typing) -------
 # OzonePlatformX11::InitializeUI registers StubKeyboardLayoutEngine, whose
@@ -169,40 +196,145 @@ verify_and_patch "IsSystemBlurEnabled (always true, blur on any RAM)" \
 ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(')
 
 # new[] size for the combined block: XkbKeyboardLayoutEngine (0xc8, same as
-# the DRM platform) + XkbEvdevCodes converter (0x10) = 0xd8, was 0x20.
+# the DRM platform) + XkbEvdevCodes converter (0x10) = 0xd8, was 0x20. The
+# immediate is the second byte of `mov $0x20,%edi` at +333.
 verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 381)" "20" '\330'
+  "$(va_to_offset "$ui_va" "$DELTA" 334)" "20" '\330'
 
 # Replace the StubKeyboardLayoutEngine construction with:
-#   lea 0xc8(%rax),%rdi / mov %rax,%r14 / call XkbEvdevCodesC1 /
-#   mov %r14,%rdi / lea 0xc8(%r14),%rsi / call XkbKeyboardLayoutEngineC1 /
-#   mov %r14,0x20(%rbx) / mov %r14,%rdi
-# then falls through into the existing SetKeyboardLayoutEngine call.
+#   lea 0xc8(%rax),%rdi / mov %rax,%rbx / call XkbEvdevCodesC1 /
+#   mov %rbx,%rdi / lea 0xc8(%rbx),%rsi / call XkbKeyboardLayoutEngineC1 /
+#   mov %rbx,0x20(%r14) / mov %rbx,%rdi
+# then falls through into the existing SetKeyboardLayoutEngine call. This
+# snapshot keeps the fresh engine in %rbx and `this` in %r14 (the 1670871
+# build had them the other way round), which is why the registers below
+# differ from that revision's patch.
 verify_and_patch "OzonePlatformX11::InitializeUI (real Xkb engine)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 390)" \
-  "4989c64889c7e8a9ce7206488b7b204c8973204885ff740a488b07ff50084c8b73204c89f7" \
-  '\110\215\270\310\000\000\000\111\211\306\350\353\317\162\006\114\211\367\111\215\266\310\000\000\000\350\020\320\162\006\114\211\163\040\114\211\367'
+  "$(va_to_offset "$ui_va" "$DELTA" 343)" \
+  "4889c34889c7e88e9bea03498b7e2049895e204885ff740a488b07ff5008498b5e204889df" \
+  '\110\215\270\310\000\000\000\110\211\303\350\204\234\352\003\110\211\337\110\215\263\310\000\000\000\350\251\234\352\003\111\211\136\040\110\211\337'
 
 # Overwrite the (now dead) StubKeyboardLayoutEngine::Lookup with a thunk
-# for StubInputController::SetCurrentLayoutByName(name, callback):
+# for StubInputController::SetCurrentLayoutByName(name):
 #   load keyboard_layout_engine_; when set, tail-jump to
-#   engine->SetCurrentLayoutByName (vptr+0x20, identical signature), else
+#   engine->SetCurrentLayoutByName (vptr+0x18, identical signature), else
 #   jump back into the original stub body. The stub engine is no longer
 #   constructed after the patch above, so its Lookup is unreachable.
 lookup_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::Lookup\(')
 verify_and_patch "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
   "$(va_to_offset "$lookup_va" "$DELTA")" \
-  "554889e5488b4708488b7f10" \
-  '\110\213\005\201\042\022\010\110\205\300\164\011\110\211\307\110\213\000\377\140\040\351\204\267\030\371'
+  "554889e5488b47084c8b4f10" \
+  '\110\213\005\167\013\310\005\110\205\300\164\011\110\211\307\110\213\000\377\140\030\351\334\246\303\373'
 
-# Redirect the StubInputController vtable slot (vptr+0x80,
-# .rela.dyn entry for 0x15834f20, R_X86_64_RELATIVE addend 0x719c0de) to
-# the thunk: verify the whole 24-byte relocation, write it with the new
-# addend (thunk VA 0xe010940).
+# Redirect the StubInputController vtable slot (vptr+0x68 — the 14th entry
+# of ui::InputController, verified against InputControllerEvdev, whose
+# SetCurrentLayoutByName has a body of its own — .rela.dyn entry for
+# 0xe0b1eb0, R_X86_64_RELATIVE addend 0x483ca20) to the thunk: verify the
+# whole 24-byte relocation, write it with the new addend (thunk VA
+# 0x8c0232a, this snapshot's StubKeyboardLayoutEngine::Lookup).
 verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
-  "$((0x1020b20))" \
-  "204f8315000000000800000000000000dec0190700000000" \
-  '\040\117\203\025\000\000\000\000\010\000\000\000\000\000\000\000\100\011\001\016\000\000\000\000'
+  "$((0x710270))" \
+  "b01e0b0e00000000080000000000000020ca830400000000" \
+  '\260\036\013\016\000\000\000\000\010\000\000\000\000\000\000\000\052\043\300\010\000\000\000\000'
+
+# --- key press crash fix ----------------------------------------------------
+#
+# ui::(anonymous namespace)::GetEventPropertiesFromXEvent(type, event):
+# for key types (7/8) it does `cmpl $0x36,0x4(%rdx)` (event is a core
+# KeyPress/KeyRelease?) and, when the tag differs, falls into
+#   xor %eax,%eax ; mov %rax,-0x48(%rbp) ; mov 0x20(%rax),%ebx
+# i.e. dereferences NULL+0x20 -> SEGV. The original ChromeOS X server only
+# delivered core key events (tag 0x36), so that branch was dead upstream;
+# a modern Xorg delivers XI2 DeviceEvents (tag 0x1f) and every key press
+# crashes Chrome ("Received signal 11 SEGV_MAPERR ... 000000000020").
+#
+# Retarget the `jne 8baf832` (75 22) to `jne 8baf816` (75 06): a foreign
+# tag then lands on `cmp $6,%esi / jne <tail>`, and key types 7/8 skip to
+# the function tail, returning an empty properties map — the same thing
+# the neighboring helpers do for events they don't recognize. Key events
+# themselves are built before this call, so nothing else changes.
+props_va=$(sym_va ' t ui::\(anonymous namespace\)::GetEventPropertiesFromXEvent\(')
+verify_and_patch "GetEventPropertiesFromXEvent (XI2 key events -> empty props)" \
+  "$(va_to_offset "$props_va" "$DELTA" 46)" \
+  "7522" \
+  '\165\006'
+
+# --- wayland damage freeze fix ------------------------------------------------
+#
+# Native-Wayland clients freeze on screen while wl_surface.frame callbacks
+# keep firing (Alacritty: typed text appears only when a desktop-level event,
+# e.g. the launcher, forces a full redraw). Mesa's wayland swrast signals
+# "the whole surface changed" with
+#   wl_surface.damage(0, 0, INT_MAX, INT_MAX)
+# and exo::Surface::Damage unions that raw rect into its pending-damage
+# cc::Region. SkRegion::op silently DISCARDS rects whose right/bottom ==
+# INT_MAX (it compares both against $0x7fffffff and, on a match, performs
+# the union with an empty rect instead), so the damage region stays empty:
+# viz schedules no redraw, the compositor shows the old buffer, and frame
+# callbacks are still sent per vsync — the client renders on happily into a
+# buffer nobody sees. Any event that damages the whole desktop through
+# another path (window map, launcher open) then draws the stale surface with
+# its latest content in one jump.
+#
+# Fix at the choke point: a cave clamps all four damage coordinates of the
+# incoming gfx::Rect to [0, 30000] before the union. 30000 px covers any
+# real output while width*height stays inside int32 for any downstream area
+# math; for well-behaved clients (coords within the surface) the clamp is a
+# no-op. The cave overwrites an int3 padding run, hijacks the 6-byte
+# function prologue (push %rbp / mov %rsp,%rbp / push %r15), replays those
+# instructions and jumps back to entry+6 — only %rax and flags are touched,
+# and the prologue reads no flags before its own `testb`.
+#
+# Cave payload (105 bytes): the same 24-byte clamp block over each int32
+# field of the rect at %rsi — offsets 0/4/8/12 = left/top/right/bottom
+# (the memory operand is oo for offsets 4/8/12, plain (%rsi) for offset 0):
+#   8b 46 oo          mov  oo(%rsi),%eax     ; load the field
+#   3d 30 75 00 00    cmp  $0x7530,%eax      ; high clamp: min(v, 30000)
+#   7e 05             jle  +5
+#   b8 30 75 00 00    mov  $0x7530,%eax
+#   85 c0             test %eax,%eax         ; low clamp: max(v, 0)
+#   7d 02             jge  +2
+#   31 c0             xor  %eax,%eax
+#   89 46 oo          mov  %eax,oo(%rsi)
+# then the replayed prologue (55 48 89 e5 41 57) and e9 rel32 back to
+# entry+6; the trailing 00 00 00 00 is the displacement placeholder the
+# build splices in below. The cave region is verified to be int3 before
+# writing and the entry against the original prologue, so any snapshot
+# drift fails loudly.
+
+cave_va=0x700b213
+entry_va=$(sym_va ' exo::Surface::Damage\(gfx::Rect const&\)')
+
+CAVE_HEX='8b063d307500007e05b83075000085c07d0231c089068b46043d307500007e05b83075000085c07d0231c08946048b46083d307500007e05b83075000085c07d0231c08946088b460c3d307500007e05b83075000085c07d0231c089460c554889e54157e900000000'
+cave_hex=$CAVE_HEX
+
+cave_len=$((${#cave_hex} / 2))
+# The cave must end in `e9 00 00 00 00` (jmp rel32 placeholder) so the
+# build can splice in the real displacement.
+case ${cave_hex: -10} in
+  e900000000) ;;
+  *) die "damage-clamp cave does not end with the jmp rel32 placeholder" ;;
+esac
+
+# Back-jump: from the cave's trailing jmp (next IP = cave_va + cave_len)
+# to entry_va + 6, the first instruction past the hijacked prologue.
+back_rel=$(rel32_hex "$((entry_va + 6))" "$((cave_va + cave_len))")
+cave_hex="${cave_hex:0: -8}${back_rel}"
+cave_off=$(va_to_offset "$cave_va" "$DELTA")
+verify_and_patch "exo::Surface::Damage (damage clamp cave)" \
+  "$cave_off" \
+  "$(printf 'cc%.0s' $(seq 1 "$cave_len"))" \
+  "$(hex_to_fmt "$cave_hex")"
+
+# Entry: replace the 6-byte prologue (55 48 89 e5 41 57 — push %rbp /
+# mov %rsp,%rbp / push %r15) with `jmp rel32` (5 bytes) + nop (1 byte); the
+# split falls exactly on instruction boundaries, and the cave replays both
+# instructions before jumping back to entry+6.
+fwd_rel=$(rel32_hex "$cave_va" "$((entry_va + 5))")
+verify_and_patch "exo::Surface::Damage (entry -> damage clamp cave)" \
+  "$(va_to_offset "$entry_va" "$DELTA")" \
+  "554889e54157" \
+  "$(hex_to_fmt "e9${fwd_rel}90")"
 
 # --- crashpad handler ------------------------------------------------------
 

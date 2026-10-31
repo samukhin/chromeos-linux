@@ -332,9 +332,18 @@ func decodeStringFields(data []byte) map[uint64]string {
 		switch wireType {
 		case 0:
 			_, n = decodeVarint(data[i:])
+			if n == 0 {
+				return fields // malformed varint: bail, don't spin
+			}
 			i += n
 		case 2:
 			length, n := decodeVarint(data[i:])
+			// Guard: n==0 (malformed varint) leaves i stuck in an infinite
+			// loop; length > len(data) makes int(length) negative on overflow
+			// and panics data[i:end] (low > high). Both mean a corrupt frame.
+			if n == 0 || length > uint64(len(data)) {
+				return fields
+			}
 			i += n
 			end := i + int(length)
 			if end <= len(data) {
@@ -369,10 +378,18 @@ func decodeUint64Fields(data []byte) map[uint64]uint64 {
 		switch wireType {
 		case 0:
 			v, n := decodeVarint(data[i:])
+			if n == 0 {
+				return fields // malformed varint: bail, don't spin
+			}
 			i += n
 			fields[fieldNum] = v
 		case 2:
 			length, n := decodeVarint(data[i:])
+			// Guard: n==0 would spin forever; length > len(data) overflows
+			// int() negative and would make data[i:] panic below.
+			if n == 0 || length > uint64(len(data)) {
+				return fields
+			}
 			i += n
 			i += int(length)
 		case 1:
@@ -515,15 +532,29 @@ func launchApp(app desktopApp) error {
 	// os.Environ() would win and apps would land on the host X server instead of
 	// the :10 Xwayland they must render into.
 	cmd.Env = append(os.Environ(), overrides...)
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// Reap the child when it exits: without Wait() every launched app would
+	// linger as a zombie under this bridge until the session ends.
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 type vmConcierge struct {
 	conn *dbus.Conn
 }
 
-func (v *vmConcierge) StartVm(req []byte, fds []dbus.UnixFD) ([]byte, *dbus.Error) {
-	log.Printf("StartVm called fd_count=%d", len(fds))
+// StartVm: in this snapshot ConciergeClientImpl::StartVm (0xb2d6258) builds
+// the call with CallMethod<StartVmRequest, StartVmResponse> (0xb2d9e10),
+// whose ScopedFD is -1 and is skipped by CallMethodWithFds, so the wire body
+// is exactly one 'ay' argument (the serialized proto). godbus validates the
+// exported signature against the wire before dispatch (standardMethodArgumentDecode
+// in export.go: len(decode) != len(body) -> ErrMsgInvalidArg), so a trailing
+// fds []dbus.UnixFD parameter rejects every call with
+// "InvalidArgs: Invalid type / number of args" before this method runs.
+func (v *vmConcierge) StartVm(req []byte) ([]byte, *dbus.Error) {
+	log.Printf("StartVm called (%d bytes)", len(req))
 	markSessionReady()
 	go func() {
 		time.Sleep(200 * time.Millisecond)
@@ -581,9 +612,28 @@ func (v *vmConcierge) StopVm(req []byte) ([]byte, *dbus.Error) {
 	return appendBool(nil, 1, true), nil // success = true
 }
 
-func (v *vmConcierge) CreateDiskImage(req []byte, fds []dbus.UnixFD) ([]byte, *dbus.Error) {
+// CreateDiskImage: same story as StartVm — ConciergeClientImpl::CreateDiskImage
+// (0xb2d5ed4) goes through CallMethod (0xb2d7722) with an fd of -1, so the
+// launcher's call is a single 'ay' argument; the fd-carrying variant
+// (CreateDiskImageWithFd, 0xb2d5f4c) is only used by ARC. The old
+// (req []byte, fds []dbus.UnixFD) signature therefore failed godbus arity
+// validation on every launcher launch, which ash.log showed as
+// "Failed to create disk image. Empty response." +
+// "Failed to restart Crostini with error code: 71" with no matching entry
+// in crostini-bridge.log (the call never reached Go).
+// SetVmCpuRestriction: ConciergeHelperService calls this on every VM start to
+// apply CPU pinning and logs "Failed to call SetVmCpuRestriction" (twice per
+// call) on UnknownMethod. Pinning is not applied here, and the response proto
+// has a single bool success field: an empty reply would read false and keep
+// the failure path, so answer success = true.
+func (v *vmConcierge) SetVmCpuRestriction(req []byte) ([]byte, *dbus.Error) {
+	log.Printf("SetVmCpuRestriction: %d bytes (no-op)", len(req))
+	return appendBool(nil, 1, true), nil
+}
+
+func (v *vmConcierge) CreateDiskImage(req []byte) ([]byte, *dbus.Error) {
 	learnOwnerID("CreateDiskImage", decodeStringFields(req))
-	log.Printf("CreateDiskImage called fd_count=%d", len(fds))
+	log.Printf("CreateDiskImage called (%d bytes)", len(req))
 	return encodeCreateDiskImageResponse(), nil
 }
 
@@ -821,6 +871,19 @@ type debugdStub struct{}
 func (d *debugdStub) SetSchedulerConfigurationV2(configName string, lockPolicy bool) (bool, uint32, *dbus.Error) {
 	log.Printf("debugd.SetSchedulerConfigurationV2 configName=%q lockPolicy=%v", configName, lockPolicy)
 	return true, 0, nil
+}
+
+// KstaledSetRatio(ratio byte) — the MGLRU kstaled ratio from ash::InitializeKstaled;
+// the caller (OnSetKstaledRatio) only checks a PopBool success flag, so accept it.
+func (d *debugdStub) KstaledSetRatio(ratio uint8) (bool, *dbus.Error) {
+	log.Printf("debugd.KstaledSetRatio ratio=%d (accepted, no kstaled here)", ratio)
+	return true, nil
+}
+
+// GetU2fFlags — OnGetU2fFlags reads a single string and splits it into the
+// flag set; an empty reply yields an empty set (no U2F flags configured).
+func (d *debugdStub) GetU2fFlags() (string, *dbus.Error) {
+	return "", nil
 }
 
 type imageLoader struct{}

@@ -201,6 +201,25 @@ func (s *sessionManager) IsGuestSessionActive() (bool, *dbus.Error) {
 	return false, nil
 }
 
+// QueryAdbSideload — there is no adb sideloading on this setup; answering
+// false (like session_manager with sideloading disabled) is a valid reply and
+// silences the UnknownMethod logged by SessionManagerClient on every poll.
+func (s *sessionManager) QueryAdbSideload() (bool, *dbus.Error) {
+	return false, nil
+}
+
+// GetServerBackedStateKeys — the reply is aay (array of byte arrays, see
+// OnGetServerBackedStateKeys: PopArray + PopArrayOfBytes loop), so the Go
+// signature is [][]byte. Ash polls this about once a minute
+// (DeviceLocalAccountManagementStateProvider::RefreshManagementState); an
+// empty list is a valid answer that reports the device as unmanaged (no
+// server-backed keys) and silences the UnknownMethod that used to log every
+// minute. It is only non-empty during enterprise enrollment, which does not
+// happen on this setup.
+func (s *sessionManager) GetServerBackedStateKeys() ([][]byte, *dbus.Error) {
+	return [][]byte{}, nil
+}
+
 func (s *sessionManager) IsScreenLocked() (bool, *dbus.Error) {
 	return s.isLocked(), nil
 }
@@ -383,6 +402,54 @@ func (u *userDataAuth) AuthenticateAuthSession(req []byte) ([]byte, *dbus.Error)
 //
 // The error field is not set, which ReplyToCryptohomeError reads as success —
 // that is what makes the unlock passwordless: any entered password "matches".
+// CheckKey is the legacy cryptohome API this snapshot's lock screen actually
+// uses: ExtendedAuthenticatorImpl::AuthenticateToCheck (0x9fe3f68) ->
+// UserDataAuthClientImpl::CheckKey (0xa077d70) ->
+// org.chromium.UserDataAuthInterface.CheckKey with a serialized CheckKeyRequest
+// ('ay'). The bridge only exported the modern AuthenticateAuthSession /
+// AuthenticateAuthFactor methods, so unlock hit "UnknownMethod 'CheckKey'"
+// (ash.log) and failed with "Extended authenticator cryptohome error, code: 1"
+// (extended_authenticator_impl.cc:203).
+//
+// Reply contract, recovered from the binary:
+//   - OnOperationComplete<CheckKeyReply> (0x9fe4aac) reads the optional's
+//     engaged bit (+0) and reply->error() (+0x18) and reports success iff
+//     CryptohomeErrorToMountError(error) == MOUNT_ERROR_NONE;
+//   - CryptohomeErrorToMountError (0x9ff093b) jump-tables on the code and
+//     returns the code itself for CRYPTOHOME_ERROR_NOT_SET (0): the case-0
+//     entry lands on the function epilogue with eax still holding the code
+//     (mov %edi,%eax before the table), i.e. 0 = success;
+//   - an empty CheckKeyReply parses with every field at its default, so
+//     error() == 0 -> OnAuthSuccess. Same "empty proto = success" default
+//     the other stubbed methods here rely on.
+func (u *userDataAuth) CheckKey(req []byte) ([]byte, *dbus.Error) {
+	logAuthReq("CheckKey", req)
+	return []byte{}, nil
+}
+
+// RemoveKey is the UserDataAuth call made right after a successful unlock by
+// EasyUnlockRemoveKeysOperation (smart-lock key cleanup): it removes keys one
+// at a time under generated names "easy-unlock-<counter>" and stops ONLY when
+// a removal comes back with "key not found" — success replies make it issue
+// the next index forever. Reply contract, recovered from the binary:
+//
+//   - OnKeyRemoved (0x784c98e) CHECKs the reply is present (nullopt from an
+//     UnknownMethod answer lands on `ud2` at +0x102 and kills the session);
+//   - error is read at optional+0x18 (reply+0x10 = field 1, varint — see
+//     RemoveKeyReply::_InternalSerialize emitting tag 0x08) and mapped via
+//     CryptohomeErrorToMountError (0x9ff093b): 0 -> MOUNT_ERROR_NONE (loop to
+//     the next key), CRYPTOHOME_ERROR_KEY_NOT_FOUND (2) -> mount error 2 ->
+//     RunCallback(true) — the normal end of the loop, no keys exist here;
+//     anything else -> LOG + RunCallback(false).
+//
+// So a KEY_NOT_FOUND reply is the correct response for every call: there are
+// no easy-unlock keys in this environment, and an empty (error=0) reply would
+// spin Chrome through infinite key indices at ~2500 calls/s.
+func (u *userDataAuth) RemoveKey(req []byte) ([]byte, *dbus.Error) {
+	logAuthReq("RemoveKey", req)
+	return []byte{0x08, 0x02}, nil // error = CRYPTOHOME_ERROR_KEY_NOT_FOUND
+}
+
 func (u *userDataAuth) AuthenticateAuthFactor(req []byte) ([]byte, *dbus.Error) {
 	logAuthReq("AuthenticateAuthFactor", req)
 

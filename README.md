@@ -113,9 +113,9 @@ sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja gcc make
 ## Структура репозитория
 
 ```
-chromeos-bin/REVISION         пин ревизии снапшота ChromiumOS (1670871)
+chromeos-bin/REVISION         пин ревизии снапшота ChromiumOS (1040000)
 chromeos-bin/fetch.sh         скачивание + проверка контрольных сумм
-chromeos-bin/chrome/          распакованный снапшот (после make fetch, ~870 МБ)
+chromeos-bin/chrome/          распакованный снапшот (после make fetch, ~580 МБ)
 
 scripts/common.sh             общие хелперы ВСЕХ скриптов: ASH_ROOT, die/log/note (с префиксом вызывающего), need/have
 scripts/build-chrome.sh       патчинг бинарника → dist/chrome/
@@ -139,7 +139,7 @@ dbus-bridges/cmd/*/           исходники бриджей (Go)
 terminal/terminal-ui.js       UI терминала, который инжектируется в SWA
 
 Makefile                      цели сборки
-dist/                         всё собранное (~900 МБ, не коммитится)
+dist/                         всё собранное (~620 МБ, не коммитится)
 .cache/                       временные файлы сборки (не коммитится)
 ```
 
@@ -264,7 +264,6 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | `RedirectChromeLogging` | `ret` (no-op) | Chrome уводит логи в ChromeOS-путь |
 | `OnDisconnect` | `ret` (no-op) | крэш при таймауте mojo-канала |
 | `HasInternalDisplay` | всегда `true` | нет ползунка яркости |
-| `IsSystemBlurEnabled` | всегда `true` | blur панели/шторки гейтится не на GPU, а на ОЗУ: `chromeos::features::IsSystemBlurEnabled()` — это буквально `AmountOfTotalPhysicalMemory() > 4GiB` из `/proc/meminfo`, без FeatureList и без флага. На хостах ≤4 ГБ (гости VirtualBox, типовые Haswell-ноутбуки) панель и шторка рисуются непрозрачными, хотя композитор blur умеет рисовать на чём угодно (`viz::SoftwareRenderer::GetBackdropFilterShader` есть). С патчем — blur при любом объёме RAM; на малорамных хостах это стоит части FPS в анимациях |
 | Раскладка RU/EN | `OzonePlatformX11::InitializeUI` вместо `StubKeyboardLayoutEngine` собирает пару `XkbEvdevCodes` + `XkbKeyboardLayoutEngine` (как DRM-платформа) и регистрирует её в `KeyboardLayoutEngineManager`, а thunk на месте мёртвого `Stub::Lookup` перенаправляет `StubInputController::SetCurrentLayoutByName` в зарегистрированный движок | смена RU/EN в шторке двигает только индикатор в трее: набор текста остаётся US (нужны xkb-данные из `xkb-data` / `xorg-xkbdata`) |
 | crashpad-wrapper | всегда добавляет `--database` | падение на старте crashpad-handler'а |
 

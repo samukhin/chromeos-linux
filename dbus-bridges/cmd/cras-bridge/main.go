@@ -99,6 +99,11 @@ func (c *crasControl) SetInputMute(muted bool) *dbus.Error {
 	c.mu.Lock()
 	c.st.inputMuted = muted
 	c.mu.Unlock()
+	v := "0"
+	if muted {
+		v = "1"
+	}
+	pactl("set-source-mute", "@DEFAULT_SOURCE@", v)
 	return nil
 }
 
@@ -112,6 +117,44 @@ func (c *crasControl) SetInputNodeGain(nodeID uint64, gain int32) *dbus.Error {
 
 func (c *crasControl) SwapLeftRight(nodeID uint64, swap bool) *dbus.Error {
 	return nil
+}
+
+// SetDisplayRotation(node_id, rotation) — audio routing does not depend on the
+// display orientation here; accept the call so CrasAudioHandler stops logging
+// UnknownMethod.
+func (c *crasControl) SetDisplayRotation(nodeID uint64, rotation uint32) *dbus.Error {
+	log.Printf("SetDisplayRotation: node=%d rotation=%d (no-op)", nodeID, rotation)
+	return nil
+}
+
+// Media-player state Ash forwards to CRAS for hardware offload (D-Bus
+// signatures confirmed from the binary: SetPlayerPlaybackStatus(s),
+// SetPlayerIdentity(s), SetPlayerMetadata(a{sv})). There is no player
+// attached to CRAS on this setup, so the calls are accepted and logged;
+// without them the UnknownMethod reply reaches CrasAudioClientImpl and gets
+// logged as ERROR on every media-session change.
+func (c *crasControl) SetPlayerPlaybackStatus(status string) *dbus.Error {
+	log.Printf("SetPlayerPlaybackStatus: %q (no-op)", status)
+	return nil
+}
+
+func (c *crasControl) SetPlayerIdentity(identity string) *dbus.Error {
+	log.Printf("SetPlayerIdentity: %q (no-op)", identity)
+	return nil
+}
+
+func (c *crasControl) SetPlayerMetadata(metadata map[string]dbus.Variant) *dbus.Error {
+	log.Printf("SetPlayerMetadata: %v (no-op)", metadata)
+	return nil
+}
+
+// GetDeprioritizeBtWbsMic — there is no Bluetooth here, so the WBS mic is
+// never deprioritized; answering false (retrieved as PopBool) gives
+// CrasAudioHandler::HandleGetDeprioritizeBtWbsMic a definite value instead of
+// the "Failed to retrieve WBS mic deprioritized flag" ERROR it logs when the
+// call fails. Refreshed about once a minute.
+func (c *crasControl) GetDeprioritizeBtWbsMic() (bool, *dbus.Error) {
+	return false, nil
 }
 
 func (c *crasControl) GetDefaultOutputBufferSize() (int32, *dbus.Error) {

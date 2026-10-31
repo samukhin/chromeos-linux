@@ -116,6 +116,18 @@ func (p *powerManager) GetKeyboardBrightnessPercent() (float64, *dbus.Error) {
 	return 0, nil
 }
 
+// HasAmbientColorDevice / GetKeyboardBacklightToggledOff — no ambient light
+// sensor and no keyboard backlight on this setup. Both are bare PopBool reads
+// (see OnHasAmbientColorDevice / OnGetKeyboardBacklightToggledOff); answering
+// them stops the UnknownMethod that PowerManagerClientImpl logged on startup.
+func (p *powerManager) HasAmbientColorDevice() (bool, *dbus.Error) {
+	return false, nil
+}
+
+func (p *powerManager) GetKeyboardBacklightToggledOff() (bool, *dbus.Error) {
+	return false, nil
+}
+
 func (p *powerManager) SetScreenBrightness(req []byte) *dbus.Error {
 	percent, ok := parseSetBacklightBrightnessRequest(req)
 	if !ok {

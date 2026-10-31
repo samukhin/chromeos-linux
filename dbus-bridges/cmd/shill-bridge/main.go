@@ -166,6 +166,14 @@ func (m *shillManager) GetDebugLevel() (string, *dbus.Error) {
 	return "off", nil
 }
 
+// GetNetworksForGeolocation — no managed networks to advertise; an empty list
+// of property dicts is a valid aa{sv} reply (dbus::PopDataAsValue turns it
+// into an empty base::List) and stops shill_client_helper from logging
+// UnknownMethod on every geolocation refresh.
+func (m *shillManager) GetNetworksForGeolocation() ([]map[string]dbus.Variant, *dbus.Error) {
+	return []map[string]dbus.Variant{}, nil
+}
+
 func (m *shillManager) EnableTethering(priority string) (string, *dbus.Error) {
 	m.mu.RLock()
 	devices := m.devices

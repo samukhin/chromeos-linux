@@ -329,6 +329,9 @@ while true; do
         "$SOMMELIER" \
           --noop-driver \
           -X \
+          --force-drm-device="${ASH_DRM_DEVICE:-/dev/dri/renderD128}" \
+          --enable-linux-dmabuf \
+          --xwayland-gl-driver-path=/usr/lib/dri \
           --socket=wayland-1 \
           --x-display=10 \
           --xwayland-path="$(command -v Xwayland || echo /usr/bin/Xwayland)" \
