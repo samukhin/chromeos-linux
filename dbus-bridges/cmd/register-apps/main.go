@@ -97,7 +97,25 @@ func parseDesktop(path, id string) (desktopApp, bool) {
 	if appType != "Application" || name == "" {
 		return desktopApp{}, false
 	}
+	// Chrome matches a launched window's WM_CLASS against this value to tie
+	// the window to its launcher entry; without it the shelf falls back to the
+	// penguin placeholder even though the entry exists (pavucontrol: WM_CLASS
+	// is "pavucontrol", desktop_file_id is "org.pulseaudio.pavucontrol").
+	// GTK/Qt set WM_CLASS from the executable name, so fall back to it.
+	if wmClass == "" {
+		wmClass = execName(execLine)
+	}
 	return desktopApp{id: id, name: name, exec: execLine, wmClass: wmClass}, true
+}
+
+// execName pulls the program out of a desktop Exec= line: strips the field
+// codes, any leading path and the arguments. "pavucontrol %U" -> "pavucontrol".
+func execName(execLine string) string {
+	f := strings.Fields(strings.TrimSpace(execLine))
+	if len(f) == 0 {
+		return ""
+	}
+	return filepath.Base(strings.TrimSuffix(f[0], "/"))
 }
 
 func scanApps() []desktopApp {
@@ -214,8 +232,16 @@ func main() {
 
 	for _, app := range apps {
 		id := generateAppID(vmName, containerName, app.id)
-		if _, exists := registry[id]; !exists {
+		existing, exists := registry[id]
+		if !exists {
 			registry[id] = buildAppEntry(app, vmName, containerName, vmType)
+			continue
+		}
+		// Entries are never rewritten once written, so a wm_class that we used
+		// to leave empty would stay empty forever (Chrome persists this
+		// registry back on shutdown). Backfill only that one field.
+		if wm, _ := existing["startup_wm_class"].(string); wm == "" && app.wmClass != "" {
+			existing["startup_wm_class"] = app.wmClass
 		}
 	}
 

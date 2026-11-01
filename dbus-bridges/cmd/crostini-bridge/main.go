@@ -650,6 +650,12 @@ func (c *vmCicerone) ListRunningContainers(req []byte) ([]byte, *dbus.Error) {
 
 func (c *vmCicerone) LaunchContainerApplication(req []byte) ([]byte, *dbus.Error) {
 	fields := decodeStringFields(req)
+	// Reverse-engineering note on this snapshot's request layout, confirmed by
+	// field dumps (it is NOT upstream's): field 1 = vm_name, field 2 =
+	// container_name, field 3 = desktop_file_id, field 4 = owner_id — the
+	// owner id Chrome echoes back from ContainerStarted ("test-user" here).
+	// There is no startup_id field at all, so no launcher-generated id can be
+	// forwarded to the app.
 	setOwnerID("LaunchContainerApplication", fields[4])
 	id := fields[3]
 	log.Printf("LaunchContainerApplication: desktop_file_id=%q", id)
@@ -697,6 +703,11 @@ func findIconFile(iconName string, size int) []byte {
 			paths := []string{
 				filepath.Join(base, "icons", "hicolor", fmt.Sprintf("%dx%d", s, s), "apps", iconName+".png"),
 				filepath.Join(base, "pixmaps", iconName+".png"),
+				// Many Debian/Arch packages ship icons only as .xpm (xterm)
+				// or drop a .svg into pixmaps instead of hicolor/scalable
+				// (Alacritty). Chrome wants PNG or SVG, so convert below.
+				filepath.Join(base, "pixmaps", iconName+".xpm"),
+				filepath.Join(base, "pixmaps", iconName+".svg"),
 			}
 			if s == sizes[0] {
 				paths = append(paths,
@@ -719,6 +730,18 @@ func findIconFile(iconName string, size int) []byte {
 						return pngData
 					}
 					return data
+				}
+				if strings.HasSuffix(path, ".xpm") {
+					// XPM is not a Chrome image format: transcode to PNG via
+					// ffmpeg (widely installed; netpbm/imagemagick not
+					// guaranteed). Writes PNG to stdout with image2pipe.
+					cmd := exec.Command("ffmpeg", "-v", "error", "-i", path,
+						"-f", "image2pipe", "-vcodec", "png", "-")
+					pngData, err := cmd.Output()
+					if err == nil && len(pngData) > 0 {
+						return pngData
+					}
+					continue
 				}
 				return data
 			}

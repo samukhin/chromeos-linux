@@ -79,6 +79,17 @@ grep -q 'drm_fd = noop_driver ? -1 : open_virtgpu' sommelier.cc ||
 grep -q 'drm_fd = noop_driver ? -1 : open_virtgpu' sommelier.cc ||
   die "sommelier.cc patch failed (pattern not found)"
 
+# 1b. App id prefix: snapshot 1040000's GetCrostiniShelfAppId matches windows
+# against the launcher registry with prefix "org.chromium.termina." followed by
+# "wmclass." (kCrostiniWindowAppIdPrefix/kWMClassPrefix in
+# chrome/browser/ash/crostini). Upstream sommelier (newer) uses
+# "org.chromium.guest_os.<vm>.*", which this Chrome never matches -> every
+# Linux window falls back to the penguin placeholder on the shelf.
+grep -q '"org.chromium.%s"' sommelier.h ||
+  sed -i 's|#define APPLICATION_ID_FORMAT_PREFIX "org.chromium.guest_os.%s"|#define APPLICATION_ID_FORMAT_PREFIX "org.chromium.%s"|' sommelier.h
+grep -q 'APPLICATION_ID_FORMAT_PREFIX "org.chromium.%s"' sommelier.h ||
+  die "sommelier.h app id prefix patch failed (pattern not found)"
+
 # 2. Buffer/compositor patches: exo relabels XRGB8888 shm buffers to
 #    ARGB8888, sommelier has to carry that through and set an opaque region.
 python3 - <<'PYEOF'
