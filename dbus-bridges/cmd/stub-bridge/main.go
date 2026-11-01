@@ -1,11 +1,12 @@
 // stub-bridge stubs the one-shot D-Bus methods Chrome calls at startup on
-// ChromeOS daemons this setup does not run: pci guard, plugin VMs, update
-// engine, SMB provider, RGB keyboard, machine learning, crosdisks and biod.
+// ChromeOS daemons this setup does not run: tpm_managerd, resourced, pci
+// guard, plugin VMs, update engine, SMB provider, RGB keyboard, machine
+// learning, crosdisks and biod.
 //
 // Every signature below was read off the binary's client side (the Pop* call
 // each On* handler makes on dbus::Response), so the replies decode cleanly and
 // Chrome stops logging ServiceUnknown/UnknownMethod for these names. One
-// process owns all eight names to keep the extra surface to a single binary.
+// process owns all ten names to keep the extra surface to a single binary.
 package main
 
 import (
@@ -94,6 +95,29 @@ func (s *stub) GetRecordsForUser(userID string) ([]dbus.ObjectPath, *dbus.Error)
 	return []dbus.ObjectPath{}, nil
 }
 
+// TpmManager.GetTpmNonsensitiveStatus(in ay request) → ay — both sides are
+// tpm_manager protos. An empty buffer parses as a reply with every field at
+// its default, so status stays STATUS_SUCCESS(0) instead of the 3 this client
+// writes when parsing fails. ash's consumers branch on that field: with 0 they
+// stop retrying and the "Failed to get tpm status; status: 3" warnings go away
+// with the ServiceUnknown error. There is no TPM here, so there is nothing to
+// report — no fabricated fields, just an empty reply.
+func (s *stub) GetTpmNonsensitiveStatus(req []byte) ([]byte, *dbus.Error) {
+	log.Printf("TpmManager.GetTpmNonsensitiveStatus (%d-byte request -> empty reply)", len(req))
+	return []byte{}, nil
+}
+
+// ResourceManager.SetMemoryMarginsBps(in u swap_margins_bps, in u
+// vmmem_margins_bps) → (out t, out t) — the two uint64s are the margins
+// resourced actually applied, in KB; OnMemoryMarginsSet only logs them. Nothing
+// is applied here, so both read back as 0 and the call stops failing with
+// ServiceUnknown every 30 seconds.
+func (s *stub) SetMemoryMarginsBps(swapMarginsBps, vmmemMarginsBps uint32) (uint64, uint64, *dbus.Error) {
+	log.Printf("ResourceManager.SetMemoryMarginsBps swap=%d vmmem=%d bps -> 0 KB / 0 KB",
+		swapMarginsBps, vmmemMarginsBps)
+	return 0, 0, nil
+}
+
 type service struct {
 	name  string
 	path  dbus.ObjectPath
@@ -103,6 +127,8 @@ type service struct {
 // Name/path/interface triples taken from the binary's proxy constants and the
 // object_path= field of the failing calls in ash.log.
 var services = []service{
+	{"org.chromium.TpmManager", "/org/chromium/TpmManager", "org.chromium.TpmManager"},
+	{"org.chromium.ResourceManager", "/org/chromium/ResourceManager", "org.chromium.ResourceManager"},
 	{"org.chromium.pciguard", "/org/chromium/pciguard", "org.chromium.pciguard"},
 	{"org.chromium.VmPluginDispatcher", "/org/chromium/VmPluginDispatcher", "org.chromium.VmPluginDispatcher"},
 	{"org.chromium.UpdateEngine", "/org/chromium/UpdateEngine", "org.chromium.UpdateEngineInterface"},
