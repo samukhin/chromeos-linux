@@ -336,6 +336,70 @@ verify_and_patch "exo::Surface::Damage (entry -> damage clamp cave)" \
   "554889e54157" \
   "$(hex_to_fmt "e9${fwd_rel}90")"
 
+# --- GPU: native pixmap import gate ----------------------------------------
+# Without this, every X11 client on the sommelier display gets a white window
+# and the GPU log fills with
+#   SharedImageFactory: Could not find SharedImageBackingFactory with params:
+#   usage: |Gles2|Raster|Display|Scanout, format: 15, gmb_type: platform
+# (see also the libminigbm shim below — the two together close the
+# dmabuf -> exo -> OzoneImageBacking path).
+#
+# OzoneImageBackingFactory::IsSupported ends in a call to the active GL
+# ozone's CanImportNativePixmap(); for the X11/EGL ozone that is
+# ui::{anonymous}::GLOzoneEGLX11::CanImportNativePixmap (folded together with
+# the Gbm twin at one address), and it reads a capability flag filled during
+# EGL initialization instead of asking the driver for the extensions we
+# actually need (EGL_EXT_image_dma_buf_import, which the host Mesa exposes).
+# With the flag unset the factory refuses every platform GMB and viz has
+# nowhere to put an exo dmabuf — hence the white window.
+#
+# This is the 1040000 analogue of the three NativePixmapEGLX11Binding patches
+# the 1670871 build needed (see /home/user/patch.diff): in this older snapshot
+# there is no IsSharedImageFormatSupported/GetNativePixmapSupportType pair —
+# the whole decision sits in this one predicate. Force it true; the import
+# itself then runs through gl::GLImageNativePixmap::Initialize, which accepts
+# BGRX_8888 (its allow-mask has bit 12 set) and hands the dmabuf to Mesa EGL.
+# Prologue `push %rbp / mov %rsp,%rbp / call` -> `mov $1,%eax / ret`.
+va=$(sym_va ' t ui::\(anonymous namespace\)::GLOzoneEGLX11::CanImportNativePixmap\(\)')
+verify_and_patch "GLOzoneEGLX11::CanImportNativePixmap (always true)" \
+  "$(va_to_offset "$va" "$DELTA")" "554889e5e8" \
+  '\270\001\000\000\000\303'
+
+# ...but that alone is not enough on this host: the GPU process runs plain
+# GLX (it links libGLX_mesa — no ANGLE, no libEGL at all), so the active
+# ozone is GLOzoneGLX, whose CanImportNativePixmap() is the shared
+# `return false` thunk folded together with GLOzoneEGL::'s and
+# gl::GLImage::GetNativePixmap's — patching that address would corrupt all
+# three. The gate that actually refuses the platform GMB lives inside
+# OzoneImageBackingFactory::IsSupported itself, in two conditional jumps:
+#   +0x43  je fail   — after CanImportNativePixmapToVulkan(); only taken on
+#                      the Vulkan branch (al set), NOP it so the result is
+#                      ignored;
+#   +0x5d  je true   — skips the GLOzone CanImportNativePixmap probe; make
+#                      it unconditional so IsSupported always says yes and
+#                      the real import runs downstream (a genuine import
+#                      failure still surfaces as a null backing, which
+#                      ash.log shows).
+# Prologue-relative offsets, so the usual byte verification applies.
+va=$(sym_va ' gpu::OzoneImageBackingFactory::IsSupported\(')
+verify_and_patch "OzoneImageBackingFactory::IsSupported (ignore Vulkan import gate)" \
+  "$(va_to_offset "$va" "$DELTA" 67)" "7430" '\220\220'
+verify_and_patch "OzoneImageBackingFactory::IsSupported (skip GL ozone import gate)" \
+  "$(va_to_offset "$va" "$DELTA" 93)" "7412" '\353\022'
+
+# --- libminigbm shim (Mesa stand-in) ---------------------------------------
+# Chrome is built against ChromeOS' minigbm, whose usage bits and import type
+# codes differ from Mesa's (GBM_BO_IMPORT_FD_MODIFIER: 0x5505 vs 0x5504), so
+# Mesa's gbm returns NULL and the GPU process never finds a shared image
+# backing. Swap the pristine snapshot aside and build the shim in its place;
+# it dlopens libgbm.so.1 at load time. See scripts/minigbm_shim.c.
+[ -f "$OUT/libminigbm.so" ] || die "no pristine libminigbm.so in $OUT"
+mv "$OUT/libminigbm.so" "$OUT/libminigbm.so.orig"
+echo "kept pristine $OUT/libminigbm.so.orig"
+"${CC:-cc}" -shared -fPIC -O2 -o "$OUT/libminigbm.so" \
+  "$ASH_ROOT/scripts/minigbm_shim.c" -ldl
+echo "built minigbm shim -> $OUT/libminigbm.so ($(stat -c%s "$OUT/libminigbm.so") bytes)"
+
 # --- crashpad handler ------------------------------------------------------
 
 mv "$OUT/chrome_crashpad_handler" "$OUT/chrome_crashpad_handler.real"

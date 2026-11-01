@@ -289,9 +289,12 @@ SESSION_PID_FILE="$XDG_RUNTIME_DIR/chromeos-linux-session.pid"
 printf '%s\n' "$$" >"$SESSION_PID_FILE" || log "WARNING: could not write $SESSION_PID_FILE"
 
 while true; do
+  # Fresh compositor sockets + a fresh gbm shim trace for this iteration
+  # (the shim logs every gbm call; the log is how the white X11 windows were
+  # diagnosed — see scripts/minigbm_shim.c).
   rm -f "$XDG_RUNTIME_DIR/wayland-0" "$XDG_RUNTIME_DIR/wayland-0.lock" \
         "$XDG_RUNTIME_DIR/wayland-1" "$XDG_RUNTIME_DIR/wayland-1.lock" \
-        /tmp/.X10-lock /tmp/.X11-unix/X10 2>/dev/null || true
+        /tmp/.X10-lock /tmp/.X11-unix/X10 /tmp/gbm-shim.log 2>/dev/null || true
 
   mkdir -p "$PROFILE/$TEST_USER"
   "$BIN/register-apps" "$PROFILE/$TEST_USER/Preferences" >&2 || true
@@ -325,20 +328,51 @@ while true; do
           sleep 0.5
         done
       ) &
+      # GPU path. --noop-driver leaves drm_fd == -1, so without an explicit
+      # device there is no ctx.gbm and every dmabuf gate stays shut: Xwayland
+      # is spawned with -shm and clients only ever see wl_shm.
+      #   --force-drm-device      opens the render node directly, bypassing
+      #                           open_virtgpu (which matches virtio-gpu only);
+      #                           sets ctx.gbm/drm — without it neither flag
+      #                           below has any effect;
+      #   --enable-linux-dmabuf   advertise zwp_linux_dmabuf_v1 to our own
+      #                           clients — gated on ctx.gbm, hence the flag
+      #                           above; direct-rendering clients (OBS,
+      #                           glxgears) then export dmabuf buffers that
+      #                           chrome imports directly (zero copy);
+      #   --xwayland-gl-driver-path
+      #                           LIBGL_DRIVERS_PATH baked in at build time is
+      #                           /opt/google/cros-containers/lib, which does
+      #                           not exist here, so Xwayland would find no DRI
+      #                           drivers without this hint.
+      #
+      # --glamor switches Xwayland from -shm to GPU rendering: clients get
+      # zwp_linux_dmabuf and Chrome imports their buffers zero-copy. This
+      # USED to be the white-screen switch (bisected on an unpatched binary:
+      # drop -shm and every X11 window went white) and is only safe because
+      # build-chrome.sh now patches the import gates — see the GPU section
+      # there: libminigbm.so shim (usage bits + import type translation) and
+      # OzoneImageBackingFactory::IsSupported forced open. Verified with it
+      # on: xterm/glxgears render, /tmp/gbm-shim.log shows every
+      # gbm_bo_import(0x5505->0x5504, XR24) landing as BO.
+      # Known cosmetic quirk carried over from the 1670871 bisect: some
+      # clients (OBS preview) flicker under glamor — chrome blends a surface
+      # whose alpha byte is 0 — xterm and glxgears are unaffected. Without
+      # the binary patches above, comment this flag back out.
       SOMMELIER_DISPLAY=wayland-0 \
       WAYLAND_DISPLAY=wayland-0 \
       XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
         "$SOMMELIER" \
           --noop-driver \
-          -X \
-          --force-drm-device="${ASH_DRM_DEVICE:-/dev/dri/renderD128}" \
-          --enable-linux-dmabuf \
-          --xwayland-gl-driver-path=/usr/lib/dri \
+          -X --glamor \
           --socket=wayland-1 \
           --x-display=10 \
           --xwayland-path="$(command -v Xwayland || echo /usr/bin/Xwayland)" \
           --vm-identifier=termina \
           --no-exit-with-child \
+          --force-drm-device="${ASH_DRM_DEVICE:-/dev/dri/renderD128}" \
+          --enable-linux-dmabuf \
+          --xwayland-gl-driver-path=/usr/lib/dri \
           -- sleep infinity \
           2>>"$PROFILE/sommelier.log" || true
       sleep 1
@@ -377,6 +411,7 @@ while true; do
     --no-first-run \
     --remote-debugging-port=9222 \
     --ignore-gpu-blocklist \
+    --enable-logging=stderr \
     --x11-display="$DISPLAY" \
     --user-data-dir="$PROFILE" \
     "${login_flags[@]}" \
