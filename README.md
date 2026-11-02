@@ -302,7 +302,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * Работают бриджи shill, CRAS, powerd, session_manager, UserDataAuth, Crostini, rmad, заглушки `stub-bridge` и совместимость Mojo service manager.
 * NetworkManager отдаёт шилл-бриджу реальное состояние сети.
 * Громкость работает через CRAS-бридж (PulseAudio/PipeWire).
-* `power-bridge` крутит яркость (sysfs, фолбэк на `xrandr`) и шлёт в systemd запросы suspend/reboot (см. «Сырые места»). Батарея читается из UPower — на хосте без него её нет (см. «Что не работает»).
+* `power-bridge` крутит яркость (sysfs, фолбэк на `xrandr`) и шлёт в systemd запросы suspend/reboot (см. «Сырые места»). Батарея читается из UPower — на хосте без него её нет.
 * Работает Linux-сантехника: выбор файлов, xdg-desktop-portal-gtk, polkit-промпты, gnome-keyring.
 * Работает **нативный лок-экран Ash** (`Ctrl+Shift+L`) и разлочка **любым паролем** (см. «Лок-экран и разлочка»).
 * Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — см. патч «Раскладка RU/EN».
