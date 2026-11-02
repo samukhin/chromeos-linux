@@ -341,14 +341,22 @@ while true; do
       #                           not exist here, so Xwayland would find no DRI
       #                           drivers without this hint.
       #
-      # Deliberately NOT passed: --glamor (it would drop -shm from Xwayland's
-      # command line and switch it to GPU rendering). Bisected as the flicker
-      # switch: without it the OBS preview is stable; adding it back makes the
-      # preview flicker — chrome blends a surface whose alpha byte is 0, so the
-      # xterm shows through and frames accumulate (x2/x3) — and hardware OBS
-      # goes blank. The opaque-region patch in sommelier did not help, so the
-      # trigger sits inside glamor itself. Client-side GPU rendering does NOT
-      # depend on --glamor: OBS and glxgears stay hardware-accelerated here.
+      # -X and --glamor are two independent sommelier flags: -X ("Enable X11
+      # forwarding") is what starts Xwayland at all — without it there is no
+      # :10 and no Linux apps — while --glamor ("Use glamor to accelerate X11
+      # clients") only picks HOW that Xwayland renders. Never drop -X; the
+      # switch discussed below is --glamor alone.
+      # --glamor IS passed: it drops -shm from Xwayland's command line and
+      # switches it to GPU rendering. It used to be deliberately omitted —
+      # bisected as the flicker switch: without it the OBS preview was
+      # stable, adding it back made the preview flicker (chrome blends a
+      # surface whose alpha byte is 0, so the xterm shows through and frames
+      # accumulate x2/x3) and hardware OBS went blank. The opaque-region
+      # patch in sommelier did not help, so the trigger sits inside glamor
+      # itself. That stopped reproducing, so the flag is back: if the flicker
+      # returns, drop ONLY "--glamor" from the line below and keep -X.
+      # Client-side GPU rendering never depended on it — OBS and glxgears
+      # stay hardware-accelerated either way.
       SOMMELIER_DISPLAY=wayland-0 \
       WAYLAND_DISPLAY=wayland-0 \
       XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \

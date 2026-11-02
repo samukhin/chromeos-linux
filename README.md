@@ -21,11 +21,16 @@
 7. [Переменные окружения](#переменные-окружения)
 8. [Патчи бинарника](#патчи-бинарника-applied-at-build-time)
 9. [Режим ChromeOS: lsb-release и mojo](#режим-chromeos-lsb-release-и-mojo)
-10. [Что работает / сырые места / что не работает](#что-работает)
-11. [Лок-экран и разлочка](#лок-экран-и-разлочка)
-12. [Проверка и диагностика](#проверка-и-диагностика)
-13. [Обновление ревизии Chrome и хакинг](#обновление-ревизии-chrome)
-14. [Ограничения безопасности](#ограничения-безопасности)
+10. [Что работает](#что-работает)
+11. [Терминал](#терминал)
+12. [Сырые места](#сырые-места)
+13. [Что не работает](#что-не-работает)
+14. [Лок-экран и разлочка](#лок-экран-и-разлочка)
+15. [Проверка и диагностика](#проверка-и-диагностика)
+16. [Обновление ревизии Chrome](#обновление-ревизии-chrome)
+17. [Хакинг](#хакинг)
+18. [Ограничения безопасности](#ограничения-безопасности)
+19. [Ссылки](#ссылки)
 
 ## Как это устроено
 
@@ -57,6 +62,7 @@
 | `org.chromium.SessionManager`<br>`org.chromium.UserDataAuth` | `session-bridge` | «запущенная сессия», состояние входа, гостевой профиль `/home/chronos/user` |
 | `org.chromium.VmConcierge`, `VmCicerone`,<br>`DlcService`, `ImageLoader`, `debugd` | `crostini-bridge` | локальные `.desktop`-файлы: регистрация в лаунчере и запуск приложений на `:10` |
 | `org.chromium.Rmad` | `rmad-bridge` | заглушка RMA-демона |
+| `org.chromium.ResourceManager`, `TpmManager`,<br>`PermissionBroker`, `UpdateEngine`, `typecd`, `pciguard`,<br>`bluetooth`, `Rgbkbd`, `CrosDisks`, `BiometricsDaemon`,<br>`MachineLearning`, `lorgnette`,<br>`com.ubuntu.Upstart`, `org.freedesktop.fwupd` | `stub-bridge` | заглушки сервисов, которых на хосте нет: правдоподобные пустые ответы, чтобы Ash не падал и не логировал ошибки |
 | `/run/mojo/service_manager.sock` | `mojo-stub` | Mojo service manager (ACCEPT_INVITEE + слив сообщений) |
 | — | `register-apps` | разовый helper: пишет `crostini.registry` в `Preferences`, чтобы `.desktop`-файлы появились в лаунчере |
 
@@ -113,15 +119,16 @@ sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja gcc make
 ## Структура репозитория
 
 ```
-chromeos-bin/REVISION         пин ревизии снапшота ChromiumOS (1670871)
+chromeos-bin/REVISION         пин ревизии снапшота ChromiumOS (1732678)
 chromeos-bin/fetch.sh         скачивание + проверка контрольных сумм
-chromeos-bin/chrome/          распакованный снапшот (после make fetch, ~870 МБ)
+chromeos-bin/chrome/          распакованный снапшот (после make fetch, ~920 МБ)
 
 scripts/common.sh             общие хелперы ВСЕХ скриптов: ASH_ROOT, die/log/note (с префиксом вызывающего), need/have
 scripts/build-chrome.sh       патчинг бинарника → dist/chrome/
 scripts/build-sommelier.sh    сборка sommelier → dist/sommelier/
 scripts/build-bridges.sh      сборка Go-бриджей → dist/bin/
 scripts/displayfix.c          C-шим libdisplayfix.so
+scripts/minigbm_shim.c        C-шим libminigbm.so (замена Mesa-несовместимого minigbm)
 scripts/setup-system.sh       разовая установка под root
 scripts/doctor.sh             проверка зависимостей + преflight сессии
 scripts/verify.sh             проверка артефактов сборки
@@ -139,7 +146,7 @@ dbus-bridges/cmd/*/           исходники бриджей (Go)
 terminal/terminal-ui.js       UI терминала, который инжектируется в SWA
 
 Makefile                      цели сборки
-dist/                         всё собранное (~900 МБ, не коммитится)
+dist/                         всё собранное (~970 МБ, не коммитится)
 .cache/                       временные файлы сборки (не коммитится)
 ```
 
@@ -155,7 +162,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 Запускать `./session/start-session.sh` **из обычного терминала (TTY) либо из любого окна** — отдельно `startx` запускать не нужно: если `DISPLAY` не задан, скрипт сам поднимает X через `startx` (первый свободный `:N`) и становится его клиентом; если `DISPLAY` уже есть (X-сеанс LightDM/GDM/SDDM), используется он. Внутри уже поднятого X-сеанса `start-session.sh` просто работает поверх него.
 
-Пересборка с нуля: `make clean && make`. Время сборки — около 5 минут, из них 4 — патчинг 603-мегабайтного бинарника.
+Пересборка с нуля: `make clean && make`. Время сборки — около 5 минут, из них 4 — патчинг 688-мегабайтного бинарника.
 
 ### Цели Makefile
 
@@ -177,7 +184,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 1. Проверить `./scripts/doctor.sh` — все пункты `ok` (включая `== session preflight ==`).
 2. `make` — завершается строкой `bridges -> .../dist/bin/`.
 3. `sudo ./scripts/setup-system.sh --user "$USER"` — печатает `setup-system: done`.
-4. `./scripts/smoke-test.sh` — 11 passed / 0 failed (можно и без X, это только D-Bus).
+4. `./scripts/smoke-test.sh` — 20 passed / 0 failed (можно и без X, это только D-Bus).
 5. `./session/start-session.sh` — появляется окно Ash; `ls /tmp/.X11-unix/` показывает два сокета: хост X (`X0` либо `X1`, какой свободный взял startx) и Xwayland `X10`.
 
 ## Что делает `setup-system.sh` (root, идемпотентен)
@@ -210,7 +217,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 `./session/start-session.sh`:
 
 1. Проверяет системную шину и что профиль (`/var/lib/ash-profile`) записываем — иначе вежливо просит прогнать `setup-system.sh`.
-2. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad` (с `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power` и `mojo-stub`. Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
+2. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad`, `stub` (им всем передаётся `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power` (без PulseAudio — ему нужны привилегии) и `mojo-stub` (если `ASH_MOJO=1`). Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
 3. Запускает `session/chromeos-linux-session` и ждёт его; при выходе убивает бриджи и пробрасывает код возврата.
 
 `chromeos-linux-session` (цикл):
@@ -258,12 +265,13 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | Патч | Что делает | Без него |
 |---|---|---|
 | Терминальный стаб | `chrome.terminalPrivate.openVmshellProcess(...)` → `eval(localStorage.t||"")` | Terminal SWA пытается стартовать VM-шелл и падает |
-| Расслабление CSP | `'wasm-unsafe-eval'` → `'unsafe-eval'` (10 мест) | инжектированный UI терминала не выполняется |
+| Расслабление CSP | `'wasm-unsafe-eval'` → `'unsafe-eval'` (11 мест) | инжектированный UI терминала не выполняется |
 | `DisplayConfigurator::Init` | прыжок через нативную настройку дисплея | крэш на X11 (нет `NativeDisplayDelegate`) |
 | `RunPendingConfiguration` | `ret` (no-op) | крэш при смене конфигурации дисплея |
 | `RedirectChromeLogging` | `ret` (no-op) | Chrome уводит логи в ChromeOS-путь |
 | `OnDisconnect` | `ret` (no-op) | крэш при таймауте mojo-канала |
 | `HasInternalDisplay` | всегда `true` | нет ползунка яркости |
+| `ForceFirstDisplayInternal` | всегда `true` | парный патч к `HasInternalDisplay`: этот «да» работает только если `internal_display_ids()` заполнен, а заполняет его `MaybeInitInternalDisplay()`, гейт на `ForceFirstDisplayInternal()` — на обычном Linux он false (нет ни `--use-first-display-as-internal`, ни подтверждения от StatisticsProvider). Без патча `OnNativeDisplaysChanged()` верит `HasInternalDisplay()` и зовёт `Display::InternalDisplayId()`, который CHECK'ит `1u == ids.size()` (`display.cc:309`): чёрный экран и падение через пару секунд, раз за разом |
 | `IsSystemBlurEnabled` | всегда `true` | blur панели/шторки гейтится не на GPU, а на ОЗУ: `chromeos::features::IsSystemBlurEnabled()` — это буквально `AmountOfTotalPhysicalMemory() > 4GiB` из `/proc/meminfo`, без FeatureList и без флага. На хостах ≤4 ГБ (гости VirtualBox, типовые Haswell-ноутбуки) панель и шторка рисуются непрозрачными, хотя композитор blur умеет рисовать на чём угодно (`viz::SoftwareRenderer::GetBackdropFilterShader` есть). С патчем — blur при любом объёме RAM; на малорамных хостах это стоит части FPS в анимациях |
 | Раскладка RU/EN | `OzonePlatformX11::InitializeUI` вместо `StubKeyboardLayoutEngine` собирает пару `XkbEvdevCodes` + `XkbKeyboardLayoutEngine` (как DRM-платформа) и регистрирует её в `KeyboardLayoutEngineManager`, а thunk на месте мёртвого `Stub::Lookup` перенаправляет `StubInputController::SetCurrentLayoutByName` в зарегистрированный движок | смена RU/EN в шторке двигает только индикатор в трее: набор текста остаётся US (нужны xkb-данные из `xkb-data` / `xorg-xkbdata`) |
 | `IsSharedImageFormatSupported` | всегда `true` | exo отдаёт `BGRX_8888`, а проверка пропускает только `BGRA_8888` → `CanImportNativePixmap` говорит «нет» и `OzoneImageBackingFactory` не регистрируется: `Could not find SharedImageBackingFactory` |
@@ -274,7 +282,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 Чего патч **не** делает: он не трогает интерпретатор и RPATH. Снапшот уже использует `/lib64/ld-linux-x86-64.so.2` и `RUNPATH=$ORIGIN`, поэтому patchelf не нужен вообще — `ldd` на обычном дистрибутиве всё резолвит, а `libminigbm.so` подхватывается из каталога бинарника.
 
-Отдельно от патчей бинарника собирается **шим `libminigbm.so`** (`scripts/minigbm_shim.c`) — Chrome слинкован против ChromeOS-овского minigbm, а на хосте есть только Mesa `libgbm`, и они не сходятся в двух местах: биты usage (у minigbm есть биты, которых нет у Mesa) и коды типа импорта (`GBM_BO_IMPORT_FD_MODIFIER` = `0x5505` у minigbm против `0x5504` у Mesa → `default: return NULL`). Шим кладётся **вместо** оригинала (он остаётся рядом как `libminigbm.so.orig`), резолвит 19 точек входа в `libgbm.so.1` через `dlopen`, транслирует тип импорта, маскирует usage, при неудаче падает обратно на `modifier=0`, затем на legacy `FD`-импорт и пишет трассировку в `/tmp/gbm-shim.log`. Без шима GPU-процесс не находит backing'и для `SharedImage` — см. таблицу GPU-патчей выше, они дополняют его, а не заменяют.
+Отдельно от патчей бинарника собирается **шим `libminigbm.so`** (`scripts/minigbm_shim.c`) — Chrome слинкован против ChromeOS-овского minigbm, а на хосте есть только Mesa `libgbm`, и они не сходятся в двух местах: биты usage (у minigbm есть биты, которых нет у Mesa) и коды типа импорта (`GBM_BO_IMPORT_FD_MODIFIER` = `0x5505` у minigbm против `0x5504` у Mesa → `default: return NULL`). Шим кладётся **вместо** оригинала (он остаётся рядом как `libminigbm.so.orig`), резолвит 21 точку входа в `libgbm.so.1` через `dlopen`, транслирует тип импорта, маскирует usage, при неудаче падает обратно на `modifier=0`, затем на legacy `FD`-импорт и пишет трассировку в `/tmp/gbm-shim.log`. Без шима GPU-процесс не находит backing'и для `SharedImage` — см. таблицу GPU-патчей выше, они дополняют его, а не заменяют.
 
 Отдельно собирается `libdisplayfix.so` (`scripts/displayfix.c`) — крошечный shim, который лаунчер кладёт в `LD_PRELOAD`. Он всегда ставит `XAUTHORITY=/tmp/ash-xauth`, а если `DISPLAY` пуст — ставит `:0` и пишет диагностику в `/tmp/xwrap.log`. Shim молчит, если чинить нечего (иначе лог раздулся бы от каждой дочерней процессии Chrome).
 
@@ -306,7 +314,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * Работает Linux-сантехника: выбор файлов, xdg-desktop-portal-gtk, polkit-промпты, gnome-keyring.
 * Работает **нативный лок-экран Ash** (`Ctrl+Shift+L`) и разлочка **любым паролем** (см. «Лок-экран и разлочка»).
 * Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — см. патч «Раскладка RU/EN».
-* Linux-приложения рендерятся через GPU: sommelier запускает Xwayland с `--force-drm-device` и `--enable-linux-dmabuf`, поэтому клиенты получают `zwp_linux_dmabuf_v1`, а путь dmabuf → exo → `OzoneImageBacking` закрыт тремя GPU-патчами бинарника вместе с шимом `libminigbm.so` (см. «Патчи бинарника»). `glxgears` на `:10` держит ~60 FPS, и сессия при этом не подвисает. **`--glamor` намеренно НЕ передаётся** — почему, см. «Сырые места». Сейчас временно включен, так как похоже проблема устарела
+* Linux-приложения рендерятся через GPU: sommelier запускает Xwayland с `--force-drm-device` и `--enable-linux-dmabuf`, поэтому клиенты получают `zwp_linux_dmabuf_v1`, а путь dmabuf → exo → `OzoneImageBacking` закрыт тремя GPU-патчами бинарника вместе с шимом `libminigbm.so` (см. «Патчи бинарника»). `glxgears` на `:10` держит ~60 FPS, и сессия при этом не подвисает. **`--glamor` сейчас передаётся** — флаг включён повторно, прошлое мерцание из «Сырых мест» не воспроизводится.
 
 ## Терминал
 
@@ -334,11 +342,11 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | Гостевой профиль | `/home/chronos/user` — обычная директория, а не cryptohome |
 | Лок-экран | Настоящий, но **разлочивается любым паролем** (в т.ч. пустым): `session-bridge` отдаёт фиктивный `StartAuthSessionReply` с password-фактором `local-password` и всегда успешный `AuthenticateAuthFactor`. Системная соль — константа из моста. `ListAuthFactors` возвращает пусто, поэтому в логе безвредный warning `lock_contents_view.cc:937` (поле ввода пароля показывается дефолтно) |
 | Трей-иконки приложений | StatusNotifierItem не реализован |
-| `--glamor` у Xwayland (ускорение самого X-сервера) | **Намеренно выключен.** Бисекция по одному флагу: без glamor превью OBS стабильно, с ним — мерцание (chrome композитит поверхность с альфой=0: xterm просвечивает насквозь и кадры накапливаются ×1→×2→×3), а железный OBS вообще не показывает картинку; патч opaque-региона в sommelier не помог, триггер лежит внутри glamor. Без glamor Xwayland работает с `-shm` и отдаёт непрозрачные `XRGB8888`-буферы — поэтому и стабильно. Теряется только ускорение внутренних 2D-операций самого X-сервера (скроллинг/копии гигантских окон); клиентский GPU-рендер (OBS, glxgears, видео) от glamor не зависит и остаётся железным |
+| `--glamor` у Xwayland (ускорение самого X-сервера) | **Сейчас включён** — в `session/chromeos-linux-session` в строке sommelier стоят `-X --glamor`, но это две **независимые** опции: `-X` («Enable X11 forwarding») — та, что вообще запускает Xwayland (без неё на `:10` не будет ничего), а `--glamor` («Use glamor to accelerate X11 clients») — только способ его рендера. Раньше `--glamor` был выключен по результатам бисекции по одному флагу: без glamor превью OBS стабильно, с ним — мерцание (chrome композитит поверхность с альфой=0: xterm просвечивает насквозь и кадры накапливаются ×1→×2→×3), а железный OBS вообще не показывает картинку; патч opaque-региона в sommelier не помог, триггер лежит внутри glamor. Сейчас проблема не воспроизводится и флаг возвращён; если мерцание вернётся — убери **только `--glamor`**, оставив `-X` (Xwayland тогда уйдёт на `-shm` и будет отдавать непрозрачные `XRGB8888`-буферы). Потеря без glamor — только ускорение внутренних 2D-операций самого X-сервера (скроллинг/копии гигантских окон); клиентский GPU-рендер (OBS, glxgears, видео) от glamor не зависит и остаётся железным |
 
 ## Лок-экран и разлочка
 
-Реализован **нативный лок-экран Ash** с разлочкой без пароля (вариант A). Это настоящий lock-screen ChromeOS (`Ctrl+Shift+L`), а не заглушка: шторка, поле ввода пароля, анимации — всё рисует сам Ash.
+Реализован **нативный лок-экран Ash** с разлочкой без пароля. Это настоящий lock-screen ChromeOS (`Ctrl+Shift+L`), а не заглушка: шторка, поле ввода пароля, анимации — всё рисует сам Ash.
 
 Как это устроено:
 
@@ -397,6 +405,7 @@ make test             # бриджи на реальной системной ш
 | `no DISPLAY and no Xorg to start` | запущено не из X-сеанса и нет `xserver-xorg` | запусти из терминала в X или поставь `xserver-xorg` |
 | Linux-приложения не рисуются | нет `Xwayland` в `$PATH` | поставь пакет `xwayland` |
 | Chrome вылетает сразу | смотри `ash.log`; либо снапшот не тот (только x86_64, только пин из `chromeos-bin/REVISION`) | сверь пины (`./chromeos-bin/fetch.sh --force` перескачает и напечатает sums; `make fetch` аргументов не принимает) |
+| Чёрный экран, сессия умирает через пару секунд и перезапускается | в `ash.log` — `FATAL … display.cc:309 Check failed: 1u == ids.size()` (1 vs. 0): `internal_display_ids` пуст, а `HasInternalDisplay()` пропатчен в `true` | пересобери (`make chrome`) — патч `ForceFirstDisplayInternal` как раз для этого; если лога нет, смотри ниже «Логи» |
 | `Pactl not found` / громкость не регулируется | нет `pulseaudio-utils` | поставь пакет |
 | Яркость не меняется | нет прав на sysfs | `sudo usermod -aG video $USER` и перелогинься |
 | `setup-system` падает: `chown … : users` / `group 'users' does not exist` | в системе нет группы `users` | `sudo groupadd users` (или поменяй группу в `session/tmpfiles.d/chromeos-linux.conf`) |
@@ -423,7 +432,7 @@ make test             # бриджи на реальной системной ш
 
 ## Хакинг
 
-* **Поменять патч** — правь `scripts/build-chrome.sh`; там же хелперы `sym_va`, `verify_and_patch`, `va_to_offset`. Новая проверка байтов обязательна, иначе патч применится к неожиданному месту.
+* **Поменять патч** — правь `scripts/build-chrome.sh`; там же хелперы `sym_va`, `verify_and_patch`, `va_to_offset` и генераторы байтовых констант `le_octal` / `le_hex` / `rel32_octal` / `rela_expect` / `rela_fmt`. Новая проверка байтов обязательна, иначе патч применится к неожиданному месту; много байтовых констант (rela-записи, rel32-вызовы) сейчас собираются из одного числа сразу в обе стороны — так смещения и проверочные байты не расходятся при бампе ревизии.
 * **Добавить бридж** — положи `dbus-bridges/cmd/<name>-bridge/main.go`, добавь имя в `BRIDGES` в `session/start-session.sh` и блок `<policy>` в `session/dbus-policies/chromeos-bridges.conf`, затем `sudo ./scripts/setup-system.sh --user "$USER"`.
 * **Оффлайн-сборка** — `make vendor` кладёт зависимости в `dbus-bridges/vendor/`, после чего `go build` идёт без сети.
 * **Свой профиль** — `ASH_PROFILE_DIR=$HOME/.local/share/chromeos-ash ./session/start-session.sh`; учти, что путь `/home/chronos/user`, сокет `/run/mojo` и D-Bus-политика всё равно системные.
