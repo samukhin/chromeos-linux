@@ -344,7 +344,6 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * SUSPEND.
 * Уведомления в центре уведомлений Ash. Владельца `org.freedesktop.Notifications` на session-шине нет — `notify-send` и прочие Linux-уведомления никуда не доставляются.
 * Bluetooth: `bluetoothd` не установлен и в сессии не поднимается, плитки Bluetooth в шторке быстрых настроек нет.
-* Батарея: UPower не установлен — `power-bridge` каждые 30 с пишет `UPower.EnumerateDevices: The name is not activatable` и отвечает «батареи нет».
 * Вход в аккаунт Google, синк, Phone Hub, Nearby Share и прочие сервисы, привязанные к аккаунту.
 
 ## Проверка и диагностика
