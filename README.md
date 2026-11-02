@@ -57,6 +57,7 @@
 | `org.chromium.SessionManager`<br>`org.chromium.UserDataAuth` | `session-bridge` | «запущенная сессия», состояние входа, гостевой профиль `/home/chronos/user` |
 | `org.chromium.VmConcierge`, `VmCicerone`,<br>`DlcService`, `ImageLoader`, `debugd` | `crostini-bridge` | локальные `.desktop`-файлы: регистрация в лаунчере и запуск приложений на `:10` |
 | `org.chromium.Rmad` | `rmad-bridge` | заглушка RMA-демона |
+| `org.chromium.TpmManager`, `ResourceManager`, `pciguard`,<br>`VmPluginDispatcher`, `UpdateEngine`, `SmbProvider`, `Rgbkbd`,<br>`MachineLearning`, `CrosDisks`, `BiometricsDaemon` | `stub-bridge` | 10 имён демонов ChromeOS, которых здесь нет: принимает одноразовые методы Chrome и отвечает пустыми/нулевыми результатами, чтобы вместо `ServiceUnknown` каждые 30 с шли валидные ответы |
 | `/run/mojo/service_manager.sock` | `mojo-stub` | Mojo service manager (ACCEPT_INVITEE + слив сообщений) |
 | — | `register-apps` | разовый helper: пишет `crostini.registry` в `Preferences`, чтобы `.desktop`-файлы появились в лаунчере |
 
@@ -94,9 +95,9 @@ sudo apt install xserver-xorg
 **Arch**
 
 ```bash
-sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja gcc make \
-  wayland libxkbcommon libdrm libgbm pixman libxcb libxcomposite \
-  xorg-xwayland xorg-xrandr xorg-xrdb xorg-xhost xorg-xauth dbus \
+sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja binutils \
+  perl gcc make curl tar wayland libxkbcommon libdrm libgbm pixman libxcb libxcomposite \
+  xorg-xwayland xorg-xrandr xorg-xrdb xorg-xhost xorg-xauth xorg-xkbdata dbus \
   nss nspr cups alsa-lib libpulse pipewire-pulse librsvg \
   networkmanager gnome-keyring polkit-gnome xdg-desktop-portal-gtk unzip
 ```
@@ -105,6 +106,7 @@ sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja gcc make
 
 * `xwayland` — без него Linux-приложения внутри Ash не рисуются;
 * `x11-xserver-utils` — `xrandr` (границы окна Ash) и `xrdb` (цвета для xterm);
+* `xorg-xkbdata` (на Debian это `xkb-data`) — данные раскладок: без них патч «Раскладка RU/EN» не меняет язык при наборе;
 * `pulseaudio-utils` — `pactl`, через который `cras-bridge` крутит громкость;
 * `librsvg2-bin` — `rsvg-convert` для SVG-иконок в лаунчере;
 * `network-manager` — `shill-bridge` без NM просто пишет в лог «NM not available»;
@@ -122,6 +124,7 @@ scripts/build-chrome.sh       патчинг бинарника → dist/chrome/
 scripts/build-sommelier.sh    сборка sommelier → dist/sommelier/
 scripts/build-bridges.sh      сборка Go-бриджей → dist/bin/
 scripts/displayfix.c          C-шим libdisplayfix.so
+scripts/minigbm_shim.c        C-шим libminigbm.so (обёртка над системным libgbm)
 scripts/setup-system.sh       разовая установка под root
 scripts/doctor.sh             проверка зависимостей + преflight сессии
 scripts/verify.sh             проверка артефактов сборки
@@ -139,7 +142,7 @@ dbus-bridges/cmd/*/           исходники бриджей (Go)
 terminal/terminal-ui.js       UI терминала, который инжектируется в SWA
 
 Makefile                      цели сборки
-dist/                         всё собранное (~620 МБ, не коммитится)
+dist/                         всё собранное (~630 МБ, не коммитится)
 .cache/                       временные файлы сборки (не коммитится)
 ```
 
@@ -155,7 +158,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 Запускать `./session/start-session.sh` **из обычного терминала (TTY) либо из любого окна** — отдельно `startx` запускать не нужно: если `DISPLAY` не задан, скрипт сам поднимает X через `startx` (первый свободный `:N`) и становится его клиентом; если `DISPLAY` уже есть (X-сеанс LightDM/GDM/SDDM), используется он. Внутри уже поднятого X-сеанса `start-session.sh` просто работает поверх него.
 
-Пересборка с нуля: `make clean && make`. Время сборки — около 5 минут, из них 4 — патчинг 603-мегабайтного бинарника.
+Пересборка с нуля: `make clean && make`. Время сборки — около 5 минут, из них 4 — патчинг 412-мегабайтного бинарника.
 
 ### Цели Makefile
 
@@ -186,7 +189,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 | Шаг | Что появляется |
 |---|---|
-| D-Bus-политика | `/etc/dbus-1/system.d/chromeos-bridges.conf` — копия `session/dbus-policies/chromeos-bridges.conf` с подставленным пользователем; после изменения шина перезапускается |
+| D-Bus-политика | `/etc/dbus-1/system.d/chromeos-bridges.conf` — копия `session/dbus-policies/chromeos-bridges.conf` с подставленным пользователем; шина **перечитывает** политику без перезапуска (`dbus-broker` — `reload`; перезапуск только как фолбэк для `dbus-daemon`, который читает её только при старте) |
 | Системные каталоги | `/etc/tmpfiles.d/chromeos-linux.conf` + `systemd-tmpfiles --create`: `/var/lib/ash-profile`, `/run/mojo`, `/home/chronos/user`, заглушки termina-DLC и VM-диска, `/var/log/chrome`, `/var/lib/metrics/...`, а также заглушка `/dev/kvm` — **только если KVM на хосте нет** (без неё Chrome считает, что виртуализации нет, и молча не открывает Linux-приложения; при наличии `/sys/class/misc/kvm` строка из конфига выбрасывается, а уже установленная заглушка снимается — она мешала бы udev создать настоящий device-node) |
 | Личность ОС | в `/etc/lsb-release` дописываются `DEVICETYPE=CHROMEBOOK` и `CHROMEOS_RELEASE_NAME=Chrome OS` (исходный файл сохраняется в `/etc/lsb-release.chromeos-linux.bak`) |
 | Заглушки шелла | симлинки `vsh` и `crosh` → `session/stubs/shell-stub.sh` **и в `/usr/local/bin`, и в `/usr/bin`** (Ash терминала зовёт их по абсолютному пути `/usr/bin/vsh`, `PATH` не ищет — см. преflight в `doctor.sh`) |
@@ -200,7 +203,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 > **Группа `users`.** Скрипт делает `chown "$USER:users"` профиля, а все каталоги из tmpfiles создаются с группой `users`. На Debian/Ubuntu она есть по умолчанию (`USERS_GROUP=users`), на части minimal-установок — нет. Если её не окажется, `setup-system` упадёт на `chown`/`systemd-tmpfiles` с `group 'users' does not exist`: создай её (`sudo groupadd users`) либо заранее поменяй группу во всех строках `session/tmpfiles.d/chromeos-linux.conf` (и в `chown` внутри `scripts/setup-system.sh`).
 
-Почему без systemd не обойтись «вручную»: политика D-Bus подхватывается только при старте демона. На systemd-less системе (или в контейнере) скрипт предупредит, что dbus надо перезапустить или перезагрузиться.
+Почему без systemd не обойтись «вручную»: применить D-Bus-политику отдельно от шины всё равно нельзя. `setup-system.sh` сначала пробует `reload` (шина перечитывает `<includedir>` и не рвёт соединения — polkitd и logind продолжают работать), а `restart` — только для демонов без поддержки reload. На systemd-less системе (или в контейнере) скрипт предупредит, что dbus надо перезапустить или перезагрузиться.
 
 Что **не** делает `setup-system.sh` и не требует: он не ставит юнитов, не трогает `PATH`, не регистрирует сессию у дисплейного менеджера. В `/usr/bin` он пишет **только** две заглушки `vsh`/`crosh` (туда же их ждёт абсолютный путь из бинарника) и ничего больше.
 
@@ -209,14 +212,14 @@ sudo ./scripts/setup-system.sh --user "$USER"
 `./session/start-session.sh`:
 
 1. Проверяет системную шину и что профиль (`/var/lib/ash-profile`) записываем — иначе вежливо просит прогнать `setup-system.sh`.
-2. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad` (с `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power` и `mojo-stub`. Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
+2. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad` (эти пять — с `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power`, `stub` (заглушки для отсутствующих демонов ChromeOS) и `mojo-stub` (если `ASH_MOJO=1`). Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
 3. Запускает `session/chromeos-linux-session` и ждёт его; при выходе убивает бриджи и пробрасывает код возврата.
 
 `chromeos-linux-session` (цикл):
 
 1. Готовит профиль: `mkdir`, `CHROMEOS_SESSION_LOG_DIR`, метки «OOBE пройдено» (`.oobe_completed`, `First Run`, `Local State`), чистка токенов входа, JSON-правки `Preferences` (включён Crostini, `exit_type=Normal`).
 2. Прогоняет `register-apps` — пишет Linux-приложения в лаунчер Ash.
-3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), открывает `chrome-untrusted://terminal/`, кладёт `terminal/terminal-ui.js` в `localStorage.t` и перезагружает страницу. Это срабатывает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
+3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (цикл из 60 попыток с интервалом 2 с, т.е. до ~120 с), открывает `chrome-untrusted://terminal/`, кладёт `terminal/terminal-ui.js` в `localStorage.t` и перезагружает страницу. Это срабатывает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
 4. Поднимает в фоне sommelier + Xwayland на `:10` (ждёт появления `wayland-0` и ответа CDP, выставляет чёрно-белые цвета xterm через `xrdb`).
 5. Определяет границы окна Ash через `xrandr` и запускает Chrome с закреплённым набором флагов (`--enable-wayland-server`, `--ozone-platform=x11`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`).
 6. Когда Chrome вышел — убивает sommelier/Xwayland, ждёт остаточных процессов `chrome` и начинает заново.
@@ -245,6 +248,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | `ASH_DISPLAY_SIZE` | `1920x1080` | запасные границы окна, если `xrandr` ничего не сообщает |
 | `ASH_DISPLAY_BOUNDS` | — | явные границы `ШxВ` (без промеров) |
 | `ASH_XRANDR_OUTPUT` | основной вывод | принудительно указать, какой xrandr-вывод менять по размеру |
+| `ASH_DRM_DEVICE` | `/dev/dri/renderD128` | render-node для `--force-drm-device` sommelier'а — без него нет `ctx.gbm`, dmabuf-гейты закрыты и Xwayland стартует с `-shm` |
 | `ASH_MOJO` | `1` | `0` — не запускать `mojo-stub` в `start-session.sh` |
 | `ASH_SMOKE_TIMEOUT` | `6` | сколько секунд `make test` ждёт появления имени на шине |
 | `ASH_TERMINAL_UI` | — | путь к `terminal-ui.js` для `terminal-inject.pl` (по умолчанию аргумент из сессии) |
@@ -252,12 +256,12 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 ## Патчи бинарника (applied at build time)
 
-Снапшот патчится в `scripts/build-chrome.sh`. Каждый патч сверяет ожидаемые байты и **падает с ошибкой**, если бинарник не совпал — молчаливо «починить» чужой бинарник нельзя.
+Снапшот патчится в `scripts/build-chrome.sh`. Каждый патч сверяет ожидаемые байты и **падает с ошибкой**, если бинарник не совпал — молчаливо «починить» чужой бинарник нельзя. Исключения: `HasInternalDisplay` помечен `soft` (найдена не во всех снапшотах — просто предупреждение), отсутствие терминального стаба и CSP-строк даёт только warning, а `WaylandDmabufFeedbackManager` пропускается целиком, если символа в этом снапшоте нет.
 
 | Патч | Что делает | Без него |
 |---|---|---|
 | Терминальный стаб | `chrome.terminalPrivate.openVmshellProcess(...)` → `eval(localStorage.t||"")` | Terminal SWA пытается стартовать VM-шелл и падает |
-| Расслабление CSP | `'wasm-unsafe-eval'` → `'unsafe-eval'` (10 мест) | инжектированный UI терминала не выполняется |
+| Расслабление CSP | `'wasm-unsafe-eval'` → `'unsafe-eval'` (5 мест в бинарнике) | инжектированный UI терминала не выполняется |
 | `DisplayConfigurator::Init` | прыжок через нативную настройку дисплея | крэш на X11 (нет `NativeDisplayDelegate`) |
 | `WaylandDmabufFeedbackManager` | версия 0, dmabuf-пробы пропускаются | зависания/крэш на не-ChromeOS GPU |
 | `RunPendingConfiguration` | `ret` (no-op) | крэш при смене конфигурации дисплея |
@@ -265,9 +269,13 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | `OnDisconnect` | `ret` (no-op) | крэш при таймауте mojo-канала |
 | `HasInternalDisplay` | всегда `true` | нет ползунка яркости |
 | Раскладка RU/EN | `OzonePlatformX11::InitializeUI` вместо `StubKeyboardLayoutEngine` собирает пару `XkbEvdevCodes` + `XkbKeyboardLayoutEngine` (как DRM-платформа) и регистрирует её в `KeyboardLayoutEngineManager`, а thunk на месте мёртвого `Stub::Lookup` перенаправляет `StubInputController::SetCurrentLayoutByName` в зарегистрированный движок | смена RU/EN в шторке двигает только индикатор в трее: набор текста остаётся US (нужны xkb-данные из `xkb-data` / `xorg-xkbdata`) |
+| `GetEventPropertiesFromXEvent` | при XI2-кейсобытиях (тег `0x1f` вместо core-тега `0x36`) ветка возвращала пустую карту свойств вместо разыменования NULL | SEGV на каждое нажатие клавиши на современном Xorg |
+| `exo::Surface::Damage` | cave клампит координаты incoming `gfx::Rect` в `[0, 30000]` перед union'ом: `wl_surface.damage(0,0,INT_MAX,INT_MAX)` от Mesa гасится в `SkRegion`, и регион повреждений остаётся пустым | нативные Wayland-клиенты «замерзают»: текст появляется только при полной перерисовке десктопа |
+| `GLOzoneEGLX11::CanImportNativePixmap` + `gpu::OzoneImageBackingFactory::IsSupported` | два гейта импорта нативного pixmap'а всегда `true` | белые окна всех X11-клиентов на дисплее sommelier и «Could not find SharedImageBackingFactory» в GPU-логе |
+| `libminigbm.so` | снапшотный `libminigbm.so` отодвигается в `.orig`, вместо него собирается шим (`scripts/minigbm_shim.c`), который `dlopen`-ит системный `libgbm.so.1`: коды usage/import у ChromeOS-`minigbm` и Mesa различаются (`GBM_BO_IMPORT_FD_MODIFIER` `0x5505` против `0x5504`) | Mesa возвращает `NULL`, GPU-процесс не находит shared image backing |
 | crashpad-wrapper | всегда добавляет `--database` | падение на старте crashpad-handler'а |
 
-Чего патч **не** делает: он не трогает интерпретатор и RPATH. Снапшот уже использует `/lib64/ld-linux-x86-64.so.2` и `RUNPATH=$ORIGIN`, поэтому patchelf не нужен вообще — `ldd` на обычном дистрибутиве всё резолвит, а `libminigbm.so` подхватывается из каталога бинарника.
+Чего патч **не** делает: он не трогает интерпретатор и RPATH. Снапшот уже использует `/lib64/ld-linux-x86-64.so.2` и `RUNPATH=$ORIGIN`, поэтому patchelf не нужен вообще — `ldd` на обычном дистрибутиве всё резолвит, а `libminigbm.so` лежит в каталоге бинарника (правда, это уже не оригинал, а собранный шим; исходный файл сохранён рядом как `libminigbm.so.orig`).
 
 Отдельно собирается `libdisplayfix.so` (`scripts/displayfix.c`) — крошечный shim, который лаунчер кладёт в `LD_PRELOAD`. Он всегда ставит `XAUTHORITY=/tmp/ash-xauth`, а если `DISPLAY` пуст — ставит `:0` и пишет диагностику в `/tmp/xwrap.log`. Shim молчит, если чинить нечего (иначе лог раздулся бы от каждой дочерней процессии Chrome).
 
@@ -291,11 +299,10 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * Ставятся все 24 System Web App, включая Terminal, Files, Settings и Camera.
 * Terminal SWA поднимает настоящий bash через инжектированный UI.
 * Chrome переживает перелогин и ре-экзекуции сессии, не вылетая из дисплейного менеджера.
-* Работают бриджи shill, CRAS, powerd, session_manager, UserDataAuth, Crostini, rmad и совместимость Mojo service manager.
+* Работают бриджи shill, CRAS, powerd, session_manager, UserDataAuth, Crostini, rmad, заглушки `stub-bridge` и совместимость Mojo service manager.
 * NetworkManager отдаёт шилл-бриджу реальное состояние сети.
 * Громкость работает через CRAS-бридж (PulseAudio/PipeWire).
-* UPower кормит бридж питания состоянием батареи.
-* Яркость работает через sysfs с фолбэком на `xrandr`.
+* `power-bridge` крутит яркость (sysfs, фолбэк на `xrandr`) и шлёт в systemd запросы suspend/reboot (см. «Сырые места»). Батарея читается из UPower — на хосте без него её нет (см. «Что не работает»).
 * Работает Linux-сантехника: выбор файлов, xdg-desktop-portal-gtk, polkit-промпты, gnome-keyring.
 * Работает **нативный лок-экран Ash** (`Ctrl+Shift+L`) и разлочка **любым паролем** (см. «Лок-экран и разлочка»).
 * Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — см. патч «Раскладка RU/EN».
@@ -306,11 +313,11 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 | Область | Состояние |
 |---|---|
-| Данные сети/аудио/батареи в трее | Реальные данные есть, но очень ограничены |
+| Данные сети/аудио/батареи в трее | Сеть и аудио — реальные, но очень ограничены; батареи нет без UPower |
 | Интеграция Linux-приложений в лаунчер | `.desktop`-файлы пишутся в настройки Crostini, но запускаться могут не все (большинство — да) |
 | Эмуляция терминала | Базовый VT100 хватает на fastfetch; для работы бери нормальный терминал |
 | Аудио-узлы | Громкость работает, но узлы захардкожены (Speaker/Headphone/Mic), реального discovery PipeWire нет |
-| Рендер «управляемых» Linux-приложений | X11-приложения на `DISPLAY=:10` идут через wl_shm, без аппаратного ускорения |
+| Рендер «управляемых» Linux-приложений | X11-приложения на `DISPLAY=:10` идут через GPU: Xwayland поднят с `--glamor`, буферы экспортируются как `zwp_linux_dmabuf_v1` и импортируются Chrome'ом zero-copy. Работает только из-за патчей import-гейтов и шима `libminigbm.so` (см. таблицу патчей); у части клиентов (превью OBS) встречается мерцание |
 | Яркость / SUSPEND | `power-bridge` работает от вашего пользователя: на запись в `/sys/class/backlight/*/brightness` нужны права (добавьте себя в группу `video`), suspend зависит от polkit |
 | Гостевой профиль | `/home/chronos/user` — обычная директория, а не cryptohome |
 | Лок-экран | Настоящий, но **разлочивается любым паролем** (в т.ч. пустым): `session-bridge` отдаёт фиктивный `StartAuthSessionReply` с password-фактором `local-password` и всегда успешный `AuthenticateAuthFactor`. Системная соль — константа из моста. `ListAuthFactors` возвращает пусто, поэтому в логе безвредный warning `lock_contents_view.cc:937` (поле ввода пароля показывается дефолтно) |
@@ -335,7 +342,9 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 * Выбор, подключение и отключение Wi-Fi из интерфейса ChromeOS. Вообще, почти все настройки.
 * SUSPEND.
-* Уведомления в центре уведомлений Ash.
+* Уведомления в центре уведомлений Ash. Владельца `org.freedesktop.Notifications` на session-шине нет — `notify-send` и прочие Linux-уведомления никуда не доставляются.
+* Bluetooth: `bluetoothd` не установлен и в сессии не поднимается, плитки Bluetooth в шторке быстрых настроек нет.
+* Батарея: UPower не установлен — `power-bridge` каждые 30 с пишет `UPower.EnumerateDevices: The name is not activatable` и отвечает «батареи нет».
 * Вход в аккаунт Google, синк, Phone Hub, Nearby Share и прочие сервисы, привязанные к аккаунту.
 
 ## Проверка и диагностика
@@ -354,7 +363,7 @@ make test             # бриджи на реальной системной ш
 * **systemd-logind** неактивен → suspend/reboot из трея мертвы. Обычно за этим стоит мёртвый polkit: polkitd выходит в момент падения системной шины (теряет `org.freedesktop.PolicyKit1`, а `polkit.service` — static, без `Restart=`), после чего logind зависает, дожидаясь polkit-авторизации. Раньше `setup-system.sh` при каждом изменении политики делал `restart dbus` и ронял polkit вместе с шиной — теперь он применяет политику `reload`-ом (без разрыва соединений) и отдельно поднимает polkit.
 * **logind «active», но без D-Bus-имени** → Xorg не стартует: `Cannot open virtual console 1 (Permission denied)`. Тонкость в том, что `is-active` тут врёт — перезапуск шины рвёт соединение logind, а юнит остаётся «active»; имя `org.freedesktop.login1` logind занимает только при (пере)подключении. Xorg просит logind взять VT (`TakeControl`/`TakeDevice`), ответа нет, и он падает в ветку прямого открытия `/dev/tty1`, на которое у обычного пользователя прав нет. Лечение: `sudo ./scripts/setup-system.sh` (он сам перезапустит logind) или вручную `sudo systemctl restart systemd-logind` — после чего имя возвращается и `startx` поднимается. Проверка: `busctl status org.freedesktop.login1` (должен быть владелец, а не `(activatable)`).
 
-`make test` — самый полезный предварительный прогон: он поднимает каждый бридж, ждёт, пока его имя появится на шине (это возможно только при корректной политике), дёргает `GetVolumeState` и `RetrieveSessionState`, проверяет mojo-сокет и `register-apps`. При провале логи не удаляются, а печатаются.
+`make test` — самый полезный предварительный прогон: он поднимает бриджи `shill`, `cras`, `power`, `session`, `crostini`, `rmad` и `mojo-stub` (`stub` не проверяется — он просто держит имена), ждёт, пока имя появится на шине (это возможно только при корректной политике), дёргает `GetVolumeState` и `RetrieveSessionState`, проверяет mojo-сокет и прогоняет `register-apps`. При провале логи не удаляются, а печатаются.
 
 ### Логи
 
@@ -365,8 +374,10 @@ make test             # бриджи на реальной системной ш
 | `/var/lib/ash-profile/*-bridge.log` | по одному на бридж |
 | `/var/lib/ash-profile/bridges.log` | записи watchdog-ов о перезапусках |
 | `/var/lib/ash-profile/xorg.log` | свой Xorg, если поднимал скрипт |
-| `/var/lib/ash-profile/test-user/log/ash` | собственный сессионный лог Chrome |
+| `/var/lib/ash-profile/test-user/log/` | `CHROMEOS_SESSION_LOG_DIR` — сюда Chrome складывает `session_log.txt` (диагностика); обычно пуст |
+| `/var/lib/ash-profile/terminal-inject.log` | ход инжекта UI терминала: ожидание CDP, `localStorage`, монтирование страницы |
 | `/tmp/xwrap.log` | случаи, когда `libdisplayfix.so` чинил `DISPLAY` |
+| `/tmp/gbm-shim.log` | каждый вызов шима `libminigbm.so` (очищается при старте сессии) |
 | `/tmp/chromeos-linux/shell-stub.log` | вызовы заглушек `vsh` / `crosh` |
 
 ### Типовые проблемы
