@@ -19,8 +19,14 @@ else
 fi
 
 echo "== dist/chrome =="
+# -x for everything that has to run, -e for the two libraries: a file that
+# lost its executable bit would sail through ldd/grep and only blow up when
+# chrome actually starts.
 for f in chrome chrome_crashpad_handler chrome_crashpad_handler.real \
-         chromeos-ash libdisplayfix.so libminigbm.so; do
+         chromeos-ash; do
+  [ -x "$ASH_ROOT/dist/chrome/$f" ] || fail "dist/chrome/$f missing or not executable"
+done
+for f in libdisplayfix.so libminigbm.so; do
   [ -e "$ASH_ROOT/dist/chrome/$f" ] || fail "dist/chrome/$f missing"
 done
 if [ -x "$ASH_ROOT/dist/chrome/chromeos-ash" ]; then
@@ -35,14 +41,26 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
     ok "chrome: all shared libraries resolve"
   fi
 
-  # LC_ALL=C: readelf localizes that header ("Запрашиваемый интерпретатор
-  # программы:" under ru_RU), so the sed below would match nothing and the
-  # check would print <unreadable> on any non-English system.
+  # LC_ALL=C: readelf localizes the "Requesting program interpreter" header
+  # under ru_RU, so the sed below would match nothing on a non-English
+  # system. An empty result used to be printed as ok ("<unreadable>"/
+  # "<none>") and hid a missing readelf or a broken header; now it fails.
+  # `|| true` keeps set -e from killing verify mid-run — a broken readelf
+  # has to show up as a FAIL line, not as a silent abort.
   interp=$(LC_ALL=C readelf -l "$ASH_ROOT/dist/chrome/chrome" |
-           sed -n 's/.*Requesting program interpreter: \(.*\)\]$/\1/p' | head -1)
-  ok "chrome interpreter: ${interp:-<unreadable>}"
-  rpath=$(LC_ALL=C readelf -d "$ASH_ROOT/dist/chrome/chrome" | awk -F'[][]' '/RPATH|RUNPATH/ { print $2; exit }')
-  ok "chrome rpath: ${rpath:-<none>}"
+           sed -n 's/.*Requesting program interpreter: \(.*\)\]$/\1/p' | head -1) || true
+  if [ -n "$interp" ]; then
+    ok "chrome interpreter: $interp"
+  else
+    fail "chrome interpreter unreadable (readelf -l failed; $APT_HINT binutils)"
+  fi
+  rpath=$(LC_ALL=C readelf -d "$ASH_ROOT/dist/chrome/chrome" |
+          awk -F'[][]' '/RPATH|RUNPATH/ { print $2; exit }') || true
+  if [ -n "$rpath" ]; then
+    ok "chrome rpath: $rpath"
+  else
+    fail "chrome rpath missing (readelf -d) — chrome resolves its bundled libs via \$ORIGIN"
+  fi
 
   if grep -qF 'eval(localStorage.t||"")' "$ASH_ROOT/dist/chrome/chrome"; then
     ok "terminal stub patch applied"
@@ -50,49 +68,84 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
     fail "terminal stub patch missing"
   fi
 
-  # Три GPU-патча из build-chrome.sh (зачем они — см. там же и в README).
-  # Смещения считаем от символов, а не держим в константах: при обновлении
-  # снапшота символы сдвинутся вместе с кодом.
-  if have nm && have objdump; then
+  # CSP relaxation from build-chrome.sh: 'wasm-unsafe-eval' -> 'unsafe-eval'.
+  # Grep for the ABSENCE of the original token: the quoted `'unsafe-eval'`
+  # already occurs in other CSPs with or without this patch, so testing for
+  # its presence would prove nothing.
+  if grep -qF "'wasm-unsafe-eval'" "$ASH_ROOT/dist/chrome/chrome"; then
+    fail "CSP patch missing: 'wasm-unsafe-eval' still present"
+  else
+    ok "CSP wasm-unsafe-eval -> unsafe-eval applied"
+  fi
+
+  # Three GPU patches from build-chrome.sh (what they are for — see the
+  # comments there and the README). Sites are measured from symbols, never
+  # pinned as constants: on a snapshot bump the symbols move with the code.
+  # All three sites sit in .text, so the section delta is enough here
+  # (build-chrome maps through every PT_LOAD because it also has data
+  # sites). Every check runs its own nm on purpose: the demangled dump is
+  # ~564 MB, too big for a shell variable on this 4 GB host (bash holds it
+  # plus a here-string copy — the OOM killer then takes verify down with
+  # 137 instead of a FAIL line), and caching it in a file would only move
+  # those megabytes into tmpfs. So nm streams straight into awk, which
+  # reads a line at a time.
+  if ! have nm || ! have objdump; then
+    echo "  skip: nm/objdump not installed"
+  else
     read -r text_vma text_off < <(
       LC_ALL=C objdump -h "$ASH_ROOT/dist/chrome/chrome" |
         awk '$2==".text"{ print "0x"$4, "0x"$6 }') || true
-    [ -n "${text_vma:-}" ] || fail ".text section not readable"
-    delta=$(( ${text_off:-0} - ${text_vma:-0} ))
+    if [ -z "${text_vma:-}" ]; then
+      # One clear failure instead of three confused ones: without .text the
+      # delta would be 0 and every patch would "mismatch" on its own.
+      fail ".text section not readable — GPU patch checks skipped"
+    else
+      delta=$(( text_off - text_vma ))
 
-    check_gpu_patch() { # <label> <symbol regex> <extra offset> <6 bytes>
-      local va off got
-      # Без exit в awk: ранний выход дал бы nm SIGPIPE, а set -e подхватил
-      # бы 141 и убил verify на середине. Первый матч берём в shell'е.
-      va=$(nm -C "$ASH_ROOT/dist/chrome/chrome" | SYM_PATTERN="$2" \
-           awk '$0 ~ ENVIRON["SYM_PATTERN"] { print "0x"$1 }')
-      va=${va%%$'\n'*}
-      [ -n "$va" ] || { fail "$1: symbol not found"; return; }
-      off=$(( va + delta + ${3:-0} ))
-      got=$(dd if="$ASH_ROOT/dist/chrome/chrome" bs=1 skip="$off" count=6 \
-              2>/dev/null | od -An -tx1 | tr -d ' \n') || true
-      if [ "$got" = "$4" ]; then
-        ok "$1"
-      else
-        fail "$1: bytes '$got' != '$4' at $off"
-      fi
-    }
+      check_gpu_patch() { # <label> <sym-regex> <extra-offset> <expected-hex>
+        local va site off got expected=$4
+        # ENVIRON instead of awk -v: -v would eat the backslashes in
+        # \(...\) — the same trap build-chrome.sh documents. No early exit
+        # in awk: it would SIGPIPE nm and pipefail/set -e would kill the
+        # script with 141. First match wins via !found. `|| true` keeps a
+        # dead nm from aborting verify — it surfaces as the FAIL below.
+        va=$(nm -C "$ASH_ROOT/dist/chrome/chrome" | SYM_PATTERN="$2" \
+             awk '!found && $0 ~ ENVIRON["SYM_PATTERN"] { print "0x"$1; found = 1 }') || true
+        [ -n "$va" ] || { fail "$1: symbol not found"; return; }
+        site=$(( va + ${3:-0} ))
+        off=$(( site + delta ))
+        # Read exactly as many bytes as expected has and compare in full:
+        # the length needs no pin and a short read can never match.
+        got=$(dd if="$ASH_ROOT/dist/chrome/chrome" bs=1 skip="$off" \
+                count=$(( ${#expected} / 2 )) 2>/dev/null | od -An -tx1 | tr -d ' \n') || true
+        if [ "$got" = "$expected" ]; then
+          ok "$1"
+        else
+          fail "$1: bytes '$got' != '$expected' at file offset $off (VA 0x$(printf %x "$site"))"
+        fi
+      }
 
-    check_gpu_patch "IsSharedImageFormatSupported -> true" \
-      ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(' \
-      0 b801000000c3
-    check_gpu_patch "GetNativePixmapSupportType -> kX11Pixmap" \
-      ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)' \
-      0 b802000000c3
-    check_gpu_patch "NativePixmapEGLX11Binding::Create -> BGRX check dropped" \
-      ' t ui::NativePixmapEGLX11Binding::Create\(' \
-      110 909090909090
-  else
-    echo "  skip: nm/objdump not installed"
+      # b8 01 00 00 00 c3 = mov $1,%eax; ret — the payload of patch 1.
+      check_gpu_patch "IsSharedImageFormatSupported -> true" \
+        ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(' \
+        0 b801000000c3
+      # b8 02 00 00 00 c3 = mov $2,%eax; ret — the payload of patch 2.
+      check_gpu_patch "GetNativePixmapSupportType -> kX11Pixmap" \
+        ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)' \
+        0 b802000000c3
+      # Patch 3: six NOPs over the `je` — Create+110, right after the
+      # call gl::IsFormatSupported. The offset mirrors the pin in
+      # build-chrome.sh and the bytes are its payload: both scripts get
+      # updated together, and catching that they drifted apart is exactly
+      # what verify is for.
+      check_gpu_patch "NativePixmapEGLX11Binding::Create -> BGRX check dropped" \
+        ' t ui::NativePixmapEGLX11Binding::Create\(' \
+        110 909090909090
+    fi
   fi
 
-  # libminigbm.so обязан быть нашим шимом, а не оригиналом снапшота:
-  # оригинал при сборке переименовывается в .orig.
+  # libminigbm.so must be our shim, not the snapshot's original: the build
+  # renames the pristine copy to .orig.
   if grep -qF 'gbm_bo_import(type=' "$ASH_ROOT/dist/chrome/libminigbm.so" 2>/dev/null; then
     ok "minigbm shim installed"
   else

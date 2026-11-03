@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Turn the prebuilt ChromiumOS Chrome build into an Ash shell that runs on a
-# stock Linux userspace.
+# stock Linux userspace (ported from the Nix `chromefixed` derivation): the
+# binary patches fail loudly when the binary no longer matches, and nothing
+# is patchelf'ed — the snapshot already uses /lib64/ld-linux-x86-64.so.2 and
+# RUNPATH=$ORIGIN, so it runs on a stock userspace as-is, with
+# libdisplayfix.so injected by the launcher.
 #
-# Ported from the Nix packaging this repo used to ship (the `chromefixed`
-# derivation): the binary patches fail loudly when the binary no longer
-# matches, and nothing is patchelf'ed — the snapshot already uses
-# /lib64/ld-linux-x86-64.so.2 and RUNPATH=$ORIGIN, so it runs on a stock
-# userspace as-is, with libdisplayfix.so injected by the launcher.
+# A failed patch prints its whole site — file offset, VA, nearest
+# symbol, code around it, expected vs actual, payload — enough to fix it in
+# place. The rule every report repeats: never paste "actual" into
+# `expected`; recompute the site from its symbol/anchor, then pin the new
+# pristine bytes.
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -17,6 +21,7 @@ CHROME="$OUT/chrome"
 
 need nm "nm — binutils ($APT_HINT binutils / $PAC_HINT binutils)"
 need objdump "objdump — binutils ($APT_HINT binutils / $PAC_HINT binutils)"
+need readelf "readelf — binutils ($APT_HINT binutils / $PAC_HINT binutils)"
 need gawk "gawk — $APT_HINT gawk / $PAC_HINT gawk"
 need "${CC:-cc}" "C compiler — $APT_HINT build-essential / $PAC_HINT base-devel"
 
@@ -28,76 +33,159 @@ mkdir -p "$OUT"
 cp -a "$SRC/." "$OUT/"
 chmod u+w "$CHROME"
 
-# --- helpers ---------------------------------------------------------------
+# --- shared caches -----------------------------------------------------------
 
-# Bytes we are about to write; NULs keep this out of shell variables, so ask
-# printf and count through a pipe instead.
+# One nm run for the whole script (~4s) instead of one per symbol lookup
+# (15+ runs, ~60s of every build). Feeds sym_va and the failure report;
+# removed on exit.
+NM_CACHE=$(mktemp "${TMPDIR:-/tmp}/ash-nm.XXXXXX")
+trap 'rm -f "$NM_CACHE"' EXIT
+nm -C -S "$CHROME" > "$NM_CACHE"
+
+# VA <-> file offset through the PT_LOAD segments: one mapping for the whole
+# binary, .rela.dyn/.rodata included (the old .text-delta shortcut only
+# worked for code, which is why data sites were pasted as raw file offsets).
+LOADS=$(readelf -lW "$CHROME" | awk '$1 == "LOAD" { print $2, $3, $5 }')
+[ -n "$LOADS" ] || die "no PT_LOAD segments in $CHROME"
+
+# .rela.dyn bounds: rela_record() below looks a relocation up by r_offset
+# inside this section only — 24-byte records, so alignment against the
+# section start is enough to rule out a look-alike elsewhere in the binary.
+RELA_META=$(readelf -SW "$CHROME" |
+  awk '$2 == ".rela.dyn" { printf "%d %d", strtonum("0x" $5), strtonum("0x" $6) }')
+[ -n "$RELA_META" ] || die "no .rela.dyn section in $CHROME"
+read -r RELA_OFF RELA_SIZE <<< "$RELA_META"
+
+va2off() { # <va> -> decimal file offset; exit 1 when unmapped
+  local va=$(( $1 )) o v fs
+  while read -r o v fs; do
+    o=$((o)); v=$((v)); fs=$((fs))
+    if [ "$va" -ge "$v" ] && [ "$va" -lt "$((v + fs))" ]; then
+      echo $(( o + va - v )); return 0
+    fi
+  done <<< "$LOADS"
+  return 1
+}
+
+off2va() { # <file offset> -> decimal VA; exit 1 when unmapped
+  local off=$(( $1 )) o v fs
+  while read -r o v fs; do
+    o=$((o)); v=$((v)); fs=$((fs))
+    if [ "$off" -ge "$o" ] && [ "$off" -lt "$((o + fs))" ]; then
+      echo $(( v + off - o )); return 0
+    fi
+  done <<< "$LOADS"
+  return 1
+}
+
+# --- helpers -----------------------------------------------------------------
+
+# Bytes to write; NULs keep them out of shell variables, so count via a pipe.
 payload_len() { printf "$1" | wc -c; }
 
-# verify_and_patch <what> <offset> <expected-hex> <printf-fmt> [soft]
-#   Checks that the binary still has <expected-hex> at <offset> (prefix
-#   compare, same byte counts as the original script), then overwrites with
-#   the payload. "soft" downgrades every failure to a warning.
+# Symbol address as 0x... from the nm cache (demangled). The pattern goes
+# through the environment: awk -v would eat the backslashes in "\(...".
+# Some symbols print twice (alias + real name) — first hit wins. Fails
+# loudly unless soft.
+sym_va() {
+  local pattern=$1 mode=${2:-strict} out
+  out=$(SYM_PATTERN="$pattern" \
+        awk '$0 ~ ENVIRON["SYM_PATTERN"] && !found { print "0x"$1; found = 1 }' \
+        "$NM_CACHE")
+  [ -n "$out" ] || fail_or_warn "$mode" "symbol not found: $pattern"
+  printf '%s' "$out"
+}
+
+# Nearest symbol at or before <va> — one pass, best address wins, no sort.
+nearest_sym() { # <va> -> "name (+N bytes into it)"
+  awk -v va="$1" 'BEGIN { best = -1 }
+    $1 ~ /^[0-9a-f]+$/ { a = strtonum("0x" $1); if (a <= va && a > best) { best = a; ln = $0 } }
+    END {
+      if (ln == "") { print "(no symbol at or before this address)"; exit }
+      sub(/^[0-9a-f]+( [0-9a-f]+)? [^ ] /, "", ln)
+      printf "%s (+%d bytes into it)", ln, va - best
+    }' "$NM_CACHE"
+}
+
+fail_or_warn() { # <strict|soft> <message>
+  if [ "$1" = "strict" ]; then die "$2"; fi
+  echo "WARNING: $2" >&2
+}
+
+# --- what a failed patch tells you -------------------------------------------
+patch_report() { # <file-offset> <expected-hex> <actual-hex> <printf-fmt>
+  local offset=$1 expected=$2 actual=$3 fmt=$4 va start
+  {
+    printf '  file offset : %d (0x%x)\n' "$offset" "$offset"
+    if va=$(off2va "$offset"); then
+      printf '  address     : 0x%x\n' "$va"
+      printf '  nearest sym : %s\n' "$(nearest_sym "$va")"
+      printf '  code around the site:\n'
+      objdump -d --start-address="$va" --stop-address="$((va + 40))" "$CHROME" 2>/dev/null |
+        grep -E '^\s+[0-9a-f]+:' | sed 's/^/    /' || true
+    fi
+    printf '  expected    : %s\n' "$expected"
+    printf '  actual      : %s\n' "$actual"
+    printf '  payload     : %s (%d bytes would be written)\n' \
+      "$(printf "$fmt" | od -An -tx1 | tr -d ' \n')" "$(payload_len "$fmt")"
+    start=$(( offset >= 44 ? offset - 44 : 0 ))
+    printf '  bytes around file+%d (site under ^):\n' "$start"
+    # 96 hex chars per row; the caret row follows the row containing the
+    # site, so `^` always sits under its first byte.
+    dd if="$CHROME" bs=1 skip="$start" count=112 2>/dev/null |
+      od -An -v -tx1 | tr -d ' \n' | fold -w 96 |
+      awk -v col=$(( (offset - start) * 2 )) '{
+        print "    " $0
+        if (col >= (NR - 1) * 96 && col < NR * 96)
+          printf "%*s^ site starts here\n", col - (NR - 1) * 96 + 4, ""
+      }'
+    printf '  fix: never paste "actual" into expected — that pins the patch to\n'
+    printf '       whatever sits there now (how rev 1733743 crashed InitializeUI).\n'
+    printf '       Recompute the site from its symbol/anchor (nm/objdump), then\n'
+    printf '       keep expected as the pristine bytes at the new site.\n'
+  }
+}
+
+# verify_and_patch <what> <file-offset> <expected-hex> <printf-fmt> [soft]
+#   The binary must hold <expected-hex> at <offset> (prefix compare), then
+#   the payload overwrites it. Mismatch: full site report, then die — unless
+#   "soft", which warns and writes nothing.
 verify_and_patch() {
-  local what=$1 offset=$2 expected=$3 fmt=$4 mode=${5:-strict}
-  local got prefix want
-
-  [ -n "$offset" ] || { fail_or_warn "$mode" "$what: symbol/offset not found"; return 0; }
-
+  local what=$1 offset=$2 expected=$3 fmt=$4 mode=${5:-strict} got
+  [ -n "$offset" ] || { fail_or_warn "$mode" "$what: no site offset (see the symbol errors above)"; return 0; }
   got=$(dd if="$CHROME" bs=1 skip="$offset" count="$(payload_len "$fmt")" 2>/dev/null |
         od -An -tx1 | tr -d ' \n')
-  want=$expected
-  prefix=${got:0:${#expected}}
-
-  if [ "$prefix" != "$want" ]; then
-    fail_or_warn "$mode" "$what patch bytes changed at $offset: got '$prefix', expected '$want'"
+  if [ "${got:0:${#expected}}" != "$expected" ]; then
+    fail_or_warn "$mode" "$what: bytes changed at file offset $offset"$'\n'"$(patch_report "$offset" "$expected" "$got" "$fmt")"
     return 0
   fi
-
   printf "$fmt" | dd of="$CHROME" bs=1 seek="$offset" conv=notrunc 2>/dev/null
   echo "patched $what at $offset"
 }
 
-fail_or_warn() {
-  if [ "$1" = "strict" ]; then
-    die "$2"
+# patch_sym <what> <sym-regex> <expected-hex> <printf-fmt> [<+-offset>] [soft]
+#   The common shape of a patch: site = symbol (+ a compile-time offset like
+#   `13`), so it moves with the code on a snapshot bump.
+patch_sym() {
+  local what=$1 pattern=$2 expected=$3 fmt=$4
+  shift 4
+  local extra=0 mode=strict a va offset
+  for a in "$@"; do
+    if [ "$a" = soft ]; then mode=soft; else extra=$a; fi
+  done
+  va=$(sym_va "$pattern" "$mode")
+  [ -n "$va" ] || return 0
+  if ! offset=$(va2off $(( va + extra ))); then
+    fail_or_warn "$mode" "$what: VA $(( va + extra )) is not in any PT_LOAD segment"
+    return 0
   fi
-  echo "WARNING: $2" >&2
-}
-
-# Symbol address as 0x... from GNU nm (demangled). Fails loudly unless soft.
-# The pattern goes through the environment: passing it with awk -v would eat
-# the backslashes in "\(..." before the regex engine sees them.
-# nm prints several symbols twice (alias + real name); keep only the first
-# hit and keep scanning — no `exit`, or nm dies of SIGPIPE and `pipefail`
-# turns that into a failure.
-sym_va() {
-  local pattern=$1 mode=${2:-strict} out
-  out=$(nm -C "$CHROME" | SYM_PATTERN="$pattern" \
-        awk '$0 ~ ENVIRON["SYM_PATTERN"] && !found { print "0x"$1; found = 1 }')
-  if [ -z "$out" ]; then
-    fail_or_warn "$mode" "symbol not found: $pattern"
-  fi
-  printf '%s' "$out"
-}
-
-# VMA -> file offset using the .text section delta (same approximation the
-# Nix build used).
-text_delta() {
-  objdump -h "$CHROME" | awk '$2 == ".text" {
-    printf "%d\n", strtonum("0x"$6) - strtonum("0x"$4)
-  }'
-}
-
-va_to_offset() { # <va> <delta> [+extra]
-  awk -v va="$1" -v delta="$2" -v extra="${3:-0}" \
-    'BEGIN { printf "%d\n", strtonum(va) + extra + delta }'
+  verify_and_patch "$what" "$offset" "$expected" "$fmt" "$mode"
 }
 
 # printf octal escapes for the low <n> bytes of <value>, little-endian.
-# Every multi-byte constant below is built from one number this way, so the
-# expected bytes and the payload can never drift apart — and a negative
-# rel32 comes out as proper two's complement.
+# Multi-byte constants come from one number in both directions, so expected
+# and payload can never drift apart; a negative rel32 is proper two's
+# complement.
 le_octal() { # <value> <bytes>
   awk -v v="$1" -v n="$2" 'BEGIN {
     for (i = 0; i < n; i++) {
@@ -108,15 +196,11 @@ le_octal() { # <value> <bytes>
   }'
 }
 
-# rel32 displacement between two VAs as four octal escapes: the target and
-# the address of the byte after the call/jmp.
-rel32_octal() { # <target-va> <next-instruction-va>
+rel32_octal() { # <target-va> <next-instruction-va> -> 4 octal escapes
   le_octal "$(( $1 - $2 ))" 4
 }
 
-# The same low <n> bytes as two lowercase hex digits per byte — the form
-# verify_and_patch compares against od's dump.
-le_hex() { # <value> <bytes>
+le_hex() { # <value> <bytes> -> lowercase hex, the form od prints
   awk -v v="$1" -v n="$2" 'BEGIN {
     for (i = 0; i < n; i++) {
       b = v % 256; if (b < 0) b += 256
@@ -126,25 +210,37 @@ le_hex() { # <value> <bytes>
   }'
 }
 
-# A 24-byte .rela.dyn record (r_offset | r_info | addend): the hex form for
-# the expected-bytes check and the printf form for the payload. Feeding the
-# same three numbers to both means r_offset and r_info are always compared,
-# not just the addend: a stale file offset no longer matches, because a
+# A 24-byte .rela.dyn record (r_offset | r_info | addend): hex form for the
+# check, printf form for the payload — both from the same three numbers, so
+# r_offset/r_info are compared too: a stale file offset cannot pass (a
 # misaligned read puts a neighbouring r_info where R_X86_64_RELATIVE (8)
-# has to be.
-rela_expect() { # <r_offset> <r_info> <addend>
-  le_hex "$1" 8
-  le_hex "$2" 8
-  le_hex "$3" 8
+# has to be). Each argument goes through $(( )): callers pass raw sym_va
+# "0x..." strings as well as computed decimals, and awk's % reads the
+# former as 0.
+rela_expect() { le_hex $(( $1 )) 8; le_hex $(( $2 )) 8; le_hex $(( $3 )) 8; }  # <r_offset> <r_info> <addend>
+rela_fmt()    { le_octal $(( $1 )) 8; le_octal $(( $2 )) 8; le_octal $(( $3 )) 8; }
+
+# File offset of the .rela.dyn record whose r_offset is <va>. A record opens
+# with the 8-byte little-endian address, so one grep pass finds every
+# occurrence of it in the binary; the .rela.dyn bounds plus 24-byte
+# alignment against the section start pick the record out, and
+# verify_and_patch then compares all 24 bytes. LC_ALL=C keeps grep -P on
+# bytes — the VA pattern is not valid UTF-8.
+rela_record() { # <r_offset-va> -> decimal file offset
+  local va=$(( $1 )) pat off
+  pat=$(le_hex "$va" 8 | sed 's/../\\x&/g')
+  while read -r off; do
+    off=$((off))
+    if [ "$off" -ge "$RELA_OFF" ] && [ "$off" -lt "$((RELA_OFF + RELA_SIZE))" ] &&
+       [ $(( (off - RELA_OFF) % 24 )) -eq 0 ]; then
+      echo "$off"
+      return 0
+    fi
+  done < <(LC_ALL=C grep -Poba -- "$pat" "$CHROME" | cut -d: -f1 || true)
+  return 1
 }
 
-rela_fmt() { # <r_offset> <r_info> <addend>
-  le_octal "$1" 8
-  le_octal "$2" 8
-  le_octal "$3" 8
-}
-
-# --- string patches --------------------------------------------------------
+# --- string patches ----------------------------------------------------------
 
 OLD_STUB='chrome.terminalPrivate.openVmshellProcess([], () => {})'
 NEW_STUB='eval(localStorage.t||"")'
@@ -164,14 +260,24 @@ while IFS=: read -r csp_offset _; do
   echo "patched CSP wasm-unsafe-eval -> unsafe-eval at $csp_offset"
 done < <(grep -Fboa "'wasm-unsafe-eval'" "$CHROME" || true)
 
-# --- symbol patches --------------------------------------------------------
+# --- symbol patches ----------------------------------------------------------
+# Sites are "symbol + constant" (patch_sym): they move with the code. Only
+# the expected bytes are pinned — when those change, the report hands over
+# the new bytes, the nearest symbol and the disassembly, so updating is
+# mechanical.
 
-DELTA=$(text_delta)
-[ -n "$DELTA" ] || die ".text section not found in $CHROME"
-
-va=$(sym_va ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display::NativeDisplayDelegate')
-verify_and_patch "DisplayConfigurator::Init (skip native display config)" \
-  "$(va_to_offset "$va" "$DELTA" 13)" "75474889fb80bf" '\351\104\000\000\000\220\220'
+# Site = Init+13: `jne <rel8>` — right after `cmpb $1,0x21(this)` — skips
+# the native display config; the patch makes that skip unconditional. The
+# rel8 is a within-function distance: no symbol to derive it from, so it
+# stays a pinned pristine byte (the fixed `mov %rdi,%rbx; cmpb` behind it
+# is pinned too). The payload's 5-byte jmp replaces the 2-byte jne and
+# must land on the same target, so its displacement is computed from that
+# one number (rel8 - 3): expected and payload cannot drift apart.
+init_skip=$((0x47))  # jne displacement, pristine (rev 1733909)
+patch_sym "DisplayConfigurator::Init (skip native display config)" \
+  ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display::NativeDisplayDelegate' \
+  "75$(le_hex "$init_skip" 1)4889fb80bf" \
+  '\351'"$(le_octal $(( init_skip - 3 )) 4)"'\220\220' 13
 
 # WaylandDmabufFeedbackManager: the patch that used to live here zeroed the
 # version field at this+8 and skipped the gpu::Capabilities probe that fills
@@ -187,227 +293,242 @@ verify_and_patch "DisplayConfigurator::Init (skip native display config)" \
 #                crash/hang, restore the patch (git restore this file).
 # Original bytes at constructor+112 for reference: e8fdd63d08488bb80001000048
 
-va=$(sym_va ' display::DisplayConfigurator::RunPendingConfiguration\(\)')
-verify_and_patch "RunPendingConfiguration (no-op)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\303'
+patch_sym "RunPendingConfiguration (no-op)" \
+  ' display::DisplayConfigurator::RunPendingConfiguration\(\)' "55" '\303'
 
-va=$(sym_va ' ash::RedirectChromeLogging\(base::CommandLine const&\)')
-verify_and_patch "RedirectChromeLogging (no-op)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\303'
+patch_sym "RedirectChromeLogging (no-op)" \
+  ' ash::RedirectChromeLogging\(base::CommandLine const&\)' "55" '\303'
 
-va=$(sym_va ' ash::mojo_service_manager::.*::OnDisconnect\(')
-verify_and_patch "OnDisconnect (no-op)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\303'
+patch_sym "OnDisconnect (no-op)" \
+  ' ash::mojo_service_manager::.*::OnDisconnect\(' "55" '\303'
 
-va=$(sym_va ' display::HasInternalDisplay\(\)' soft)
-verify_and_patch "HasInternalDisplay (returns true)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\260\001\303' soft
+patch_sym "HasInternalDisplay (returns true)" \
+  ' display::HasInternalDisplay\(\)' "55" '\260\001\303' soft
 
-# HasInternalDisplay() above is a white lie, and it has to stay one: ash is
-# written for a machine that always has an internal panel. The lie only works
-# if internal_display_ids() is actually populated, otherwise the very next
-# caller — DisplayManager::OnNativeDisplaysChanged(), reached from
-# InitFromCommandLine() — does
+# HasInternalDisplay() above is a white lie: it only works if
+# internal_display_ids() is populated, otherwise the next caller,
+# DisplayManager::OnNativeDisplaysChanged() (via InitFromCommandLine()), does
 #     if (HasInternalDisplay() && !found_internal_in_list)
 #         internal_id = Display::InternalDisplayId();
-# and InternalDisplayId() CHECKs "1u == ids.size()" (display.cc:309): Chrome
-# dies with a black screen before the first frame, restarts, dies, ... The
-# ids are filled by MaybeInitInternalDisplay(), which is gated on
-# ForceFirstDisplayInternal(): true only with --use-first-display-as-internal
-# or when StatisticsProvider vouches for the board — neither happens on a
-# plain Linux host, so ids stayed empty. Force it true: the first (normally
-# the only) host display is registered as the internal one, which is exactly
-# what the switch above asks for.
-va=$(sym_va ' display::ForceFirstDisplayInternal\(\)')
-verify_and_patch "ForceFirstDisplayInternal (first display is internal)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\260\001\303'
+# and InternalDisplayId() CHECKs "1u == ids.size()" (display.cc:309): black
+# screen, restart, die. The ids come from MaybeInitInternalDisplay(), gated
+# on ForceFirstDisplayInternal() — true only with
+# --use-first-display-as-internal or a ChromeOS board, so here they stay
+# empty. Force it true: the first host display becomes the internal one.
+patch_sym "ForceFirstDisplayInternal (first display is internal)" \
+  ' display::ForceFirstDisplayInternal\(\)' "55" '\260\001\303'
 
 # System UI blur (shelf, quick settings, hotseat) is gated on RAM, not GPU:
 # chromeos::features::IsSystemBlurEnabled() is literally
 #   return base::SysInfo::AmountOfTotalPhysicalMemory() > 4GiB;   (0x100000000)
-# read from /proc/meminfo, with no FeatureList or command-line override.
-# So on a <=4 GiB host (VirtualBox guests, typical Haswell laptops) the panel
-# and quick settings render opaque even though the compositor draws backdrop
-# filters fine on any GPU — viz::SoftwareRenderer has its own
-# GetBackdropFilterShader, so no hardware is actually required. Force it true
-# so blur works regardless of installed RAM. Costs some FPS on small-RAM hosts.
-# Prologue: push %rbp; mov %rsp,%rbp; call ... -> mov $1,%eax; ret (no push, so
-# the stack stays balanced).
-va=$(sym_va ' chromeos::features::IsSystemBlurEnabled\(\)')
-verify_and_patch "IsSystemBlurEnabled (always true, blur on any RAM)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\270\001\000\000\000\303'
+# read from /proc/meminfo, no FeatureList or override — yet the compositor
+# draws backdrop filters on any GPU (viz::SoftwareRenderer has its own
+# GetBackdropFilterShader). Force it true; costs some FPS on <=4 GiB hosts.
+# Prologue -> "mov $1,%eax; ret" (no push, so the stack stays balanced).
+patch_sym "IsSystemBlurEnabled (always true, blur on any RAM)" \
+  ' chromeos::features::IsSystemBlurEnabled\(\)' "55" '\270\001\000\000\000\303'
 
 # --- keyboard layout engine (RU/EN quick-settings chip drives typing) -------
 # OzonePlatformX11::InitializeUI registers StubKeyboardLayoutEngine, whose
 # Lookup always falls back to the hardcoded US layout, and the input
-# controller's SetCurrentLayoutByName is a no-op stub — so switching RU/EN
-# in Ash quick settings only moved the tray indicator. Mirror what
-# OzonePlatformDrm does instead: build an XkbEvdevCodes converter plus a
-# real XkbKeyboardLayoutEngine in one block, hand it to
-# KeyboardLayoutEngineManager, and forward the input controller's
-# SetCurrentLayoutByName through a thunk to the registered engine.
+# controller's SetCurrentLayoutByName is a no-op stub — switching RU/EN in
+# Ash quick settings only moved the tray indicator. Mirror OzonePlatformDrm:
+# build an XkbEvdevCodes converter plus a real XkbKeyboardLayoutEngine in
+# one block, hand it to KeyboardLayoutEngineManager, and forward the input
+# controller's SetCurrentLayoutByName through a thunk to that engine.
 
 ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(')
 
 # new[] size for the combined block: XkbKeyboardLayoutEngine (0xc8, same as
-# the DRM platform) + XkbEvdevCodes converter (0x10) = 0xd8, was 0x20.
-# Immediate byte of `mov $0x20,%edi` right before the new[] call; in this
-# revision that sits at ui_va+431 (the StubKeyboardLayoutEngine allocation
-# that precedes its constructor call).
+# the DRM platform) + XkbEvdevCodes (0x10) = 0xd8, was 0x20. Site: the
+# immediate of `mov $0x20,%edi` feeding that new[] call — InitializeUI+431
+# in this revision (the StubKeyboardLayoutEngine allocation).
 verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 431)" "20" '\330'
+  "$(va2off $(( ui_va + 431 )))" "20" '\330'
 
-# Replace the StubKeyboardLayoutEngine construction with:
-#   lea 0xc8(%rax),%rdi / mov %rax,%r14 / call XkbEvdevCodesC1 /
-#   mov %r14,%rdi / lea 0xc8(%r14),%rsi / call XkbKeyboardLayoutEngineC1 /
-#   mov %r14,0x20(%rbx) / mov %r14,%rdi
-# then falls through into the existing SetKeyboardLayoutEngine call.
-# The site must start where rax still holds the fresh block (i.e. right after
-# the new[] call, before `mov %rax,%rdi`), and it must end on the original
-# `mov %r14,%rdi` before SetKeyboardLayoutEngine: the 37 payload bytes are
-# exactly that span. Offsets are relative to the symbol, never pasted.
-# Both call displacements depend on where this block sits, so derive them
-# from the constructor symbols — a pasted dump is stale after every
-# snapshot bump, which is exactly how the previous revision broke ld.so.
+# Replace the StubKeyboardLayoutEngine construction with a real Xkb engine
+# (XkbEvdevCodes converter at +0xc8, then XkbKeyboardLayoutEngine) stored to
+# 0x20(%rbx), falling through into the existing SetKeyboardLayoutEngine
+# call. The site must start where rax still holds the fresh block and the 37
+# payload bytes must end exactly on the original `mov %r14,%rdi` —
+# InitializeUI+440 here. Both call displacements are derived from the
+# constructor symbols, never pasted: a dumped blob goes stale on every
+# snapshot bump.
 evdev_va=$(sym_va ' t ui::XkbEvdevCodes::XkbEvdevCodes\(\)')
 kbengine_va=$(sym_va ' t ui::XkbKeyboardLayoutEngine::XkbKeyboardLayoutEngine\(ui::XkbKeyCodeConverter const&\)')
-engine_site=$((ui_va + 440))
+stubcstr_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::StubKeyboardLayoutEngine\(')
+engine_site=$(( ui_va + 440 ))
+# expected = the pristine bytes of the site, with its one address-dependent
+# field — the `call StubKeyboardLayoutEngine ctor` at site+6 — derived from
+# the constructor symbol instead of pasted: that rel32 moves on every
+# snapshot bump even when the site itself does not (rev 1733909).
+engine_expected="4989c64889c7e8$(le_hex $(( stubcstr_va - engine_site - 11 )) 4)488b43204c8973204885c0740d488b084889c7ff51084c8b7320"
 verify_and_patch "OzonePlatformX11::InitializeUI (real Xkb engine)" \
-  "$(va_to_offset "$engine_site" "$DELTA")" \
-  "4989c64889c7e83d542e07488b43204c8973204885c0740d488b084889c7ff51084c8b7320" \
+  "$(va2off "$engine_site")" \
+  "$engine_expected" \
   '\110\215\270\310\000\000\000\111\211\306\350'"$(rel32_octal "$evdev_va" $((engine_site + 15)))"'\114\211\367\111\215\266\310\000\000\000\350'"$(rel32_octal "$kbengine_va" $((engine_site + 30)))"'\114\211\163\040\114\211\367'
 
-# Overwrite the (now dead) StubKeyboardLayoutEngine::Lookup with a thunk
-# for StubInputController::SetCurrentLayoutByName(name, callback):
-#   mov rax,[keyboard_layout_engine_]; test rax,rax; je fallback;
-#   mov rdi,rax; mov rax,[rax]; jmp [rax+0x20]   <- XkbKeyboardLayoutEngine
-#                                                   ::SetCurrentLayoutByName
-#   fallback: jmp original StubInputController::SetCurrentLayoutByName body.
-# Slot offsets are relative to vptr (= 'vtable for' symbol + 0x10: offset-to-
-# top + RTTI precede the virtual functions), so SetCurrentLayoutByName sits at
-# symbol+0x30 == vptr+0x20. vptr+0x30 is UsesISOLevel5Shift — a silent no-op
-# that never runs the callback, which hid the bug (no failure logs at all).
-# keyboard_layout_engine_ is a plain .bss global (type 'b'), so the
-# RIP-relative load is correct. The stub engine is no longer constructed
-# after the patch above, so its Lookup is unreachable.
+# The X11 InitializeUI patch above replaced the stub's construction, so
+# StubKeyboardLayoutEngine::Lookup is never invoked (we run only the X11
+# platform) — dead code, and a free 0x90-byte executable cave for our
+# 26-byte thunk:
+#   mov rax,[keyboard_layout_engine_]; test; je fallback; mov rdi,rax;
+#   mov rax,[rax]; jmp [rax+0x20]  <- XkbKeyboardLayoutEngine::
+#                                     SetCurrentLayoutByName
+#   fallback: jmp the original SetCurrentLayoutByName body.
+# Slot offsets are relative to vptr (= 'vtable for' symbol + 0x10, because
+# offset-to-top + RTTI precede the virtual functions): the jump target is
+# vptr+0x20; vptr+0x30 would be UsesISOLevel5Shift — a silent no-op that
+# never runs the callback, which hid this bug. keyboard_layout_engine_ is a
+# .bss global ('b'), so the RIP-relative load is correct.
 lookup_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::Lookup\(')
 ke_va=$(sym_va ' b ui::KeyboardLayoutEngineManager::keyboard_layout_engine_')
 fallback_va=$(sym_va ' t ui::StubInputController::SetCurrentLayoutByName\(')
+# expected = the pristine prologue the thunk overwrites: push %rbp;
+# mov %rsp,%rbp; mov 0x10(%rdi),%r9; test %r9,%r9; je — fixed instruction
+# bytes, nothing address-dependent (the je's rel8 operand lies outside the
+# 12 pinned).
 verify_and_patch "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
-  "$(va_to_offset "$lookup_va" "$DELTA")" \
+  "$(va2off "$lookup_va")" \
   "554889e54c8b4f104d85c974" \
   '\110\213\005'"$(rel32_octal "$ke_va" $((lookup_va + 7)))"'\110\205\300\164\011\110\211\307\110\213\000\377\140\040\351'"$(rel32_octal "$fallback_va" $((lookup_va + 26)))"
 
-# Redirect the real StubInputController vtable slot for
-# SetCurrentLayoutByName (vptr+0x80 = 'vtable for' symbol + 0x90, .rela.dyn
-# entry at file 0x12bf000, R_X86_64_RELATIVE addend 0x77c3aba = the stub body)
-# to the thunk: verify the whole 24-byte relocation, write it with the new
-# addend (thunk VA 0xf30023e = StubKeyboardLayoutEngine::Lookup).
+# Redirect the real StubInputController vtable slot for SetCurrentLayoutByName
+# (vptr+0x80 = 'vtable for' symbol+0x90) to the thunk: find the .rela.dyn
+# record for that slot, verify the whole 24-byte relocation (r_offset,
+# R_X86_64_RELATIVE, addend = the stub body it points at today), write it
+# back with the new addend (the thunk lives at lookup_va).
+sctrl_vt=$(sym_va ' vtable for ui::StubInputController$')
+tunnel_slot=$(( sctrl_vt + 0x90 ))
+tunnel_rec=$(rela_record "$tunnel_slot") ||
+  die "StubInputController::SetCurrentLayoutByName -> thunk: no .rela.dyn record for slot 0x$(printf %x "$tunnel_slot")"
 verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
-  "$((0x12bf000))" \
-  "$(rela_expect $((0x173817e8)) 8 $((0x77c3aba)))" \
-  "$(rela_fmt $((0x173817e8)) 8 $((0xf30023e)))"
+  "$tunnel_rec" \
+  "$(rela_expect "$tunnel_slot" 8 "$fallback_va")" \
+  "$(rela_fmt "$tunnel_slot" 8 "$lookup_va")"
 
 # --- hide demo system web apps from the launcher ---------------------------
 # SystemWebAppManager::CreateInstallOptionsForSystemApp sets
 # add_to_launcher = delegate->ShouldShowInLauncher(). For the demo SWAs below
-# that slot (vptr+0x50 == 'vtable for' symbol+0x60) inherits the ICF-merged
-# "return true" stub (0x6d1db40), so every one of them lands in the launcher
-# menu. Redirect the .rela.dyn addend to a "xor %eax,%eax; ret" gadget
-# (0x6d1bd08) so ShouldShowInLauncher() returns false: the app stays
-# installed (media-app keeps working as a file viewer, chrome:// URLs still
-# open) but is not added to the launcher. To restore an app, revert the
-# corresponding line here.
-# Each record is r_offset(8) | r_info(8=R_X86_64_RELATIVE) | addend(8).
-# rela_expect/rela_fmt derive the expected bytes and the payload from the
-# same three numbers, so the check covers r_offset and r_info as well as the
-# addend and a stale file offset cannot pass it.
-SWA_RETURN_TRUE=$((0x6d1db40))    # ICF-merged "return true" stub
-SWA_RETURN_FALSE=$((0x6d1bd08))   # ICF-merged "return false" stub
-swa_hide() { # <name> <rela-file-offset> <r_offset>
-  verify_and_patch "hide SWA from launcher: $1" "$2" \
-    "$(rela_expect "$3" 8 "$SWA_RETURN_TRUE")" \
-    "$(rela_fmt "$3" 8 "$SWA_RETURN_FALSE")"
+# that slot (vptr+0x50 == 'vtable for' symbol+0x60) holds the base
+# SystemWebAppDelegate's "return true" body (five of the six delegates do
+# not override it; Media's own override is ICF-merged into it), so each app
+# lands in the launcher menu. Redirect the .rela.dyn addend to the ICF-merged
+# "xor %eax,%eax; ret" body that the already-hidden delegates (Eche, Crosh,
+# Sanitize, ...) share: the app stays installed (media-app still opens files
+# and chrome:// URLs) but is not added to the launcher. To restore an app,
+# revert its line. Each record is found by r_offset (vtable symbol + 0x60)
+# and must still carry the pristine addend, so a slot that changed fails
+# loudly instead of hiding the wrong thing.
+# Record = r_offset(8) | r_info(8 = R_X86_64_RELATIVE) | addend(8).
+SWA_RETURN_TRUE=$(sym_va ' t ash::SystemWebAppDelegate::ShouldShowInLauncher\(\) const')
+SWA_RETURN_FALSE=$(sym_va ' t EcheSystemAppDelegate::ShouldShowInLauncher\(\) const')
+swa_hide() { # <name> <vtable-regex>
+  local vt slot rec
+  vt=$(sym_va "$2")
+  slot=$(( vt + 0x60 ))
+  rec=$(rela_record "$slot") ||
+    die "hide SWA from launcher: $1: no .rela.dyn record for slot 0x$(printf %x "$slot")"
+  verify_and_patch "hide SWA from launcher: $1" "$rec" \
+    "$(rela_expect "$slot" 8 "$SWA_RETURN_TRUE")" \
+    "$(rela_fmt "$slot" 8 "$SWA_RETURN_FALSE")"
 }
-swa_hide "Галерея (media-app)"      "$((0x1d829b0))" "$((0x178a5198))"
-swa_hide "Sample System Web App"    "$((0x1d7d850))" "$((0x178a3228))"
-swa_hide "Возможности (help-app)"   "$((0x1d7e8e8))" "$((0x178a37e0))"
-swa_hide "Камера (camera-app)"      "$((0x1d791e8))" "$((0x178a1920))"
-swa_hide "Скринкаст (projector)"    "$((0x1d7c050))" "$((0x178a29a8))"
-swa_hide "Игры и приложения (mall)" "$((0x1d7cf50))" "$((0x178a2ef8))"
+swa_hide "Галерея (media-app)"      ' vtable for MediaSystemAppDelegate$'
+swa_hide "Sample System Web App"    ' vtable for SampleSystemAppDelegate$'
+swa_hide "Возможности (help-app)"   ' vtable for ash::HelpAppSystemAppDelegate$'
+swa_hide "Камера (camera-app)"      ' vtable for CameraSystemAppDelegate$'
+swa_hide "Скринкаст (projector)"    ' vtable for ProjectorSystemWebAppDelegate$'
+swa_hide "Игры и приложения (mall)" ' vtable for MallSystemAppDelegate$'
 
 # --- GPU: ozone X11 pixmap import ------------------------------------------
 # Without these, X11 clients on the sommelier display get white windows and a
 # GPU log full of "OzoneImageBacking::ProduceSkiaGanesh failed to create GL
-# representation" (774x per session). Three separate blockers, all on the
-# NativePixmap -> GL path that OzoneImageBacking uses; exo hands us
-# BGRX_8888, and ANGLE here has no EGL_EXT_image_dma_buf_import.
+# representation" (774x per session). Three blockers on the NativePixmap -> GL
+# path OzoneImageBacking uses; exo hands us BGRX_8888, and ANGLE here has no
+# EGL_EXT_image_dma_buf_import.
 
-# 1) NativePixmapEGLX11Binding::IsSharedImageFormatSupported -> true. The
-#    original only accepts BGRA_8888, so CanImportNativePixmap() said no to
-#    the BGRX surfaces exo actually produces. Prologue
-#    "push %rbp; mov %rsp,%rbp; sub $0x10,%rsp" -> "mov $1,%eax; ret".
-va=$(sym_va ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(')
-verify_and_patch "IsSharedImageFormatSupported (accept BGRX)" \
-  "$(va_to_offset "$va" "$DELTA")" "554889e55de9" '\270\001\000\000\000\303'
+# 1) IsSharedImageFormatSupported -> true: the original only accepts
+#    BGRA_8888, so CanImportNativePixmap() said no to the BGRX surfaces exo
+#    actually produces. Prologue -> "mov $1,%eax; ret".
+#    expected = 55 48 89 e5 5d e9 — push %rbp; mov %rsp,%rbp; pop %rbp;
+#    jmp (the tail call; its rel32 lies outside the 6 pinned bytes).
+patch_sym "IsSharedImageFormatSupported (accept BGRX)" \
+  ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(' \
+  "554889e55de9" '\270\001\000\000\000\303'
 
-# 2) GetNativePixmapSupportType -> kX11Pixmap (2). It prefers kDMABuf when
-#    EGL_EXT_image_dma_buf_import is present, which ANGLE never exposes here,
-#    and CanImportNativeGLXPixmap() only asks dri3/glx, not GL. Same prologue
-#    -> "mov $2,%eax; ret".
-va=$(sym_va ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)')
+# 2) GetNativePixmapSupportType -> kX11Pixmap (2): it prefers kDMABuf when
+#    EGL_EXT_image_dma_buf_import exists, which ANGLE never exposes here, and
+#    CanImportNativeGLXPixmap() only asks dri3/glx. Prologue -> mov $2,%eax.
+#    expected = 55 48 89 e5 e8 + rel32 low byte — push %rbp; mov %rsp,%rbp;
+#    call GetGLDisplayEGL: the 6-byte payload overwrites exactly that, and
+#    the low byte moves with the callee, so it comes from the callee symbol
+#    instead of a pasted one (rev 1733909: c5 -> a5).
+gmps_va=$(sym_va ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)')
+gld_va=$(sym_va ' t gl::GLSurfaceEGL::GetGLDisplayEGL\(')
 verify_and_patch "GetNativePixmapSupportType (kX11Pixmap)" \
-  "$(va_to_offset "$va" "$DELTA")" "554889e5e8c5" '\270\002\000\000\000\303'
+  "$(va2off "$gmps_va")" \
+  "554889e5e8$(le_hex $(( gld_va - gmps_va - 9 )) 1)" \
+  '\270\002\000\000\000\303'
 
-# 3) Inside NativePixmapEGLX11Binding::Create: an inlined
-#    gl::IsFormatSupported(format) rejects kBGRX_8888 ("je -> 'format is
-#    unsupported'" VLOG, nothing in the release log). NOP the branch — the
-#    caller already vetted the format in patch 1. The branch is the `je` right
-#    after the gl::IsFormatSupported call (Create+110, vaddr 0x8019542); it
-#    used to sit at +132 when that helper was inlined as a format compare.
-va=$(sym_va ' t ui::NativePixmapEGLX11Binding::Create\(')
-verify_and_patch "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
-  "$(va_to_offset "$va" "$DELTA" 110)" "0f84ce000000" \
-  '\220\220\220\220\220\220'
+# 3) In NativePixmapEGLX11Binding::Create an inlined gl::IsFormatSupported
+#    rejects kBGRX_8888 ("je -> 'format is unsupported'" VLOG, silent in the
+#    release log). NOP the branch — the caller vetted the format in patch 1.
+#    Site: the `je` right after `call gl::IsFormatSupported` (Create+110).
+#    expected = 0f 84 <rel32>: the displacement is a within-function
+#    distance to the VLOG block — no symbol to derive it from, so it is
+#    pinned pristine like the jnes below (the payload is 6 nops and does
+#    not depend on it; a moved target only needs the number refreshed from
+#    the report).
+patch_sym "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
+  ' t ui::NativePixmapEGLX11Binding::Create\(' \
+  "0f84ce000000" '\220\220\220\220\220\220' 110
 
 # 4) exo must not advertise RGB-order dmabuf formats (AB24/XB24/AB30/AB4H).
 #    Ash imports every client dmabuf through the X11-pixmap path (patch 2),
 #    where the fourcc is lost and the channel order comes from the depth-32
-#    X visual (memory B,G,R,A). A buffer whose memory is R,G,R,A -> R and B
-#    swap: "red becomes blue" in every wayland-native client (helium, Qt).
-#    shm clients and Xwayland are unaffected because their memory already is
-#    B,G,R,A.
-#
-#    gpu::gles2::PopulateMappableDrmFormatsForExo() is the last writer of
-#    gpu::Capabilities::drm_formats_and_modifiers (offset 0x18) — the map
-#    WaylandDmabufFeedbackManager copies into its format table, so it drives
-#    both the advertised zwp_linux_dmabuf_feedback format_table and the
-#    IsFormatSupported() check behind zwp_linux_dmabuf.create_buffer. It
-#    remove_if()s every fourcc whose SharedImageFormat is not in a local
-#    candidate set and, if nothing survives, re-seeds the map from that set.
-#    Make the candidate set BGR-order:
-#      - the rodata SIF blob it seeds the local flat_tree from (list at
-#        0x354cd7c: kBGR_565, kRGBA_8888, kRGBX_8888, two YUV entries):
-#        RGBA_8888 -> BGRA_8888, RGBX_8888 -> BGRX_8888 (AR24/XR24 then also
-#        survive the filter and get seeded, so clients still get a 32-bit
-#        colour format);
-#      - skip the two feature-gated RGB-order emplaces, kRGBA_F16 (AB4H) and
-#        kRGBA_1010102 (AB30), by turning their "feature off -> skip" jne
-#        into an unconditional jmp.
+#    X visual (memory B,G,R,A) — red and blue swap in every wayland-native
+#    client (helium, Qt); shm clients and Xwayland are unaffected (their
+#    memory already is B,G,R,A).
+#    PopulateMappableDrmFormatsForExo() is the last writer of
+#    gpu::Capabilities::drm_formats_and_modifiers — the map behind both the
+#    advertised feedback format_table and create_buffer's IsFormatSupported.
+#    It remove_if()s fourccs outside a local candidate set and re-seeds the
+#    map from that set when nothing survives. Make the set BGR-order:
+#      - the rodata SIF blob it seeds from (kBGR_565, kRGBA_8888,
+#        kRGBX_8888, two YUV — address from the function's rip-relative
+#        movups load below): RGBA_8888 -> BGRA_8888,
+#        RGBX_8888 -> BGRX_8888 (AR24/XR24 then survive too);
+#      - turn the two feature-gated "off -> skip" jne — kRGBA_F16 (AB4H) and
+#        kRGBA_1010102 (AB30) — into unconditional jmp.
 #    PopulateVkDrmFormatsAndModifiers()/PopulateDRMCapabilities() run first
-#    and can insert AB24/XB24 straight from the driver — the remove_if above
-#    is what drops them again.
+#    and can insert AB24/XB24 straight from the driver — remove_if drops them.
+# Blob address: the first rip-relative movups in the function loads it (16
+# bytes); the two rewritten SIF entries sit at blob+8 and blob+16. objdump
+# prints the load target after '#'.
+pop_va=$(sym_va ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(')
+# gawk must not exit early: closing the pipe would SIGPIPE objdump and, with
+# pipefail, fail this assignment — it drains the output and prints the first
+# target only.
+sif_blob=$(objdump -d --start-address="$pop_va" --stop-address="$((pop_va + 0x1000))" "$CHROME" |
+  gawk '/movups/ && match($0, /#[ \t]+(0x)?([0-9a-f]+)/, m) && !done { print "0x" m[2]; done = 1 }')
+[ -n "$sif_blob" ] || die "exo dmabuf candidates: no rip-relative movups load in PopulateMappableDrmFormatsForExo (SIF blob anchor)"
 verify_and_patch "exo dmabuf candidates (RGBA_8888 -> BGRA_8888)" \
-  "$((0x354cd84))" "0100000000000000" '\001\000\000\000\002\000\000\000'
+  "$(va2off $((sif_blob + 8)))" "0100000000000000" '\001\000\000\000\002\000\000\000'
 verify_and_patch "exo dmabuf candidates (RGBX_8888 -> BGRX_8888)" \
-  "$((0x354cd8c))" "010000000a000000" '\001\000\000\000\013\000\000\000'
-# Both jne sites are found through the function symbol (+129 / +208), so a
-# snapshot bump that moves the body moves the patch with it.
-exo_va=$(sym_va ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(')
-verify_and_patch "exo dmabuf candidates (skip RGBA_F16)" \
-  "$(va_to_offset "$exo_va" "$DELTA" 129)" "7513" '\353\023'
-verify_and_patch "exo dmabuf candidates (skip RGBA_1010102)" \
-  "$(va_to_offset "$exo_va" "$DELTA" 208)" "7513" '\353\023'
+  "$(va2off $((sif_blob + 16)))" "010000000a000000" '\001\000\000\000\013\000\000\000'
+# Both jne sites come from the function symbol (+129 / +208). The patch
+# swaps each 2-byte jne for a 2-byte jmp with the SAME displacement (same
+# length, same target), so one pinned number per site feeds expected and
+# payload — a layout drift is a one-number fix and cannot leave the two
+# sides pointing at different targets.
+f16_skip=$((0x13))   # jne displacement, pristine (rev 1733909)
+ab30_skip=$((0x13))
+patch_sym "exo dmabuf candidates (skip RGBA_F16)" \
+  ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(' \
+  "75$(le_hex "$f16_skip" 1)" '\353'"$(le_octal "$f16_skip" 1)" 129
+patch_sym "exo dmabuf candidates (skip RGBA_1010102)" \
+  ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(' \
+  "75$(le_hex "$ab30_skip" 1)" '\353'"$(le_octal "$ab30_skip" 1)" 208
 
 # --- libminigbm shim (Mesa stand-in) ---------------------------------------
 # Chrome is built against ChromeOS' minigbm, whose usage bits and import type

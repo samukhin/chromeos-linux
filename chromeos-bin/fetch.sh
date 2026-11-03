@@ -19,9 +19,9 @@ URL="https://commondatastorage.googleapis.com/chromium-browser-snapshots/Linux_C
 # Integrity pins for snapshot 1733743 (x86_64).
 #   size/md5  — Google Cloud Storage object metadata (authoritative)
 #   sha256    — computed from the downloaded bytes (cross-checks the md5)
-EXPECTED_SIZE=319315744
-EXPECTED_MD5=5065f1acfe02687708fc8ac292be81f1
-EXPECTED_SHA256=94a1b864cef9f8db038712a9337f19464ba4a43fee108659a13b4005aa5d0d30
+EXPECTED_SIZE=319325250
+EXPECTED_MD5=f109a65b60d74dc81eb2cd7a3fc24b99
+EXPECTED_SHA256=1925e6f54e71ce3501b296dea2a6b7d53e935ce6c2f5c2b91d9c0f431d2b580e
 
 STAGE="$ASH_ROOT/chromeos-bin/.stage"
 TARGET="$ASH_ROOT/chromeos-bin/chrome"
