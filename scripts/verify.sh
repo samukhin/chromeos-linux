@@ -86,7 +86,7 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
       0 b802000000c3
     check_gpu_patch "NativePixmapEGLX11Binding::Create -> BGRX check dropped" \
       ' t ui::NativePixmapEGLX11Binding::Create\(' \
-      132 909090909090
+      110 909090909090
   else
     echo "  skip: nm/objdump not installed"
   fi

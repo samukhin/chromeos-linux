@@ -251,23 +251,30 @@ ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(
 
 # new[] size for the combined block: XkbKeyboardLayoutEngine (0xc8, same as
 # the DRM platform) + XkbEvdevCodes converter (0x10) = 0xd8, was 0x20.
+# Immediate byte of `mov $0x20,%edi` right before the new[] call; in this
+# revision that sits at ui_va+431 (the StubKeyboardLayoutEngine allocation
+# that precedes its constructor call).
 verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 381)" "20" '\330'
+  "$(va_to_offset "$ui_va" "$DELTA" 431)" "20" '\330'
 
 # Replace the StubKeyboardLayoutEngine construction with:
 #   lea 0xc8(%rax),%rdi / mov %rax,%r14 / call XkbEvdevCodesC1 /
 #   mov %r14,%rdi / lea 0xc8(%r14),%rsi / call XkbKeyboardLayoutEngineC1 /
 #   mov %r14,0x20(%rbx) / mov %r14,%rdi
 # then falls through into the existing SetKeyboardLayoutEngine call.
+# The site must start where rax still holds the fresh block (i.e. right after
+# the new[] call, before `mov %rax,%rdi`), and it must end on the original
+# `mov %r14,%rdi` before SetKeyboardLayoutEngine: the 37 payload bytes are
+# exactly that span. Offsets are relative to the symbol, never pasted.
 # Both call displacements depend on where this block sits, so derive them
 # from the constructor symbols — a pasted dump is stale after every
 # snapshot bump, which is exactly how the previous revision broke ld.so.
 evdev_va=$(sym_va ' t ui::XkbEvdevCodes::XkbEvdevCodes\(\)')
 kbengine_va=$(sym_va ' t ui::XkbKeyboardLayoutEngine::XkbKeyboardLayoutEngine\(ui::XkbKeyCodeConverter const&\)')
-engine_site=$((ui_va + 390))
+engine_site=$((ui_va + 440))
 verify_and_patch "OzonePlatformX11::InitializeUI (real Xkb engine)" \
   "$(va_to_offset "$engine_site" "$DELTA")" \
-  "4989c64889c7e84577e806488b43204c8973204885c0740d488b084889c7ff51084c8b7320" \
+  "4989c64889c7e83d542e07488b43204c8973204885c0740d488b084889c7ff51084c8b7320" \
   '\110\215\270\310\000\000\000\111\211\306\350'"$(rel32_octal "$evdev_va" $((engine_site + 15)))"'\114\211\367\111\215\266\310\000\000\000\350'"$(rel32_octal "$kbengine_va" $((engine_site + 30)))"'\114\211\163\040\114\211\367'
 
 # Overwrite the (now dead) StubKeyboardLayoutEngine::Lookup with a thunk
@@ -292,22 +299,22 @@ verify_and_patch "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
   '\110\213\005'"$(rel32_octal "$ke_va" $((lookup_va + 7)))"'\110\205\300\164\011\110\211\307\110\213\000\377\140\040\351'"$(rel32_octal "$fallback_va" $((lookup_va + 26)))"
 
 # Redirect the real StubInputController vtable slot for
-# SetCurrentLayoutByName (vptr+0x80, .rela.dyn entry at file 0x12b8dd0,
-# R_X86_64_RELATIVE addend 0x75607de = the stub body) to the thunk:
-# verify the whole 24-byte relocation, write it with the new addend
-# (thunk VA 0xebb39e8 = StubKeyboardLayoutEngine::Lookup).
+# SetCurrentLayoutByName (vptr+0x80 = 'vtable for' symbol + 0x90, .rela.dyn
+# entry at file 0x12bf000, R_X86_64_RELATIVE addend 0x77c3aba = the stub body)
+# to the thunk: verify the whole 24-byte relocation, write it with the new
+# addend (thunk VA 0xf30023e = StubKeyboardLayoutEngine::Lookup).
 verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
-  "$((0x12b8dd0))" \
-  "$(rela_expect $((0x168c6868)) 8 $((0x75607de)))" \
-  "$(rela_fmt $((0x168c6868)) 8 $((0xebb39e8)))"
+  "$((0x12bf000))" \
+  "$(rela_expect $((0x173817e8)) 8 $((0x77c3aba)))" \
+  "$(rela_fmt $((0x173817e8)) 8 $((0xf30023e)))"
 
 # --- hide demo system web apps from the launcher ---------------------------
 # SystemWebAppManager::CreateInstallOptionsForSystemApp sets
 # add_to_launcher = delegate->ShouldShowInLauncher(). For the demo SWAs below
 # that slot (vptr+0x50 == 'vtable for' symbol+0x60) inherits the ICF-merged
-# "return true" stub (0x6aea380), so every one of them lands in the launcher
+# "return true" stub (0x6d1db40), so every one of them lands in the launcher
 # menu. Redirect the .rela.dyn addend to a "xor %eax,%eax; ret" gadget
-# (0x6ae8570) so ShouldShowInLauncher() returns false: the app stays
+# (0x6d1bd08) so ShouldShowInLauncher() returns false: the app stays
 # installed (media-app keeps working as a file viewer, chrome:// URLs still
 # open) but is not added to the launcher. To restore an app, revert the
 # corresponding line here.
@@ -315,19 +322,19 @@ verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
 # rela_expect/rela_fmt derive the expected bytes and the payload from the
 # same three numbers, so the check covers r_offset and r_info as well as the
 # addend and a stale file offset cannot pass it.
-SWA_RETURN_TRUE=$((0x6aea380))    # ICF-merged "return true" stub
-SWA_RETURN_FALSE=$((0x6ae8570))   # "xor %eax,%eax; ret" gadget
+SWA_RETURN_TRUE=$((0x6d1db40))    # ICF-merged "return true" stub
+SWA_RETURN_FALSE=$((0x6d1bd08))   # ICF-merged "return false" stub
 swa_hide() { # <name> <rela-file-offset> <r_offset>
   verify_and_patch "hide SWA from launcher: $1" "$2" \
     "$(rela_expect "$3" 8 "$SWA_RETURN_TRUE")" \
     "$(rela_fmt "$3" 8 "$SWA_RETURN_FALSE")"
 }
-swa_hide "Галерея (media-app)"      "$((0x1d7b568))" "$((0x16de9aa8))"
-swa_hide "Sample System Web App"    "$((0x1d76408))" "$((0x16de7b38))"
-swa_hide "Возможности (help-app)"   "$((0x1d774a0))" "$((0x16de80f0))"
-swa_hide "Камера (camera-app)"      "$((0x1d71da0))" "$((0x16de6230))"
-swa_hide "Скринкаст (projector)"    "$((0x1d74c08))" "$((0x16de72b8))"
-swa_hide "Игры и приложения (mall)" "$((0x1d75b08))" "$((0x16de7808))"
+swa_hide "Галерея (media-app)"      "$((0x1d829b0))" "$((0x178a5198))"
+swa_hide "Sample System Web App"    "$((0x1d7d850))" "$((0x178a3228))"
+swa_hide "Возможности (help-app)"   "$((0x1d7e8e8))" "$((0x178a37e0))"
+swa_hide "Камера (camera-app)"      "$((0x1d791e8))" "$((0x178a1920))"
+swa_hide "Скринкаст (projector)"    "$((0x1d7c050))" "$((0x178a29a8))"
+swa_hide "Игры и приложения (mall)" "$((0x1d7cf50))" "$((0x178a2ef8))"
 
 # --- GPU: ozone X11 pixmap import ------------------------------------------
 # Without these, X11 clients on the sommelier display get white windows and a
@@ -338,7 +345,7 @@ swa_hide "Игры и приложения (mall)" "$((0x1d75b08))" "$((0x16de78
 
 # 1) NativePixmapEGLX11Binding::IsSharedImageFormatSupported -> true. The
 #    original only accepts BGRA_8888, so CanImportNativePixmap() said no to
-#    the BGRX surfaces exo actually produces. vaddr 0x7d2a730, prologue
+#    the BGRX surfaces exo actually produces. Prologue
 #    "push %rbp; mov %rsp,%rbp; sub $0x10,%rsp" -> "mov $1,%eax; ret".
 va=$(sym_va ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(')
 verify_and_patch "IsSharedImageFormatSupported (accept BGRX)" \
@@ -346,19 +353,21 @@ verify_and_patch "IsSharedImageFormatSupported (accept BGRX)" \
 
 # 2) GetNativePixmapSupportType -> kX11Pixmap (2). It prefers kDMABuf when
 #    EGL_EXT_image_dma_buf_import is present, which ANGLE never exposes here,
-#    and CanImportNativeGLXPixmap() only asks dri3/glx, not GL. vaddr
-#    0x7d2e92a, same prologue -> "mov $2,%eax; ret".
+#    and CanImportNativeGLXPixmap() only asks dri3/glx, not GL. Same prologue
+#    -> "mov $2,%eax; ret".
 va=$(sym_va ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)')
 verify_and_patch "GetNativePixmapSupportType (kX11Pixmap)" \
-  "$(va_to_offset "$va" "$DELTA")" "554889e5e80f" '\270\002\000\000\000\303'
+  "$(va_to_offset "$va" "$DELTA")" "554889e5e8c5" '\270\002\000\000\000\303'
 
 # 3) Inside NativePixmapEGLX11Binding::Create: an inlined
 #    gl::IsFormatSupported(format) rejects kBGRX_8888 ("je -> 'format is
 #    unsupported'" VLOG, nothing in the release log). NOP the branch — the
-#    caller already vetted the format in patch 1. Create+132, vaddr 0x7d2aa86.
+#    caller already vetted the format in patch 1. The branch is the `je` right
+#    after the gl::IsFormatSupported call (Create+110, vaddr 0x8019542); it
+#    used to sit at +132 when that helper was inlined as a format compare.
 va=$(sym_va ' t ui::NativePixmapEGLX11Binding::Create\(')
 verify_and_patch "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
-  "$(va_to_offset "$va" "$DELTA" 132)" "0f8554020000" \
+  "$(va_to_offset "$va" "$DELTA" 110)" "0f84ce000000" \
   '\220\220\220\220\220\220'
 
 # 4) exo must not advertise RGB-order dmabuf formats (AB24/XB24/AB30/AB4H).
@@ -378,7 +387,7 @@ verify_and_patch "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
 #    candidate set and, if nothing survives, re-seeds the map from that set.
 #    Make the candidate set BGR-order:
 #      - the rodata SIF blob it seeds the local flat_tree from (list at
-#        0x354565c: kBGR_565, kRGBA_8888, kRGBX_8888, two YUV entries):
+#        0x354cd7c: kBGR_565, kRGBA_8888, kRGBX_8888, two YUV entries):
 #        RGBA_8888 -> BGRA_8888, RGBX_8888 -> BGRX_8888 (AR24/XR24 then also
 #        survive the filter and get seeded, so clients still get a 32-bit
 #        colour format);
@@ -389,16 +398,16 @@ verify_and_patch "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
 #    and can insert AB24/XB24 straight from the driver — the remove_if above
 #    is what drops them again.
 verify_and_patch "exo dmabuf candidates (RGBA_8888 -> BGRA_8888)" \
-  "$((0x3545664))" "0100000000000000" '\001\000\000\000\002\000\000\000'
+  "$((0x354cd84))" "0100000000000000" '\001\000\000\000\002\000\000\000'
 verify_and_patch "exo dmabuf candidates (RGBX_8888 -> BGRX_8888)" \
-  "$((0x354566c))" "010000000a000000" '\001\000\000\000\013\000\000\000'
-# Both jne sites are found through the function symbol (+119 / +198), so a
+  "$((0x354cd8c))" "010000000a000000" '\001\000\000\000\013\000\000\000'
+# Both jne sites are found through the function symbol (+129 / +208), so a
 # snapshot bump that moves the body moves the patch with it.
 exo_va=$(sym_va ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(')
 verify_and_patch "exo dmabuf candidates (skip RGBA_F16)" \
-  "$(va_to_offset "$exo_va" "$DELTA" 119)" "7513" '\353\023'
+  "$(va_to_offset "$exo_va" "$DELTA" 129)" "7513" '\353\023'
 verify_and_patch "exo dmabuf candidates (skip RGBA_1010102)" \
-  "$(va_to_offset "$exo_va" "$DELTA" 198)" "7513" '\353\023'
+  "$(va_to_offset "$exo_va" "$DELTA" 208)" "7513" '\353\023'
 
 # --- libminigbm shim (Mesa stand-in) ---------------------------------------
 # Chrome is built against ChromeOS' minigbm, whose usage bits and import type
