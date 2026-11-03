@@ -119,7 +119,7 @@ sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja gcc make
 ## Структура репозитория
 
 ```
-chromeos-bin/REVISION         пин ревизии снапшота ChromiumOS (1733743)
+chromeos-bin/REVISION         пин ревизии снапшота ChromiumOS (1734203)
 chromeos-bin/fetch.sh         скачивание + проверка контрольных сумм
 chromeos-bin/chrome/          распакованный снапшот (после make fetch, ~920 МБ)
 
