@@ -432,7 +432,7 @@ make test             # бриджи на реальной системной ш
 
 ## Хакинг
 
-* **Поменять патч** — правь `scripts/build-chrome.sh`; там же хелперы `sym_va`, `verify_and_patch`, `va_to_offset` и генераторы байтовых констант `le_octal` / `le_hex` / `rel32_octal` / `rela_expect` / `rela_fmt`. Новая проверка байтов обязательна, иначе патч применится к неожиданному месту; много байтовых констант (rela-записи, rel32-вызовы) сейчас собираются из одного числа сразу в обе стороны — так смещения и проверочные байты не расходятся при бампе ревизии.
+* **Поменять патч** — правь `scripts/build-chrome.sh`; там же хелперы `sym_va`, `verify_and_patch`, `va2off` и генераторы байтовых констант `le_hex` / `rel32_hex` / `rela_hex` (плюс `hex_fmt` — единственное место, где hex превращается в `\xHH` для `printf`/`grep`). И `expected`, и payload — простой hex парами байт, без octal-эскейпов: две стороны читаются друг против друга строка в строку. Новая проверка байтов обязательна, иначе патч применится к неожиданному месту; много байтовых констант (rela-записи, rel32-вызовы) собираются из одного числа сразу в обе стороны — так смещения и проверочные байты не расходятся при бампе ревизии.
 * **Добавить бридж** — положи `dbus-bridges/cmd/<name>-bridge/main.go`, добавь имя в `BRIDGES` в `session/start-session.sh` и блок `<policy>` в `session/dbus-policies/chromeos-bridges.conf`, затем `sudo ./scripts/setup-system.sh --user "$USER"`.
 * **Оффлайн-сборка** — `make vendor` кладёт зависимости в `dbus-bridges/vendor/`, после чего `go build` идёт без сети.
 * **Свой профиль** — `ASH_PROFILE_DIR=$HOME/.local/share/chromeos-ash ./session/start-session.sh`; учти, что путь `/home/chronos/user`, сокет `/run/mojo` и D-Bus-политика всё равно системные.

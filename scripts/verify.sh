@@ -133,14 +133,14 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
       check_gpu_patch "GetNativePixmapSupportType -> kX11Pixmap" \
         ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)' \
         0 b802000000c3
-      # Patch 3: six NOPs over the `je` — Create+110, right after the
+      # Patch 3: six NOPs over the `je` — Create+0x6e, right after the
       # call gl::IsFormatSupported. The offset mirrors the pin in
       # build-chrome.sh and the bytes are its payload: both scripts get
       # updated together, and catching that they drifted apart is exactly
       # what verify is for.
       check_gpu_patch "NativePixmapEGLX11Binding::Create -> BGRX check dropped" \
         ' t ui::NativePixmapEGLX11Binding::Create\(' \
-        110 909090909090
+        0x6e 909090909090
     fi
   fi
 
