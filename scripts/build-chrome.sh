@@ -292,21 +292,17 @@ patch_sym "RedirectChromeLogging (no-op)" \
 patch_sym "OnDisconnect (no-op)" \
   ' ash::mojo_service_manager::.*::OnDisconnect\(' "55" "c3"
 
+# HasInternalDisplay() is a white lie that only stays true while
+# internal_display_ids() holds exactly one entry — filled by
+# MaybeInitInternalDisplay(), gated on display::ForceFirstDisplayInternal(),
+# which on a plain Linux host is true only with --use-first-display-as-internal
+# (passed by session/chromeos-linux-session). Without that flag the patched
+# "true" right below makes DisplayManager::OnNativeDisplaysChanged() call
+# Display::InternalDisplayId(), which CHECKs "1u == ids.size()"
+# (display.cc:309): black screen, restart, die. Keep this patch and that flag
+# in sync — it used to be a ForceFirstDisplayInternal patch here instead.
 patch_sym "HasInternalDisplay (returns true)" \
   ' display::HasInternalDisplay\(\)' "55" "b001c3" soft
-
-# HasInternalDisplay() above is a white lie: it only works if
-# internal_display_ids() is populated, otherwise the next caller,
-# DisplayManager::OnNativeDisplaysChanged() (via InitFromCommandLine()), does
-#     if (HasInternalDisplay() && !found_internal_in_list)
-#         internal_id = Display::InternalDisplayId();
-# and InternalDisplayId() CHECKs "1u == ids.size()" (display.cc:309): black
-# screen, restart, die. The ids come from MaybeInitInternalDisplay(), gated
-# on ForceFirstDisplayInternal() — true only with
-# --use-first-display-as-internal or a ChromeOS board, so here they stay
-# empty. Force it true: the first host display becomes the internal one.
-patch_sym "ForceFirstDisplayInternal (first display is internal)" \
-  ' display::ForceFirstDisplayInternal\(\)' "55" "b001c3"
 
 # System UI blur (shelf, quick settings, hotseat) is gated on RAM, not GPU:
 # chromeos::features::IsSystemBlurEnabled() is literally

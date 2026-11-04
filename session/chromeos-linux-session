@@ -390,6 +390,18 @@ while true; do
 
   log "starting Ash (bounds=$ASH_HOST_WINDOW_BOUNDS)"
   chrome_start=$(date +%s)
+  # The last flag below, --use-first-display-as-internal, is load-bearing and
+  # not cosmetic: it is what makes display::ForceFirstDisplayInternal() return
+  # true on a plain Linux host, and that is the only gate on
+  # MaybeInitInternalDisplay() filling internal_display_ids() with the first
+  # display. Drop it and the ids stay empty while the build-time patch keeps
+  # HasInternalDisplay() true (scripts/build-chrome.sh), so
+  # DisplayManager::OnNativeDisplaysChanged() trusts it and calls
+  # Display::InternalDisplayId(), which CHECKs "1u == ids.size()"
+  # (display.cc:309): black screen, Chrome dies a few seconds later, the loop
+  # restarts it, it dies again. Keep it in sync with that patch, and pass it
+  # too when you start dist/chrome/chromeos-ash by hand — the protection now
+  # lives in this command line, not in the binary.
   "$CHROME" \
     --ash-dev-shortcuts \
     --no-sandbox \
@@ -415,6 +427,7 @@ while true; do
     "${login_flags[@]}" \
     --ozone-platform=x11 \
     --ash-host-window-bounds="$ASH_HOST_WINDOW_BOUNDS" \
+    --use-first-display-as-internal \
     2>>"$PROFILE/ash.log" &
   chrome_pid=$!
   # wait (not a foreground run) so the INT/TERM traps fire promptly; a plain
