@@ -166,14 +166,20 @@ fi
 # would silently skip this check. Not a setup-system.sh artefact (start-session.sh
 # launches them), so this stays a soft signal that never fails a fresh machine.
 if pgrep -f 'session/chromeos-linux-session' >/dev/null 2>&1; then
-  for name in shill cras session crostini rmad power; do
-    if pgrep -f "dist/bin/${name}-bridge" >/dev/null 2>&1; then
-      ps_ok "${name}-bridge" "running"
+  check_running_bridge() { # <label> <pgrep-pattern> <log-base>
+    if pgrep -f "$2" >/dev/null 2>&1; then
+      ps_ok "$1" "running"
     else
-      printf '  WARN    %-14s not running (session is up)  -> check %s-bridge.log\n' \
-             "${name}-bridge" "${name}"
+      printf '  WARN    %-14s not running (session is up)  -> check %s.log\n' \
+             "$1" "$3"
     fi
+  }
+  for name in shill cras session crostini rmad stub power; do
+    check_running_bridge "${name}-bridge" "dist/bin/${name}-bridge" "${name}-bridge"
   done
+  # mojo-stub is a helper, not a *-bridge binary, and its log follows the
+  # same <name>-bridge.log convention from start-session.sh.
+  check_running_bridge "mojo-stub" "dist/bin/mojo-stub" "mojo-stub-bridge"
 fi
 
 echo

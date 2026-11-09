@@ -186,6 +186,20 @@ patch_sym() {
   verify_and_patch "$what" "$offset" "$expected" "$fmt" "$mode"
 }
 
+# patch_va <what> <va> <expected-hex> <payload-hex> [soft]
+#   Same as patch_sym, but for a site already resolved to a VA (a .rodata
+#   anchor, or a symbol+constant kept in a variable). Keeps every patch call
+#   shaped the same instead of spelling out va2off at each site.
+patch_va() {
+  local what=$1 va=$2 expected=$3 fmt=$4 mode=${5:-strict} offset
+  [ -n "$va" ] || { fail_or_warn "$mode" "$what: no site address"; return 0; }
+  if ! offset=$(va2off $(( va ))); then
+    fail_or_warn "$mode" "$what: VA $(( va )) is not in any PT_LOAD segment"
+    return 0
+  fi
+  verify_and_patch "$what" "$offset" "$expected" "$fmt" "$mode"
+}
+
 le_hex() { # <value> <bytes> -> lowercase hex, the form od prints; a
   # negative value is proper two's complement (rel32 displacements)
   awk -v v="$1" -v n="$2" 'BEGIN {
@@ -230,6 +244,21 @@ rela_record() { # <r_offset-va> -> decimal file offset
   return 1
 }
 
+# patch_rela <what> <slot-va> <expected-addend> <payload-addend>
+#   Rewrite the addend of the R_X86_64_RELATIVE record whose r_offset is
+#   <slot-va>. rela_record() finds the record and dies loudly when it is
+#   missing; the whole 24 bytes are still compared (rela_hex pins r_offset
+#   and r_info too), so a shifted slot or a changed pristine addend fails
+#   instead of patching the wrong slot.
+patch_rela() {
+  local what=$1 slot=$2 expected=$3 fmt=$4 rec
+  rec=$(rela_record "$slot") ||
+    die "$what: no .rela.dyn record for slot 0x$(printf %x "$slot")"
+  verify_and_patch "$what" "$rec" \
+    "$(rela_hex "$slot" 8 "$expected")" \
+    "$(rela_hex "$slot" 8 "$fmt")"
+}
+
 # --- string patches ----------------------------------------------------------
 
 OLD_STUB='chrome.terminalPrivate.openVmshellProcess([], () => {})'
@@ -263,7 +292,7 @@ done < <(grep -Fboa "'wasm-unsafe-eval'" "$CHROME" || true)
 # is pinned too). The payload's 5-byte jmp replaces the 2-byte jne and
 # must land on the same target, so its displacement is computed from that
 # one number (rel8 - 3): expected and payload cannot drift apart.
-init_skip=$((0x47))  # jne displacement, pristine (rev 1733909)
+init_skip=$((0x47))  # jne displacement, pinned for the current snapshot
 patch_sym "DisplayConfigurator::Init (skip native display config)" \
   ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display::NativeDisplayDelegate' \
   "75$(le_hex "$init_skip" 1)4889fb80bf" \
@@ -325,12 +354,18 @@ patch_sym "IsSystemBlurEnabled (always true, blur on any RAM)" \
 
 ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(')
 
+# Both sites are symbol+constant, so they live here and move with the function
+# on a snapshot bump: the new[] immediate (+0x1af) and the construction site
+# (+0x1b8) that follows it.
+engine_alloc_site=$(( ui_va + 0x1af ))
+engine_site=$(( ui_va + 0x1b8 ))
+
 # new[] size for the combined block: XkbKeyboardLayoutEngine (0xc8, same as
 # the DRM platform) + XkbEvdevCodes (0x10) = 0xd8, was 0x20. Site: the
-# immediate of `mov $0x20,%edi` feeding that new[] call — InitializeUI+0x1af
-# in this revision (the StubKeyboardLayoutEngine allocation).
-verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-  "$(va2off $(( ui_va + 0x1af )))" "20" "d8"
+# immediate of `mov $0x20,%edi` feeding that new[] call (the
+# StubKeyboardLayoutEngine allocation).
+patch_va "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
+  "$engine_alloc_site" "20" "d8"
 
 # Replace the StubKeyboardLayoutEngine construction with a real Xkb engine
 # (XkbEvdevCodes converter at +0xc8, then XkbKeyboardLayoutEngine) stored to
@@ -343,14 +378,13 @@ verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
 evdev_va=$(sym_va ' t ui::XkbEvdevCodes::XkbEvdevCodes\(\)')
 kbengine_va=$(sym_va ' t ui::XkbKeyboardLayoutEngine::XkbKeyboardLayoutEngine\(ui::XkbKeyCodeConverter const&\)')
 stubcstr_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::StubKeyboardLayoutEngine\(')
-engine_site=$(( ui_va + 0x1b8 ))
 # expected = the pristine bytes of the site, with its one address-dependent
 # field — the `call StubKeyboardLayoutEngine ctor` at site+6 — derived from
 # the constructor symbol instead of pasted: that rel32 moves on every
-# snapshot bump even when the site itself does not (rev 1733909).
+# snapshot bump even when the site itself does not.
 engine_expected="4989c64889c7e8$(le_hex $(( stubcstr_va - engine_site - 11 )) 4)488b43204c8973204885c0740d488b084889c7ff51084c8b7320"
-verify_and_patch "OzonePlatformX11::InitializeUI (real Xkb engine)" \
-  "$(va2off "$engine_site")" \
+patch_va "OzonePlatformX11::InitializeUI (real Xkb engine)" \
+  "$engine_site" \
   "$engine_expected" \
   "488db8c80000004989c6e8$(rel32_hex "$evdev_va" $((engine_site + 15)))4c89f7498db6c8000000e8$(rel32_hex "$kbengine_va" $((engine_site + 30)))4c8973204c89f7"
 
@@ -374,8 +408,8 @@ fallback_va=$(sym_va ' t ui::StubInputController::SetCurrentLayoutByName\(')
 # mov %rsp,%rbp; mov 0x10(%rdi),%r9; test %r9,%r9; je — fixed instruction
 # bytes, nothing address-dependent (the je's rel8 operand lies outside the
 # 12 pinned).
-verify_and_patch "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
-  "$(va2off "$lookup_va")" \
+patch_va "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
+  "$lookup_va" \
   "554889e54c8b4f104d85c974" \
   "488b05$(rel32_hex "$ke_va" $((lookup_va + 7)))4885c074094889c7488b00ff6020e9$(rel32_hex "$fallback_va" $((lookup_va + 26)))"
 
@@ -385,13 +419,8 @@ verify_and_patch "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
 # R_X86_64_RELATIVE, addend = the stub body it points at today), write it
 # back with the new addend (the thunk lives at lookup_va).
 sctrl_vt=$(sym_va ' vtable for ui::StubInputController$')
-tunnel_slot=$(( sctrl_vt + 0x90 ))
-tunnel_rec=$(rela_record "$tunnel_slot") ||
-  die "StubInputController::SetCurrentLayoutByName -> thunk: no .rela.dyn record for slot 0x$(printf %x "$tunnel_slot")"
-verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
-  "$tunnel_rec" \
-  "$(rela_hex "$tunnel_slot" 8 "$fallback_va")" \
-  "$(rela_hex "$tunnel_slot" 8 "$lookup_va")"
+patch_rela "StubInputController::SetCurrentLayoutByName -> thunk" \
+  "$(( sctrl_vt + 0x90 ))" "$fallback_va" "$lookup_va"
 
 # --- hide demo system web apps from the launcher ---------------------------
 # SystemWebAppManager::CreateInstallOptionsForSystemApp sets
@@ -410,14 +439,10 @@ verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
 SWA_RETURN_TRUE=$(sym_va ' t ash::SystemWebAppDelegate::ShouldShowInLauncher\(\) const')
 SWA_RETURN_FALSE=$(sym_va ' t EcheSystemAppDelegate::ShouldShowInLauncher\(\) const')
 swa_hide() { # <name> <vtable-regex>
-  local vt slot rec
+  local vt
   vt=$(sym_va "$2")
-  slot=$(( vt + 0x60 ))
-  rec=$(rela_record "$slot") ||
-    die "hide SWA from launcher: $1: no .rela.dyn record for slot 0x$(printf %x "$slot")"
-  verify_and_patch "hide SWA from launcher: $1" "$rec" \
-    "$(rela_hex "$slot" 8 "$SWA_RETURN_TRUE")" \
-    "$(rela_hex "$slot" 8 "$SWA_RETURN_FALSE")"
+  patch_rela "hide SWA from launcher: $1" \
+    "$(( vt + 0x60 ))" "$SWA_RETURN_TRUE" "$SWA_RETURN_FALSE"
 }
 swa_hide "Галерея (media-app)"      ' vtable for MediaSystemAppDelegate$'
 swa_hide "Sample System Web App"    ' vtable for SampleSystemAppDelegate$'
@@ -446,13 +471,12 @@ patch_sym "IsSharedImageFormatSupported (accept BGRX)" \
 #    EGL_EXT_image_dma_buf_import exists, which ANGLE never exposes here, and
 #    CanImportNativeGLXPixmap() only asks dri3/glx. Prologue -> mov $2,%eax.
 #    expected = 55 48 89 e5 e8 + rel32 low byte — push %rbp; mov %rsp,%rbp;
-#    call GetGLDisplayEGL: the 6-byte payload overwrites exactly that, and
-#    the low byte moves with the callee, so it comes from the callee symbol
-#    instead of a pasted one (rev 1733909: c5 -> a5).
+#    call GetGLDisplayEGL: the 6-byte payload overwrites exactly that, so the
+#    low byte is derived from the callee symbol instead of being pasted.
 gmps_va=$(sym_va ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)')
 gld_va=$(sym_va ' t gl::GLSurfaceEGL::GetGLDisplayEGL\(')
-verify_and_patch "GetNativePixmapSupportType (kX11Pixmap)" \
-  "$(va2off "$gmps_va")" \
+patch_va "GetNativePixmapSupportType (kX11Pixmap)" \
+  "$gmps_va" \
   "554889e5e8$(le_hex $(( gld_va - gmps_va - 9 )) 1)" \
   "b802000000c3"
 
@@ -461,13 +485,16 @@ verify_and_patch "GetNativePixmapSupportType (kX11Pixmap)" \
 #    release log). NOP the branch — the caller vetted the format in patch 1.
 #    Site: the `je` right after `call gl::IsFormatSupported` (Create+0x6e).
 #    expected = 0f 84 <rel32>: the displacement is a within-function
-#    distance to the VLOG block — no symbol to derive it from, so it is
-#    pinned pristine like the jnes below (the payload is 6 nops and does
-#    not depend on it; a moved target only needs the number refreshed from
-#    the report).
+#    distance to the VLOG block — no symbol to derive it from, so it stays a
+#    pinned number like the jnes below. The payload is 6 nops and does not
+#    depend on it; if a snapshot moves the target, refresh create_skip from
+#    the patch report and leave create_site alone unless the `je` itself
+#    moves.
+create_site=$((0x6e))
+create_skip=$((0xce))
 patch_sym "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
   ' t ui::NativePixmapEGLX11Binding::Create\(' \
-  "0f84ce000000" "909090909090" 0x6e
+  "0f84$(le_hex "$create_skip" 4)" "909090909090" "$create_site"
 
 # 4) exo must not advertise RGB-order dmabuf formats (AB24/XB24/AB30/AB4H).
 #    Ash imports every client dmabuf through the X11-pixmap path (patch 2),
@@ -489,32 +516,28 @@ patch_sym "NativePixmapEGLX11Binding::Create (drop BGRX check)" \
 #    PopulateVkDrmFormatsAndModifiers()/PopulateDRMCapabilities() run first
 #    and can insert AB24/XB24 straight from the driver — remove_if drops them.
 # Blob address: the first rip-relative movups in the function loads it (16
-# bytes); the two rewritten SIF entries sit at blob+8 and blob+16. objdump
-# prints the load target after '#'.
+# bytes); the two rewritten SIF entries sit at blob+8 and blob+16. The anchor
+# is located by sif_blob_va() in common.sh — shared with verify.sh, which
+# checks the same spots.
 pop_va=$(sym_va ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(')
-# gawk must not exit early: closing the pipe would SIGPIPE objdump and, with
-# pipefail, fail this assignment — it drains the output and prints the first
-# target only.
-sif_blob=$(objdump -d --start-address="$pop_va" --stop-address="$((pop_va + 0x1000))" "$CHROME" |
-  gawk '/movups/ && match($0, /#[ \t]+(0x)?([0-9a-f]+)/, m) && !done { print "0x" m[2]; done = 1 }')
+sif_blob=$(sif_blob_va "$CHROME" "$pop_va")
 [ -n "$sif_blob" ] || die "exo dmabuf candidates: no rip-relative movups load in PopulateMappableDrmFormatsForExo (SIF blob anchor)"
-verify_and_patch "exo dmabuf candidates (RGBA_8888 -> BGRA_8888)" \
-  "$(va2off $((sif_blob + 8)))" "0100000000000000" "0100000002000000"
-verify_and_patch "exo dmabuf candidates (RGBX_8888 -> BGRX_8888)" \
-  "$(va2off $((sif_blob + 16)))" "010000000a000000" "010000000b000000"
-# Both jne sites come from the function symbol (+0x81 / +0xd0). The patch
-# swaps each 2-byte jne for a 2-byte jmp with the SAME displacement (same
-# length, same target), so one pinned number per site feeds expected and
-# payload — a layout drift is a one-number fix and cannot leave the two
-# sides pointing at different targets.
-f16_skip=$((0x13))   # jne displacement, pristine (rev 1733909)
+patch_va "exo dmabuf candidates (RGBA_8888 -> BGRA_8888)" \
+  "$(( sif_blob + 8 ))" "0100000000000000" "0100000002000000"
+patch_va "exo dmabuf candidates (RGBX_8888 -> BGRX_8888)" \
+  "$(( sif_blob + 16 ))" "010000000a000000" "010000000b000000"
+# Both jne sites are function+0x81 / +0xd0. The patch swaps each 2-byte jne
+# for a 2-byte jmp with the SAME displacement (same length, same target), so
+# one pinned number per site feeds expected and payload — a layout drift is a
+# one-number fix and cannot leave the two sides pointing at different targets.
+f16_skip=$((0x13))   # jne displacement, pinned for the current snapshot
 ab30_skip=$((0x13))
-patch_sym "exo dmabuf candidates (skip RGBA_F16)" \
-  ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(' \
-  "75$(le_hex "$f16_skip" 1)" "eb$(le_hex "$f16_skip" 1)" 0x81
-patch_sym "exo dmabuf candidates (skip RGBA_1010102)" \
-  ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(' \
-  "75$(le_hex "$ab30_skip" 1)" "eb$(le_hex "$ab30_skip" 1)" 0xd0
+patch_va "exo dmabuf candidates (skip RGBA_F16)" \
+  "$(( pop_va + 0x81 ))" \
+  "75$(le_hex "$f16_skip" 1)" "eb$(le_hex "$f16_skip" 1)"
+patch_va "exo dmabuf candidates (skip RGBA_1010102)" \
+  "$(( pop_va + 0xd0 ))" \
+  "75$(le_hex "$ab30_skip" 1)" "eb$(le_hex "$ab30_skip" 1)"
 
 # --- libminigbm shim (Mesa stand-in) ---------------------------------------
 # Chrome is built against ChromeOS' minigbm, whose usage bits and import type

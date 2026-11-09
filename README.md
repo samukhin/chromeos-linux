@@ -270,6 +270,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | `RunPendingConfiguration` | `ret` (no-op) | крэш при смене конфигурации дисплея |
 | `RedirectChromeLogging` | `ret` (no-op) | Chrome уводит логи в ChromeOS-путь |
 | `OnDisconnect` | `ret` (no-op) | крэш при таймауте mojo-канала |
+| Скрытие демо-SWA | слот `SystemWebAppDelegate::ShouldShowInLauncher()` у Gallery/Sample/Help/Camera/Projector/Mall перенаправлен на `return false` | демонстрационные приложения занимают место в лаунчере; сами SWA остаются установленными и по-прежнему открываются по `chrome://`-URL |
 | `HasInternalDisplay` | всегда `true` | нет ползунка яркости |
 | `IsSystemBlurEnabled` | всегда `true` | blur панели/шторки гейтится не на GPU, а на ОЗУ: `chromeos::features::IsSystemBlurEnabled()` — это буквально `AmountOfTotalPhysicalMemory() > 4GiB` из `/proc/meminfo`, без FeatureList и без флага. На хостах ≤4 ГБ (гости VirtualBox, типовые Haswell-ноутбуки) панель и шторка рисуются непрозрачными, хотя композитор blur умеет рисовать на чём угодно (`viz::SoftwareRenderer::GetBackdropFilterShader` есть). С патчем — blur при любом объёме RAM; на малорамных хостах это стоит части FPS в анимациях |
 | Раскладка RU/EN | `OzonePlatformX11::InitializeUI` вместо `StubKeyboardLayoutEngine` собирает пару `XkbEvdevCodes` + `XkbKeyboardLayoutEngine` (как DRM-платформа) и регистрирует её в `KeyboardLayoutEngineManager`, а thunk на месте мёртвого `Stub::Lookup` перенаправляет `StubInputController::SetCurrentLayoutByName` в зарегистрированный движок | смена RU/EN в шторке двигает только индикатор в трее: набор текста остаётся US (нужны xkb-данные из `xkb-data` / `xorg-xkbdata`) |
@@ -302,7 +303,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 * Ash стартует в постоянный ChromeOS-подобный десктоп, OOBE пропущен.
 * Шельф, лаунчер, шторка быстрых настроек и системный трей открываются.
-* Ставятся все 24 System Web App, включая Terminal, Files, Settings и Camera.
+* Ставятся все 24 System Web App, включая Terminal, Files и Settings. Демонстрационные Camera, Галерея, help-app, Sample, Projector и Mall установлены, но скрыты из лаунчера отдельным патчем (см. таблицу патчей).
 * Terminal SWA поднимает настоящий bash через инжектированный UI.
 * Chrome переживает перелогин и ре-экзекуции сессии, не вылетая из дисплейного менеджера.
 * Работают бриджи shill, CRAS, powerd, session_manager, UserDataAuth, Crostini, rmad и совместимость Mojo service manager.

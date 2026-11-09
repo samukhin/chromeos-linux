@@ -11,6 +11,11 @@ ok()   { echo "  ok: $*"; }
 
 need ldd "ldd — libc-bin"
 
+# Symbol cache for the binary-patch checks; removed on exit even if a check
+# aborts the script.
+SYM_CACHE=""
+trap '[ -n "$SYM_CACHE" ] && rm -f "$SYM_CACHE"' EXIT
+
 echo "== inputs =="
 if [ -x "$ASH_ROOT/chromeos-bin/chrome/chrome" ]; then
   ok "pristine chrome snapshot"
@@ -78,69 +83,203 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
     ok "CSP wasm-unsafe-eval -> unsafe-eval applied"
   fi
 
-  # Three GPU patches from build-chrome.sh (what they are for — see the
-  # comments there and the README). Sites are measured from symbols, never
-  # pinned as constants: on a snapshot bump the symbols move with the code.
-  # All three sites sit in .text, so the section delta is enough here
-  # (build-chrome maps through every PT_LOAD because it also has data
-  # sites). Every check runs its own nm on purpose: the demangled dump is
-  # ~564 MB, too big for a shell variable on this 4 GB host (bash holds it
-  # plus a here-string copy — the OOM killer then takes verify down with
-  # 137 instead of a FAIL line), and caching it in a file would only move
-  # those megabytes into tmpfs. So nm streams straight into awk, which
-  # reads a line at a time.
+  # --- binary patch sites ---------------------------------------------------
+  # Generic readers shared by the checks below. Patches live in .text,
+  # .rodata and .rela.dyn, so map VAs through every PT_LOAD (the same way
+  # build-chrome.sh does); a .text-only delta cannot reach data or
+  # relocation sites.
+  CHROME="$ASH_ROOT/dist/chrome/chrome"
+  LOADS=$(LC_ALL=C readelf -lW "$CHROME" | awk '$1 == "LOAD" { print $2, $3, $5 }') || true
+
+  va2off() { # <va> -> decimal file offset
+    local va=$(( $1 )) o v fs
+    while read -r o v fs; do
+      o=$((o)); v=$((v)); fs=$((fs))
+      if [ "$va" -ge "$v" ] && [ "$va" -lt "$((v + fs))" ]; then
+        echo $(( o + va - v )); return 0
+      fi
+    done <<< "$LOADS"
+    return 1
+  }
+
+  # Symbol lookups are served from one filtered nm pass (created in the patch
+  # block below). The full demangled dump is ~564 MB — too big for a shell
+  # variable (bash holds it plus a here-string copy, and the OOM killer then
+  # takes verify down with 137) or a tmpfs file on a 4 GB host — so nm streams
+  # through awk and only the few dozen lines the checks need are kept.
+
+  check_bytes_va() { # <label> <va> <expected-hex>
+    local label=$1 va=$2 expected=$3 off got
+    if ! off=$(va2off "$va"); then
+      fail "$label: VA 0x$(printf %x "$va") is not in any PT_LOAD segment"
+      return
+    fi
+    # Read exactly as many bytes as expected has and compare in full: the
+    # length needs no pin and a short read can never match.
+    got=$(dd if="$CHROME" bs=1 skip="$off" \
+            count=$(( ${#expected} / 2 )) 2>/dev/null | od -An -tx1 | tr -d ' \n') || true
+    if [ "$got" = "$expected" ]; then
+      ok "$label"
+    else
+      fail "$label: bytes '$got' != '$expected' at file offset $off (VA 0x$(printf %x "$va"))"
+    fi
+  }
+
+  rel32_hex() { # <target-va> <next-instruction-va> -> 4 hex bytes
+    local v=$(( ($1 - $2) & 0xffffffff ))
+    printf '%02x%02x%02x%02x' \
+      $(( v & 255 )) $(( (v >> 8) & 255 )) $(( (v >> 16) & 255 )) $(( (v >> 24) & 255 ))
+  }
+
+  rela_addend() { # <r_offset-va> -> decimal addend; 1 when no RELATIVE record
+    local want got
+    want=$(printf '%016x' "$(( $1 ))")
+    got=$(LC_ALL=C readelf -rW "$CHROME" 2>/dev/null |
+      awk -v want="$want" 'tolower($1) == want && $3 == "R_X86_64_RELATIVE" { print $NF; exit }') || true
+    [ -n "$got" ] || return 1
+    [[ $got == 0x* ]] || got="0x$got"
+    printf '%d\n' "$((got))"
+  }
+
+  check_rela_addend() { # <label> <r_offset-va> <expected-addend>
+    local label=$1 slot=$2 expected=$(( $3 )) got
+    if ! got=$(rela_addend "$slot"); then
+      fail "$label: no R_X86_64_RELATIVE record at 0x$(printf %x "$slot")"
+      return
+    fi
+    if [ "$got" -eq "$expected" ]; then
+      ok "$label"
+    else
+      fail "$label: addend 0x$(printf %x "$got") != 0x$(printf %x "$expected") at slot 0x$(printf %x "$slot")"
+    fi
+  }
+
   if ! have nm || ! have objdump; then
     echo "  skip: nm/objdump not installed"
   else
-    read -r text_vma text_off < <(
-      LC_ALL=C objdump -h "$ASH_ROOT/dist/chrome/chrome" |
-        awk '$2==".text"{ print "0x"$4, "0x"$6 }') || true
-    if [ -z "${text_vma:-}" ]; then
-      # One clear failure instead of three confused ones: without .text the
-      # delta would be 0 and every patch would "mismatch" on its own.
-      fail ".text section not readable — GPU patch checks skipped"
+    # One nm pass, filtered to the symbols below. Keep this regex broad enough
+    # for every check_patch/sym_va call; the exact pattern is applied later
+    # against this small file.
+    SYM_CACHE=$(mktemp "${TMPDIR:-/tmp}/ash-verify-syms.XXXXXX")
+    nm -C "$CHROME" | awk '
+      /IsSharedImageFormatSupported|GetNativePixmapSupportType|NativePixmapEGLX11Binding::Create|PopulateMappableDrmFormatsForExo|OzonePlatformX11::InitializeUI|XkbEvdevCodes::XkbEvdevCodes|XkbKeyboardLayoutEngine::XkbKeyboardLayoutEngine|StubKeyboardLayoutEngine::Lookup|keyboard_layout_engine_|StubInputController::SetCurrentLayoutByName|StubInputController$|ShouldShowInLauncher|MediaSystemAppDelegate|SampleSystemAppDelegate|HelpAppSystemAppDelegate|CameraSystemAppDelegate|ProjectorSystemWebAppDelegate|MallSystemAppDelegate/ { print }
+    ' > "$SYM_CACHE" || true
+
+    # ENVIRON instead of awk -v: -v would eat the backslashes in \(...\) — the
+    # same trap build-chrome.sh documents. First match wins via !found.
+    sym_va() { # <sym-regex> -> 0x... or empty
+      local pattern=$1
+      SYM_PATTERN="$pattern" awk \
+        '!found && $0 ~ ENVIRON["SYM_PATTERN"] { print "0x"$1; found = 1 }' \
+        "$SYM_CACHE" || true
+    }
+
+    check_patch() { # <label> <sym-regex> <extra-offset> <expected-hex>
+      local va
+      va=$(sym_va "$2")
+      [ -n "$va" ] || { fail "$1: symbol not found"; return; }
+      check_bytes_va "$1" "$(( va + ${3:-0} ))" "$4"
+    }
+
+    # --- GPU: ozone X11 pixmap import -------------------------------------
+    # b8 01 00 00 00 c3 = mov $1,%eax; ret — the payload of patch 1.
+    check_patch "IsSharedImageFormatSupported -> true" \
+      ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(' \
+      0 b801000000c3
+    # b8 02 00 00 00 c3 = mov $2,%eax; ret — the payload of patch 2.
+    check_patch "GetNativePixmapSupportType -> kX11Pixmap" \
+      ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)' \
+      0 b802000000c3
+    # Patch 3: six NOPs over the `je` — Create+0x6e, right after the
+    # call gl::IsFormatSupported. The offset mirrors the pin in
+    # build-chrome.sh and the bytes are its payload: both scripts get
+    # updated together, and catching that they drifted apart is exactly
+    # what verify is for.
+    check_patch "NativePixmapEGLX11Binding::Create -> BGRX check dropped" \
+      ' t ui::NativePixmapEGLX11Binding::Create\(' \
+      0x6e 909090909090
+
+    # --- GPU: exo dmabuf format table -------------------------------------
+    pop_va=$(sym_va ' t gpu::gles2::PopulateMappableDrmFormatsForExo\(')
+    if [ -z "$pop_va" ]; then
+      fail "exo dmabuf patches: symbol not found"
     else
-      delta=$(( text_off - text_vma ))
+      # The SIF blob anchor is located by sif_blob_va() in common.sh — the
+      # same helper build-chrome.sh uses, so the two cannot drift apart.
+      sif_blob=$(sif_blob_va "$CHROME" "$pop_va") || true
+      if [ -z "$sif_blob" ]; then
+        fail "exo dmabuf candidates: no rip-relative movups load in PopulateMappableDrmFormatsForExo"
+      else
+        check_bytes_va "exo dmabuf candidates (RGBA_8888 -> BGRA_8888)" \
+          "$((sif_blob + 8))" 0100000002000000
+        check_bytes_va "exo dmabuf candidates (RGBX_8888 -> BGRX_8888)" \
+          "$((sif_blob + 16))" 010000000b000000
+      fi
+      # Both jne sites are function+0x81 / +0xd0; the patch turns each
+      # 2-byte jne into an unconditional 2-byte jmp with the same target.
+      check_bytes_va "exo dmabuf candidates (skip RGBA_F16)" \
+        "$((pop_va + 0x81))" eb13
+      check_bytes_va "exo dmabuf candidates (skip RGBA_1010102)" \
+        "$((pop_va + 0xd0))" eb13
+    fi
 
-      check_gpu_patch() { # <label> <sym-regex> <extra-offset> <expected-hex>
-        local va site off got expected=$4
-        # ENVIRON instead of awk -v: -v would eat the backslashes in
-        # \(...\) — the same trap build-chrome.sh documents. No early exit
-        # in awk: it would SIGPIPE nm and pipefail/set -e would kill the
-        # script with 141. First match wins via !found. `|| true` keeps a
-        # dead nm from aborting verify — it surfaces as the FAIL below.
-        va=$(nm -C "$ASH_ROOT/dist/chrome/chrome" | SYM_PATTERN="$2" \
-             awk '!found && $0 ~ ENVIRON["SYM_PATTERN"] { print "0x"$1; found = 1 }') || true
-        [ -n "$va" ] || { fail "$1: symbol not found"; return; }
-        site=$(( va + ${3:-0} ))
-        off=$(( site + delta ))
-        # Read exactly as many bytes as expected has and compare in full:
-        # the length needs no pin and a short read can never match.
-        got=$(dd if="$ASH_ROOT/dist/chrome/chrome" bs=1 skip="$off" \
-                count=$(( ${#expected} / 2 )) 2>/dev/null | od -An -tx1 | tr -d ' \n') || true
-        if [ "$got" = "$expected" ]; then
-          ok "$1"
+    # --- keyboard layout: real Xkb engine + forwarding thunk --------------
+    ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(')
+    evdev_va=$(sym_va ' t ui::XkbEvdevCodes::XkbEvdevCodes\(\)')
+    kbengine_va=$(sym_va ' t ui::XkbKeyboardLayoutEngine::XkbKeyboardLayoutEngine\(ui::XkbKeyCodeConverter const&\)')
+    if [ -z "$ui_va" ] || [ -z "$evdev_va" ] || [ -z "$kbengine_va" ]; then
+      fail "keyboard layout patches: symbol(s) not found"
+    else
+      check_bytes_va "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
+        "$((ui_va + 0x1af))" d8
+      engine_site=$(( ui_va + 0x1b8 ))
+      engine_expected="488db8c80000004989c6e8$(rel32_hex "$evdev_va" $((engine_site + 15)))4c89f7498db6c8000000e8$(rel32_hex "$kbengine_va" $((engine_site + 30)))4c8973204c89f7"
+      check_bytes_va "OzonePlatformX11::InitializeUI (real Xkb engine)" \
+        "$engine_site" "$engine_expected"
+    fi
+
+    lookup_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::Lookup\(')
+    ke_va=$(sym_va ' b ui::KeyboardLayoutEngineManager::keyboard_layout_engine_')
+    fallback_va=$(sym_va ' t ui::StubInputController::SetCurrentLayoutByName\(')
+    sctrl_vt=$(sym_va ' vtable for ui::StubInputController$')
+    if [ -z "$lookup_va" ] || [ -z "$ke_va" ] || [ -z "$fallback_va" ]; then
+      fail "keyboard layout thunk: symbol(s) not found"
+    else
+      lookup_expected="488b05$(rel32_hex "$ke_va" $((lookup_va + 7)))4885c074094889c7488b00ff6020e9$(rel32_hex "$fallback_va" $((lookup_va + 26)))"
+      check_bytes_va "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
+        "$lookup_va" "$lookup_expected"
+    fi
+    if [ -z "$sctrl_vt" ]; then
+      fail "StubInputController vtable not found"
+    elif [ -n "$lookup_va" ]; then
+      check_rela_addend "StubInputController::SetCurrentLayoutByName -> thunk" \
+        "$((sctrl_vt + 0x90))" "$lookup_va"
+    fi
+
+    # --- hide demo system web apps from the launcher ----------------------
+    swa_false=$(sym_va ' t EcheSystemAppDelegate::ShouldShowInLauncher\(\) const')
+    if [ -z "$swa_false" ]; then
+      fail "hide SWA from launcher: return-false symbol not found"
+    else
+      swa_vtables=(
+        "Галерея (media-app)|vtable for MediaSystemAppDelegate$"
+        "Sample System Web App|vtable for SampleSystemAppDelegate$"
+        "Возможности (help-app)|vtable for ash::HelpAppSystemAppDelegate$"
+        "Камера (camera-app)|vtable for CameraSystemAppDelegate$"
+        "Скринкаст (projector)|vtable for ProjectorSystemWebAppDelegate$"
+        "Игры и приложения (mall)|vtable for MallSystemAppDelegate$"
+      )
+      for entry in "${swa_vtables[@]}"; do
+        name=${entry%%|*}
+        pattern=${entry#*|}
+        vt=$(sym_va "$pattern")
+        if [ -z "$vt" ]; then
+          fail "hide SWA from launcher: $name: vtable not found"
         else
-          fail "$1: bytes '$got' != '$expected' at file offset $off (VA 0x$(printf %x "$site"))"
+          check_rela_addend "hide SWA from launcher: $name" \
+            "$((vt + 0x60))" "$swa_false"
         fi
-      }
-
-      # b8 01 00 00 00 c3 = mov $1,%eax; ret — the payload of patch 1.
-      check_gpu_patch "IsSharedImageFormatSupported -> true" \
-        ' t ui::NativePixmapEGLX11Binding::IsSharedImageFormatSupported\(' \
-        0 b801000000c3
-      # b8 02 00 00 00 c3 = mov $2,%eax; ret — the payload of patch 2.
-      check_gpu_patch "GetNativePixmapSupportType -> kX11Pixmap" \
-        ' t ui::\(anonymous namespace\)::GetNativePixmapSupportType\(\)' \
-        0 b802000000c3
-      # Patch 3: six NOPs over the `je` — Create+0x6e, right after the
-      # call gl::IsFormatSupported. The offset mirrors the pin in
-      # build-chrome.sh and the bytes are its payload: both scripts get
-      # updated together, and catching that they drifted apart is exactly
-      # what verify is for.
-      check_gpu_patch "NativePixmapEGLX11Binding::Create -> BGRX check dropped" \
-        ' t ui::NativePixmapEGLX11Binding::Create\(' \
-        0x6e 909090909090
+      done
     fi
   fi
 
