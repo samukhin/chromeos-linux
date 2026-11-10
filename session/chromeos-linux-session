@@ -273,6 +273,12 @@ setup_display_auth
 export DISPLAY="${DISPLAY:-:0}"
 export XAUTHORITY=/tmp/ash-xauth
 export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+# Crash dumps land in <DIR_CONFIG_DIR>/chromium/Crash Reports. Before login
+# ChromeOS resolves the home directory to "/", so that becomes
+# /.config/chromium/Crash Reports — not creatable by a normal user — and
+# crashpad logs "mkdir : No such file or directory", starting up without a
+# database. Anchor the config base inside the writable profile instead.
+export CHROME_CONFIG_HOME="$PROFILE/.config"
 log "runtime=$XDG_RUNTIME_DIR display=$DISPLAY profile=$PROFILE"
 
 # Reap Chrome/compositor/Xorg(ours) on any teardown path — a plain `kill` of

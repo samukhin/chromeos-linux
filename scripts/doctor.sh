@@ -124,12 +124,10 @@ fi
 
 # Timezone: Ash reads /var/lib/timezone/localtime (ChromeOS path); without it
 # the shelf clock silently shows America/Los_Angeles. Cosmetic, so a soft WARN.
-if [ -e /etc/localtime ]; then
-  if [ -L /var/lib/timezone/localtime ] && [ -e /var/lib/timezone/localtime ]; then
-    ps_ok "timezone" "/var/lib/timezone/localtime -> $(readlink -f /var/lib/timezone/localtime 2>/dev/null)"
-  else
-    printf '  WARN    %-14s no /var/lib/timezone/localtime (shelf clock falls back to America/Los_Angeles)  -> sudo ./scripts/setup-system.sh\n' "timezone"
-  fi
+if [ -L /var/lib/timezone/localtime ] && [ -e /var/lib/timezone/localtime ]; then
+  ps_ok "timezone" "/var/lib/timezone/localtime -> $(readlink -f /var/lib/timezone/localtime 2>/dev/null)"
+else
+  printf '  WARN    %-14s no /var/lib/timezone/localtime (shelf clock falls back to America/Los_Angeles)  -> sudo ./scripts/setup-system.sh\n' "timezone"
 fi
 
 # systemd-logind: the tray's suspend/reboot and session teardown depend on it.
