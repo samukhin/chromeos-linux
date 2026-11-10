@@ -6,7 +6,13 @@
 # derivation): the binary patches fail loudly when the binary no longer
 # matches, and nothing is patchelf'ed — the snapshot already uses
 # /lib64/ld-linux-x86-64.so.2 and RUNPATH=$ORIGIN, so it runs on a stock
-# userspace as-is, with libdisplayfix.so injected by the launcher.
+# userspace as-is.
+#
+# This branch targets Ash directly on DRM/KMS (--ozone-platform=drm). The
+# X11-only patches (DisplayConfigurator::Init, RunPendingConfiguration,
+# HasInternalDisplay, the X11 keyboard engine and the XEvent key fix) are
+# deliberately NOT applied: on DRM the native display delegate must be
+# installed and the real KMS configuration must run.
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -145,14 +151,11 @@ done < <(grep -Fboa "'wasm-unsafe-eval'" "$CHROME" || true)
 DELTA=$(text_delta)
 [ -n "$DELTA" ] || die ".text section not found in $CHROME"
 
-# The libc++ ABI namespace demangles as `std::Cr` here and `std::__Cr` in
-# later snapshots, so keep the namespace out of the pattern. The checked
-# bytes are `cmpb $0,0x21(%rdi) / je +0x38` plus the next opcode; the patch
-# turns that conditional skip into an unconditional jump to the same target
-# (Init+0x4b, the delegate-cleanup epilogue).
-va=$(sym_va ' display::DisplayConfigurator::Init\(std::.*unique_ptr<display::NativeDisplayDelegate')
-verify_and_patch "DisplayConfigurator::Init (skip native display config)" \
-  "$(va_to_offset "$va" "$DELTA" 13)" "807f2100743848" '\351\071\000\000\000\220\220'
+# DisplayConfigurator::Init and RunPendingConfiguration are intentionally left
+# untouched: on DRM, Shell::InitializeDisplayManager() hands the configurator a
+# DrmNativeDisplayDelegate, ForceInitialConfigure() calls its Initialize(), and
+# the real KMS modeset must run. The X11 branch used to patch both of them out
+# because the X11 delegate is null.
 
 # Only newer snapshots have WaylandDmabufFeedbackManager, so on an older
 # binary there is no dmabuf probing to disable.
@@ -165,10 +168,6 @@ else
   echo "skipped WaylandDmabufFeedbackManager patch (symbol not in this snapshot)"
 fi
 
-va=$(sym_va ' display::DisplayConfigurator::RunPendingConfiguration\(\)')
-verify_and_patch "RunPendingConfiguration (no-op)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\303'
-
 va=$(sym_va ' ash::RedirectChromeLogging\(base::CommandLine const&\)')
 verify_and_patch "RedirectChromeLogging (no-op)" \
   "$(va_to_offset "$va" "$DELTA")" "55" '\303'
@@ -178,86 +177,6 @@ verify_and_patch "RedirectChromeLogging (no-op)" \
 va=$(sym_va ' (chromeos|ash)::mojo_service_manager::.*::OnDisconnect\(')
 verify_and_patch "OnDisconnect (no-op)" \
   "$(va_to_offset "$va" "$DELTA")" "55" '\303'
-
-va=$(sym_va ' display::HasInternalDisplay\(\)' soft)
-verify_and_patch "HasInternalDisplay (returns true)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\260\001\303' soft
-
-# --- keyboard layout engine (RU/EN quick-settings chip drives typing) -------
-# OzonePlatformX11::InitializeUI registers StubKeyboardLayoutEngine, whose
-# Lookup always falls back to the hardcoded US layout, and the input
-# controller's SetCurrentLayoutByName is a no-op stub — so switching RU/EN
-# in Ash quick settings only moved the tray indicator. Mirror what
-# OzonePlatformDrm does instead: build an XkbEvdevCodes converter plus a
-# real XkbKeyboardLayoutEngine in one block, hand it to
-# KeyboardLayoutEngineManager, and forward the input controller's
-# SetCurrentLayoutByName through a thunk to the registered engine.
-
-ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(')
-
-# new[] size for the combined block: XkbKeyboardLayoutEngine (0xc8, same as
-# the DRM platform) + XkbEvdevCodes converter (0x10) = 0xd8, was 0x20. The
-# immediate is the second byte of `mov $0x20,%edi` at +333.
-verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 334)" "20" '\330'
-
-# Replace the StubKeyboardLayoutEngine construction with:
-#   lea 0xc8(%rax),%rdi / mov %rax,%rbx / call XkbEvdevCodesC1 /
-#   mov %rbx,%rdi / lea 0xc8(%rbx),%rsi / call XkbKeyboardLayoutEngineC1 /
-#   mov %rbx,0x20(%r14) / mov %rbx,%rdi
-# then falls through into the existing SetKeyboardLayoutEngine call. This
-# snapshot keeps the fresh engine in %rbx and `this` in %r14 (the 1670871
-# build had them the other way round), which is why the registers below
-# differ from that revision's patch.
-verify_and_patch "OzonePlatformX11::InitializeUI (real Xkb engine)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 343)" \
-  "4889c34889c7e88e9bea03498b7e2049895e204885ff740a488b07ff5008498b5e204889df" \
-  '\110\215\270\310\000\000\000\110\211\303\350\204\234\352\003\110\211\337\110\215\263\310\000\000\000\350\251\234\352\003\111\211\136\040\110\211\337'
-
-# Overwrite the (now dead) StubKeyboardLayoutEngine::Lookup with a thunk
-# for StubInputController::SetCurrentLayoutByName(name):
-#   load keyboard_layout_engine_; when set, tail-jump to
-#   engine->SetCurrentLayoutByName (vptr+0x18, identical signature), else
-#   jump back into the original stub body. The stub engine is no longer
-#   constructed after the patch above, so its Lookup is unreachable.
-lookup_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::Lookup\(')
-verify_and_patch "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
-  "$(va_to_offset "$lookup_va" "$DELTA")" \
-  "554889e5488b47084c8b4f10" \
-  '\110\213\005\167\013\310\005\110\205\300\164\011\110\211\307\110\213\000\377\140\030\351\334\246\303\373'
-
-# Redirect the StubInputController vtable slot (vptr+0x68 — the 14th entry
-# of ui::InputController, verified against InputControllerEvdev, whose
-# SetCurrentLayoutByName has a body of its own — .rela.dyn entry for
-# 0xe0b1eb0, R_X86_64_RELATIVE addend 0x483ca20) to the thunk: verify the
-# whole 24-byte relocation, write it with the new addend (thunk VA
-# 0x8c0232a, this snapshot's StubKeyboardLayoutEngine::Lookup).
-verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
-  "$((0x710270))" \
-  "b01e0b0e00000000080000000000000020ca830400000000" \
-  '\260\036\013\016\000\000\000\000\010\000\000\000\000\000\000\000\052\043\300\010\000\000\000\000'
-
-# --- key press crash fix ----------------------------------------------------
-#
-# ui::(anonymous namespace)::GetEventPropertiesFromXEvent(type, event):
-# for key types (7/8) it does `cmpl $0x36,0x4(%rdx)` (event is a core
-# KeyPress/KeyRelease?) and, when the tag differs, falls into
-#   xor %eax,%eax ; mov %rax,-0x48(%rbp) ; mov 0x20(%rax),%ebx
-# i.e. dereferences NULL+0x20 -> SEGV. The original ChromeOS X server only
-# delivered core key events (tag 0x36), so that branch was dead upstream;
-# a modern Xorg delivers XI2 DeviceEvents (tag 0x1f) and every key press
-# crashes Chrome ("Received signal 11 SEGV_MAPERR ... 000000000020").
-#
-# Retarget the `jne 8baf832` (75 22) to `jne 8baf816` (75 06): a foreign
-# tag then lands on `cmp $6,%esi / jne <tail>`, and key types 7/8 skip to
-# the function tail, returning an empty properties map — the same thing
-# the neighboring helpers do for events they don't recognize. Key events
-# themselves are built before this call, so nothing else changes.
-props_va=$(sym_va ' t ui::\(anonymous namespace\)::GetEventPropertiesFromXEvent\(')
-verify_and_patch "GetEventPropertiesFromXEvent (XI2 key events -> empty props)" \
-  "$(va_to_offset "$props_va" "$DELTA" 46)" \
-  "7522" \
-  '\165\006'
 
 # --- wayland damage freeze fix ------------------------------------------------
 #
@@ -417,30 +336,15 @@ exec "$(dirname "$0")/chrome_crashpad_handler.real" "$@"
 CWRAP
 chmod +x "$OUT/chrome_crashpad_handler"
 
-# --- libdisplayfix + launcher ---------------------------------------------
-
-"${CC:-cc}" -shared -fPIC -Wl,-soname,libdisplayfix.so \
-  -o "$OUT/libdisplayfix.so" "$ASH_ROOT/scripts/displayfix.c"
+# --- launcher --------------------------------------------------------------
 
 cat > "$OUT/chromeos-ash" <<'WRAP'
 #!/usr/bin/env bash
 # Launcher for the patched Ash Chrome binary.
+#
+# DRM mode: Ash owns the KMS display itself, so there is no DISPLAY or
+# XAUTHORITY to set up here. The session script passes --ozone-platform=drm.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Ash is a ChromeOS build: it expects a live X display and a readable cookie.
-if [ -z "${DISPLAY:-}" ]; then
-  export DISPLAY=:0
-fi
-if [ -z "${XAUTHORITY:-}" ] || [ ! -r "${XAUTHORITY:-}" ]; then
-  if [ -r /tmp/ash-xauth ]; then
-    export XAUTHORITY=/tmp/ash-xauth
-  fi
-fi
-
-# The shim back-fills DISPLAY/XAUTHORITY for processes that bypass this
-# wrapper (Chrome re-execs). It is a no-op when the environment is sane.
-export LD_PRELOAD="$HERE/libdisplayfix.so${LD_PRELOAD:+:$LD_PRELOAD}"
-
 exec "$HERE/chrome" "$@"
 WRAP
 chmod +x "$OUT/chromeos-ash"

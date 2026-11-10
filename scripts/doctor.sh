@@ -23,7 +23,7 @@ check ninja         "sommelier build"              ninja-build      ninja
 check pkg-config    "sommelier build"              pkg-config       pkgconf
 check wayland-scanner "sommelier build"            libwayland-bin   wayland
 check python3       "sommelier patches"            python3          python
-check gcc           "libdisplayfix.so"             build-essential  base-devel
+check gcc           "libminigbm.so shim"           build-essential  base-devel
 check gawk          "chrome binary patches"        gawk             gawk
 check nm            "chrome binary patches"        binutils         binutils
 check objdump       "chrome binary patches"        binutils         binutils
@@ -40,10 +40,7 @@ fi
 
 echo "== runtime =="
 check Xwayland      "X11 apps inside Ash"          xwayland         xorg-xwayland
-check xrandr        "screen bounds / brightness"   x11-xserver-utils xorg-xrandr
 check xrdb          "terminal colors"              x11-xserver-utils xorg-xrdb
-check xhost         "X access fallback"            x11-xserver-utils xorg-xhost
-check xauth         "X cookies"                    xauth            xorg-xauth
 check pactl         "CRAS volume control"          pulseaudio-utils libpulse
 check systemctl     "suspend/reboot from tray"     systemd          systemd
 check rsvg-convert  "launcher icons (SVG)"         librsvg2-bin     librsvg
@@ -71,6 +68,75 @@ else
   status=1
 fi
 
+ps_ok()   { printf '  ok      %-14s %s\n' "$1" "$2"; }
+ps_miss() { printf '  MISSING %-14s %s  -> %s\n' "$1" "$2" "$3"; status=1; }
+
+# DRM preflight: this branch runs Ash directly on KMS (--ozone-platform=drm),
+# so the display, input and udev side must be usable by the current user. These
+# are the failure modes that otherwise only show up as a black screen with a
+# single line in ash.log.
+echo "== DRM preflight =="
+
+ASH_DRM_CARD="${ASH_DRM_CARD:-/dev/dri/card0}"
+
+if [ -e "$ASH_DRM_CARD" ] && [ -r "$ASH_DRM_CARD" ] && [ -w "$ASH_DRM_CARD" ]; then
+  ps_ok "drm card" "$ASH_DRM_CARD readable/writable"
+elif [ -e "$ASH_DRM_CARD" ]; then
+  ps_miss "drm card" "$ASH_DRM_CARD not readable/writable by $(id -un)" \
+          "add $(id -un) to the video group and re-login"
+else
+  ps_miss "drm card" "$ASH_DRM_CARD missing (no graphics driver?)" \
+          "check dmesg / the kernel module (vmwgfx, i915, amdgpu, ...)"
+fi
+
+ev_found=0
+for ev in /dev/input/event*; do
+  [ -e "$ev" ] || continue
+  if [ -r "$ev" ]; then ev_found=1; break; fi
+done
+if [ "$ev_found" = 1 ]; then
+  ps_ok "input events" "readable /dev/input/event* present"
+else
+  ps_miss "input events" "no readable /dev/input/event*" \
+          "add $(id -un) to the input group and re-login"
+fi
+
+if [ -e /run/udev/control ]; then
+  ps_ok "udev" "systemd-udevd is running"
+else
+  ps_miss "udev" "/run/udev/control missing (DeviceManagerUdev cannot enumerate)" \
+          "systemctl status systemd-udevd"
+fi
+
+if [ -f /etc/lsb-release ] && grep -qs '^CHROMEOS_RELEASE_NAME=' /etc/lsb-release; then
+  ps_ok "lsb-release" "ChromeOS mode (IsRunningAsSystemCompositor)"
+else
+  ps_miss "lsb-release" "not in ChromeOS mode — DisplayConfigurator stays idle" \
+          "sudo ./scripts/setup-system.sh"
+fi
+
+# Another compositor holding DRM master would make Chrome's modeset fail.
+holders=""
+for c in niri Xorg X sway Hyprland weston gnome-shell kwin_wayland; do
+  pgrep -x "$c" >/dev/null 2>&1 && holders="$holders $c"
+done
+if [ -z "$holders" ]; then
+  ps_ok "drm master" "no known compositor running"
+else
+  ps_miss "drm master" "running:$holders (likely hold DRM master)" \
+          "stop them and start the session from a free VT"
+fi
+
+if command -v fuser >/dev/null 2>&1; then
+  users="$(fuser "$ASH_DRM_CARD" 2>/dev/null || true)"
+  if [ -z "$users" ]; then
+    ps_ok "card holders" "$ASH_DRM_CARD is not open"
+  else
+    printf '  WARN    %-14s %s already open by pid(s):%s\n' \
+           "card holders" "$ASH_DRM_CARD" "$users"
+  fi
+fi
+
 # Session preflight: durable runtime STATE that decides whether the session
 # actually works, as opposed to "is the tool installed". These are the silent
 # failure modes — everything builds and starts, but the launcher refuses to
@@ -78,9 +144,6 @@ fi
 # creates the first four; a green doctor here means the session will work.
 
 echo "== session preflight =="
-
-ps_ok()   { printf '  ok      %-14s %s\n' "$1" "$2"; }
-ps_miss() { printf '  MISSING %-14s %s  -> %s\n' "$1" "$2" "$3"; status=1; }
 
 # Crostini gate: Chrome stats /dev/kvm at session start and, if absent, refuses
 # EVERY Linux app launch with "Virtualization is not supported on this device"
@@ -141,9 +204,10 @@ fi
 #
 # is-active alone is NOT enough: a bus restart drops logind's connection while
 # the unit stays 'active', and logind only claims org.freedesktop.login1 when it
-# (re)connects. Name-less logind = Xorg's TakeControl/TakeDevice call gets no
-# reply, it falls back to opening /dev/tty1 directly and dies with
-# 'Cannot open virtual console 1 (Permission denied)'. So check the name owner.
+# (re)connects. In DRM mode logind is not what takes the VT (Chrome opens
+# /dev/dri/card0 itself), but an active logind session still provides the
+# uaccess ACLs for the card and input nodes, and the tray's suspend/reboot goes
+# through it. So check the name owner.
 if command -v systemctl >/dev/null 2>&1; then
   if ! systemctl is-active --quiet systemd-logind 2>/dev/null; then
     ps_miss "logind" "systemd-logind NOT active (suspend/reboot/tray dead)" \
@@ -151,7 +215,7 @@ if command -v systemctl >/dev/null 2>&1; then
   elif command -v busctl >/dev/null 2>&1 &&
        ! busctl call org.freedesktop.DBus /org/freedesktop/DBus \
          org.freedesktop.DBus GetNameOwner s org.freedesktop.login1 >/dev/null 2>&1; then
-    ps_miss "logind" "active but owns no D-Bus name (Xorg cannot take the VT)" \
+    ps_miss "logind" "active but owns no D-Bus name (suspend/reboot/tray dead)" \
             "sudo ./scripts/setup-system.sh  (restarts logind) or: sudo systemctl restart systemd-logind"
   else
     ps_ok "logind" "systemd-logind active and owns the bus name"
@@ -159,10 +223,10 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 # Bridges: only meaningful while a session is actually up. Gate on the session
-# script itself rather than a hardcoded /tmp/.X11-unix/X0 socket — startx picks
-# the first FREE display, so a real session can land on :1 and the X0 probe
-# would silently skip this check. Not a setup-system.sh artefact (start-session.sh
-# launches them), so this stays a soft signal that never fails a fresh machine.
+# script itself rather than a display socket — in DRM mode there is no X socket
+# at all, and an inherited $DISPLAY must not confuse the probe. Not a
+# setup-system.sh artefact (start-session.sh launches them), so this stays a
+# soft signal that never fails a fresh machine.
 if pgrep -f 'session/chromeos-linux-session' >/dev/null 2>&1; then
   for name in shill cras session crostini rmad power; do
     if pgrep -f "dist/bin/${name}-bridge" >/dev/null 2>&1; then

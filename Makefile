@@ -1,8 +1,8 @@
 # chromeos-linux without Nix: fetch, build, and (optionally) verify.
 #
-#   make            # chrome + sommelier + bridges
+#   make            # chrome (DRM/KMS) + sommelier + bridges
 #   make fetch      # download the pinned ChromiumOS Chrome snapshot
-#   make verify     # ldd/readelf sanity checks on everything we built
+#   make verify     # ldd/readelf/byte sanity checks on everything we built
 #
 # System integration (D-Bus policy, directories, lsb-release) is a separate,
 # explicit root step: sudo ./scripts/setup-system.sh

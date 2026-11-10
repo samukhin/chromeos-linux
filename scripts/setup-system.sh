@@ -55,13 +55,13 @@ ensure_polkit() {
   note "started polkit (it was not running)"
 }
 
-# systemd-logind must OWN org.freedesktop.login1 on the system bus: Xorg asks
-# logind (TakeControl/TakeDevice) for the VT, and with no reply it falls back to
-# opening /dev/tty1 directly — Permission denied for a non-root user, so startx
-# dies with 'Cannot open virtual console 1'. A bus restart drops logind's
-# connection while the unit stays 'active', and logind only claims the name when
-# it (re)connects — so is-active passes while Xorg cannot start. Restarting the
-# unit makes it reattach and re-own the name.
+# systemd-logind should OWN org.freedesktop.login1 on the system bus. In DRM
+# mode Chrome opens /dev/dri/card0 itself and does not ask logind for the VT,
+# but the active logind session is what grants uaccess ACLs on the card and
+# input nodes, and the tray's suspend/reboot goes through it. A bus restart
+# drops logind's connection while the unit stays 'active', and logind only
+# claims the name when it (re)connects — so is-active passes while the name is
+# gone. Restarting the unit makes it reattach and re-own the name.
 ensure_logind() {
   if ! command -v systemctl >/dev/null 2>&1 || ! [ -d /run/systemd/system ]; then
     return 0
@@ -72,7 +72,7 @@ ensure_logind() {
     org.freedesktop.DBus GetNameOwner s org.freedesktop.login1 >/dev/null 2>&1 && return 0
   note "systemd-logind is active but owns no D-Bus name — restarting it"
   systemctl restart systemd-logind.service >/dev/null 2>&1 ||
-    note "WARNING: could not restart systemd-logind — Xorg will fail to open the VT"
+    note "WARNING: could not restart systemd-logind — uaccess ACLs for /dev/dri may be missing"
 }
 
 POLICY_SRC="$ASH_ROOT/session/dbus-policies/chromeos-bridges.conf"
@@ -271,6 +271,7 @@ if [ "$MOJO" = "1" ]; then
     "CHROMEOS_RELEASE_DESCRIPTION=Chrome OS (chromeos-linux)"
   )
 else
+  note "WARNING: --no-mojo omits CHROMEOS_RELEASE_NAME; DRM mode needs it (IsRunningAsSystemCompositor) and the screen will stay black"
   keys=(
     "DEVICETYPE=CHROMEBOOK"
     "CHROMEOS_RELEASE_DESCRIPTION=Chrome OS (chromeos-linux)"
@@ -329,8 +330,9 @@ fi
 # wedges logind as soon as something needs authorization.
 ensure_polkit
 
-# And leave logind actually able to answer: Xorg needs it to take the VT, so a
-# logind that is 'active' but name-less on the bus breaks the session start.
+# And leave logind actually able to answer: it provides the uaccess ACLs for
+# /dev/dri/card0 and /dev/input/* and handles the tray's suspend/reboot, so a
+# logind that is 'active' but name-less on the bus breaks parts of the session.
 ensure_logind
 
 cat <<EOF
