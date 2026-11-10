@@ -22,11 +22,30 @@ const (
 	crasIface   = "org.chromium.cras.Control"
 )
 
+// Node IDs are fixed by the fake node list below. Chrome picks the headphone
+// node as the active output on startup and tells us about it with
+// SetActiveOutputNode; we must remember that choice, because the signal we
+// emit later has to name the same node — otherwise Chrome logs
+// "Active output node changed unexpectedly".
+const (
+	speakerNodeID   uint64 = 0x0001_0000_0001
+	headphoneNodeID uint64 = 0x0002_0000_0001
+	micNodeID       uint64 = 0x0001_0000_0002
+)
+
 type audioState struct {
-	volume      int32
-	outputMuted bool
-	inputGain   int32
-	inputMuted  bool
+	volume       int32
+	outputMuted  bool
+	inputGain    int32
+	inputMuted   bool
+	activeOutput uint64
+	activeInput  uint64
+	// Whether Chrome has actually told us its choice. The 5-second
+	// "initial" signal must not announce a default we merely guessed:
+	// after a bridge restart Chrome keeps its own active node, and
+	// contradicting it produces the very warning this code avoids.
+	outputSet bool
+	inputSet  bool
 }
 
 type crasControl struct {
@@ -43,11 +62,27 @@ func (c *crasControl) GetVolumeState() (int32, bool, int32, bool, bool, *dbus.Er
 
 func (c *crasControl) SetActiveOutputNode(nodeID uint64) *dbus.Error {
 	log.Printf("SetActiveOutputNode: 0x%x", nodeID)
+	c.mu.Lock()
+	changed := c.st.activeOutput != nodeID
+	c.st.activeOutput = nodeID
+	c.st.outputSet = true
+	c.mu.Unlock()
+	if changed {
+		c.conn.Emit(crasPath, crasIface+".ActiveOutputNodeChanged", nodeID)
+	}
 	return nil
 }
 
 func (c *crasControl) SetActiveInputNode(nodeID uint64) *dbus.Error {
 	log.Printf("SetActiveInputNode: 0x%x", nodeID)
+	c.mu.Lock()
+	changed := c.st.activeInput != nodeID
+	c.st.activeInput = nodeID
+	c.st.inputSet = true
+	c.mu.Unlock()
+	if changed {
+		c.conn.Emit(crasPath, crasIface+".ActiveInputNodeChanged", nodeID)
+	}
 	return nil
 }
 
@@ -299,17 +334,21 @@ func makeNode(id uint64, isInput bool, nodeType, name, deviceName string, active
 	}
 }
 
-func defaultNodes() []map[string]dbus.Variant {
+// nodes returns the node list with the Active flag matching the node Chrome
+// selected via SetActiveOutputNode/SetActiveInputNode.
+func (c *crasControl) nodes() []map[string]dbus.Variant {
+	c.mu.RLock()
+	activeOut, activeIn := c.st.activeOutput, c.st.activeInput
+	c.mu.RUnlock()
 	return []map[string]dbus.Variant{
-		makeNode(0x0001_0000_0001, false, "INTERNAL_SPEAKER", "Speaker", "Internal Speaker", true, 100),
-		makeNode(0x0002_0000_0001, false, "HEADPHONE", "Headphone", "Headphone Jack", false, 100),
-		makeNode(0x0001_0000_0002, true, "INTERNAL_MIC", "Internal Mic", "Internal Microphone", true, 50),
+		makeNode(speakerNodeID, false, "INTERNAL_SPEAKER", "Speaker", "Internal Speaker", activeOut == speakerNodeID, 100),
+		makeNode(headphoneNodeID, false, "HEADPHONE", "Headphone", "Headphone Jack", activeOut == headphoneNodeID, 100),
+		makeNode(micNodeID, true, "INTERNAL_MIC", "Internal Mic", "Internal Microphone", activeIn == micNodeID, 50),
 	}
 }
 
-func makeGetNodesHandler() any {
-	nodes := defaultNodes()
-	n := len(nodes)
+func makeGetNodesHandler(ctrl *crasControl) any {
+	const n = 3
 
 	outTypes := make([]reflect.Type, n+1)
 	mapType := reflect.TypeOf(map[string]dbus.Variant(nil))
@@ -321,7 +360,8 @@ func makeGetNodesHandler() any {
 	funcType := reflect.FuncOf(nil, outTypes, false)
 
 	return reflect.MakeFunc(funcType, func(args []reflect.Value) []reflect.Value {
-		log.Printf("GetNodes called (reflect), returning %d nodes", n)
+		nodes := ctrl.nodes()
+		log.Printf("GetNodes called (reflect), returning %d nodes", len(nodes))
 		results := make([]reflect.Value, n+1)
 		for i := range n {
 			results[i] = reflect.ValueOf(nodes[i])
@@ -360,7 +400,12 @@ func main() {
 	}
 	defer conn.Close()
 
-	st := audioState{volume: 75, inputGain: 50}
+	st := audioState{
+		volume:       75,
+		inputGain:    50,
+		activeOutput: speakerNodeID,
+		activeInput:  micNodeID,
+	}
 	if vol, muted, ok := pactlVolume(); ok {
 		st.volume = vol
 		st.outputMuted = muted
@@ -371,7 +416,7 @@ func main() {
 
 	ctrl := &crasControl{conn: conn, st: st}
 	methods := crasMethods(ctrl)
-	methods["GetNodes"] = makeGetNodesHandler()
+	methods["GetNodes"] = makeGetNodesHandler(ctrl)
 	if err := conn.ExportMethodTable(methods, crasPath, crasIface); err != nil {
 		log.Fatalf("export methods: %v", err)
 	}
@@ -412,10 +457,19 @@ func main() {
 
 	go func() {
 		time.Sleep(5 * time.Second)
-		log.Printf("Emitting NodesChanged signal")
+		ctrl.mu.RLock()
+		activeOutput, activeInput := ctrl.st.activeOutput, ctrl.st.activeInput
+		outputSet, inputSet := ctrl.st.outputSet, ctrl.st.inputSet
+		ctrl.mu.RUnlock()
+		log.Printf("Emitting NodesChanged signal (active output=0x%x set=%v input=0x%x set=%v)",
+			activeOutput, outputSet, activeInput, inputSet)
 		conn.Emit(crasPath, crasIface+".NodesChanged")
-		conn.Emit(crasPath, crasIface+".ActiveOutputNodeChanged", uint64(0x100000001))
-		conn.Emit(crasPath, crasIface+".ActiveInputNodeChanged", uint64(0x100000002))
+		if outputSet {
+			conn.Emit(crasPath, crasIface+".ActiveOutputNodeChanged", activeOutput)
+		}
+		if inputSet {
+			conn.Emit(crasPath, crasIface+".ActiveInputNodeChanged", activeInput)
+		}
 	}()
 
 	quit := make(chan os.Signal, 1)

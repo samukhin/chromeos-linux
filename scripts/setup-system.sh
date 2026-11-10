@@ -121,6 +121,12 @@ if [ "$UNDO" = "1" ]; then
     mv -f "$LSB_BAK" "$LSB"
     note "restored $LSB"
   fi
+  # Only drop the TZ link if it is a symlink (never touch a real file/dir).
+  if [ -L /var/lib/timezone/localtime ]; then
+    rm -f /var/lib/timezone/localtime
+    note "removed /var/lib/timezone/localtime"
+  fi
+  rmdir /var/lib/timezone 2>/dev/null || true
   apply_dbus_policy
   note "removed policy, tmpfiles, stubs"
   exit 0
@@ -212,15 +218,61 @@ fi
 mkdir -p "/var/lib/ash-profile/test-user"
 chown -R "$TARGET_USER:users" /var/lib/ash-profile
 
+# --- timezone ---------------------------------------------------------------
+# Ash reads its TZ from the /var/lib/timezone/localtime symlink (ChromeOS keeps
+# it next to /etc/localtime). Without it Chrome logs
+# "Cannot read timezone symlink /var/lib/timezone/localtime" and silently
+# falls back to America/Los_Angeles, so the shelf clock is wrong.
+#
+# Not every distro has /etc/localtime (this host doesn't), so work down a list
+# of candidates and use the first zoneinfo file that actually exists.
+tz_target=''
+if [ -e /etc/localtime ]; then
+  tz_target=$(readlink -f /etc/localtime)
+elif [ -s /etc/timezone ]; then
+  tz_name=$(tr -d '[:space:]' < /etc/timezone)
+  if [ -n "$tz_name" ] && [ -e "/usr/share/zoneinfo/$tz_name" ]; then
+    tz_target="/usr/share/zoneinfo/$tz_name"
+  fi
+elif [ -n "${TZ:-}" ]; then
+  # TZ may be ":Europe/Berlin" or "Europe/Berlin" (a leading ':' is a POSIX
+  # marker, and a trailing rule after ',' is irrelevant to the zone file).
+  tz_name=${TZ#:}
+  tz_name=${tz_name%%,*}
+  if [ -n "$tz_name" ] && [ -e "/usr/share/zoneinfo/$tz_name" ]; then
+    tz_target="/usr/share/zoneinfo/$tz_name"
+  fi
+fi
+if [ -z "$tz_target" ] && [ -e /usr/share/zoneinfo/UTC ]; then
+  tz_target=/usr/share/zoneinfo/UTC
+fi
+
+if [ -n "$tz_target" ]; then
+  mkdir -p /var/lib/timezone
+  # Chrome (running as the desktop user) writes localtime2 in this directory
+  # whenever the timezone changes, so it must be writable by that user.
+  chown "$TARGET_USER:users" /var/lib/timezone
+  ln -sfn "$tz_target" /var/lib/timezone/localtime
+  # Chrome also writes localtime2 next to it when the user changes the zone.
+  rm -f /var/lib/timezone/localtime2
+  note "linked /var/lib/timezone/localtime -> $tz_target"
+else
+  note "no zoneinfo database found; skipping timezone link"
+fi
+
 # --- lsb-release -----------------------------------------------------------
 
 if [ "$MOJO" = "1" ]; then
   keys=(
     "DEVICETYPE=CHROMEBOOK"
     "CHROMEOS_RELEASE_NAME=Chrome OS"
+    "CHROMEOS_RELEASE_DESCRIPTION=ChromeOS Linux"
   )
 else
-  keys=("DEVICETYPE=CHROMEBOOK")
+  keys=(
+    "DEVICETYPE=CHROMEBOOK"
+    "CHROMEOS_RELEASE_DESCRIPTION=ChromeOS Linux"
+  )
 fi
 
 if [ -f "$LSB" ] && ! [ -f "$LSB_BAK" ]; then
