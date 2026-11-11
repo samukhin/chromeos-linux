@@ -96,7 +96,7 @@ func (s *sessionManager) StartSessionEx(accountID, uniqueID string, chromeOwnerK
 // login manager; here there is no login screen, so the correct behaviour is to
 // shut the whole session down. The session script publishes its pid to
 // $XDG_RUNTIME_DIR/chromeos-linux-session.pid and installs a TERM trap that
-// tears down Chrome, sommelier, Xwayland and (if it started it) Xorg — so we
+// tears down Chrome, sommelier and Xwayland — so we
 // just signal it and let that cleanup run. Without this, logout left Chrome
 // alive on a black screen and the user had to kill everything by hand.
 func requestSessionShutdown(reason string) {

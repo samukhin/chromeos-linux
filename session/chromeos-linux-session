@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# ChromeOS Ash desktop session on stock Linux.
+# ChromeOS Ash desktop session on stock Linux, directly on DRM/KMS.
 #
 # Ported from the `chromeosLinuxSession` package in the old flake.nix:
 # prepares the profile, brings up sommelier/Xwayland, injects the Terminal UI
 # and runs the patched Ash Chrome in a restart loop.
+#
+# Ash owns the display (--ozone-platform=drm): there is no host X server and
+# no host Wayland compositor. The nested stack is Ash's exo server ->
+# sommelier -> Xwayland :10 for Linux apps.
 #
 # Runs entirely from the repository tree — no Nix store paths, no
 # /run/current-system, no /run/opengl-driver.
@@ -19,33 +23,27 @@ SOMMELIER="$ASH_ROOT/dist/sommelier/bin/sommelier"
 PROFILE="${ASH_PROFILE_DIR:-/var/lib/ash-profile}"
 TEST_USER="${ASH_LOGIN_PROFILE:-test-user}"
 
-VM_DISPLAY_BOUNDS="${ASH_DISPLAY_SIZE:-1920x1080}"
+ASH_DRM_CARD="${ASH_DRM_CARD:-/dev/dri/card0}"
 LOGIN_USER="${ASH_LOGIN_USER:-linux@local}"
 
-XORG_PID=""          # non-empty only if THIS script started Xorg (never kill an inherited display)
-XORG_AUTH=""         # cookie file handed to THAT Xorg; removed with it (startx does the same)
 chrome_pid=""        # live Chrome, so a single kill/teardown can reap it
 sommelier_bg=""      # the Xwayland/sommelier supervisor subshell
 fast_fail=0          # consecutive quick Chrome failures, to break the respawn loop
 
-# Is the X display Chrome needs still there? Logout/host shutdown can remove the
-# socket; respawning Chrome into a dead display is exactly what caused the old
-# infinite "platform failed to initialize" respawn spin.
+# Ash owns the DRM device; if it disappears (driver unload, VM teardown) there
+# is no point respawning into a dead display.
 display_alive() {
-  local d="${DISPLAY:-}" n
-  case "$d" in *:*) ;; *) return 1 ;; esac
-  n="${d##*:}"; n="${n%%.*}"
-  case "$n" in ''|*[!0-9]*) return 1 ;; esac
-  [ -S "/tmp/.X11-unix/X$n" ]
+  [ -e "$ASH_DRM_CARD" ] && [ -r "$ASH_DRM_CARD" ] && [ -w "$ASH_DRM_CARD" ]
 }
 
-# Between restarts: reap the compositor (sommelier + Xwayland) but KEEP Xorg so
-# the next iteration can reuse it. Deliberately does not touch XORG_PID.
+# Between restarts: reap the nested compositor (sommelier + its Xwayland :10).
+# Never use `pkill -x Xwayland` here: an unrelated host Xwayland (niri,
+# another session) must survive.
 stop_compositor() {
   [ -n "$sommelier_bg" ] && kill "$sommelier_bg" 2>/dev/null
   sommelier_bg=""
   pkill -x sommelier 2>/dev/null || true
-  pkill -x Xwayland 2>/dev/null || true
+  pkill -f 'Xwayland :10' 2>/dev/null || true
   return 0
 }
 
@@ -55,13 +53,6 @@ stop_compositor() {
 cleanup() {
   [ -n "$chrome_pid" ] && kill "$chrome_pid" 2>/dev/null
   stop_compositor
-  if [ -n "$XORG_PID" ]; then
-    kill "$XORG_PID" 2>/dev/null
-    XORG_PID=""
-    # Our cookie file only served that Xorg; drop it like startx does.
-    [ -n "$XORG_AUTH" ] && rm -f "$XORG_AUTH"
-    XORG_AUTH=""
-  fi
   # Remove the pid file so session-bridge never signals a dead script.
   [ -n "${SESSION_PID_FILE:-}" ] && rm -f "$SESSION_PID_FILE"
   return 0
@@ -78,130 +69,6 @@ ensure_runtime_dir() {
     chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
   fi
   export XDG_RUNTIME_DIR
-}
-
-setup_display_auth() {
-  # Prefer the real cookie, fall back to LightDM's copy (as the Nix module did
-  # from its display-setup-script), and only then open the display up.
-  if [ -n "${XAUTHORITY:-}" ] && [ -r "${XAUTHORITY}" ]; then
-    cp "${XAUTHORITY}" /tmp/ash-xauth 2>/dev/null || true
-  elif [ -r /var/run/lightdm/root/:0 ]; then
-    cp /var/run/lightdm/root/:0 /tmp/ash-xauth 2>/dev/null || true
-  else
-    xhost +local: >/dev/null 2>&1 || xhost + >/dev/null 2>&1 || true
-  fi
-  [ -e /tmp/ash-xauth ] || : > /tmp/ash-xauth
-  chmod 644 /tmp/ash-xauth 2>/dev/null || true
-}
-
-# First FREE display number: free means neither the lock file nor the socket
-# exists — the same rule /usr/bin/startx uses when picking its display. Neither
-# this script nor startx may assume :0: a real session here has landed on :1.
-# Returns 1 if :0-:63 are all taken.
-first_free_display() {
-  local n
-  for ((n = 0; n < 64; n++)); do
-    if [ ! -e "/tmp/.X${n}-lock" ] && [ ! -S "/tmp/.X11-unix/X${n}" ]; then
-      printf '%s' "$n"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# Fallback: only reached if we are running with NO $DISPLAY at all (normally
-# start-session.sh has already re-exec'd us under startx, which sets one). Used
-# to force ":0 -ac"; both were wrong — :0 collides with a busy display, and -ac
-# opens the server to every local process. Now we mirror startx exactly: mint a
-# MIT-MAGIC-COOKIE, hand it to the server via -auth (access control ON), and
-# export XAUTHORITY so setup_display_auth() below copies the cookie to
-# /tmp/ash-xauth for Chrome. Without a cookie xhost could not even connect to
-# open the display later (it authenticates too), so the cookie is what makes the
-# no--ac path work.
-start_x_if_needed() {
-  if [ -n "${DISPLAY:-}" ]; then
-    log "using existing X display $DISPLAY"
-    return 0
-  fi
-  local xbin n authfile cookie i
-  xbin="$(command -v Xorg || command -v X)" || true
-  [ -n "$xbin" ] || die "no DISPLAY and no Xorg to start — log into an X session first, or install xserver-xorg"
-  n="$(first_free_display)" || die "no free X display (:0-:63 all taken)"
-  command -v mcookie >/dev/null 2>&1 ||
-    die "mcookie missing — cannot start X with access control (install util-linux)"
-  command -v xauth  >/dev/null 2>&1 ||
-    die "xauth missing — cannot start X with access control (install xorg-xauth)"
-  authfile="$PROFILE/serverauth.$$"
-  cookie="$(mcookie)"
-  rm -f "$authfile"
-  xauth -q -f "$authfile" add ":$n" . "$cookie" ||
-    die "could not write $authfile — cannot start X"
-  chmod 600 "$authfile" 2>/dev/null || true
-  export XAUTHORITY="$authfile"
-  XORG_AUTH="$authfile"
-  log "no DISPLAY, starting $xbin :$n (log: $PROFILE/xorg.log)"
-  "$xbin" ":$n" -auth "$authfile" -nolisten tcp >"${PROFILE}/xorg.log" 2>&1 &
-  XORG_PID=$!
-  for i in $(seq 1 50); do
-    if [ -S "/tmp/.X11-unix/X${n}" ]; then
-      export DISPLAY=":$n"
-      log "X server is up on :$n (log: $PROFILE/xorg.log)"
-      return 0
-    fi
-    sleep 0.2
-  done
-  die "failed to start an X server on :$n — see $PROFILE/xorg.log"
-}
-
-detect_display_bounds() {
-  if [ -n "${ASH_DISPLAY_BOUNDS:-}" ] && printf '%s' "$ASH_DISPLAY_BOUNDS" | grep -Eq '^[0-9]+x[0-9]+$'; then
-    printf '%s\n' "$ASH_DISPLAY_BOUNDS"
-    return
-  fi
-
-  local bounds
-  bounds="$(xrandr --current 2>/dev/null | awk '
-    / connected primary/ {
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^[0-9]+x[0-9]+[+][0-9]+[+][0-9]+/) {
-          sub(/[+].*/, "", $i)
-          found = 1
-          print $i
-          exit
-        }
-      }
-    }
-    / connected/ && fallback == "" {
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^[0-9]+x[0-9]+[+][0-9]+[+][0-9]+/) {
-          split($i, parts, "+")
-          fallback = parts[1]
-        }
-      }
-    }
-    END { if (!found && fallback != "") print fallback }
-  ')"
-  if printf '%s' "$bounds" | grep -Eq '^[0-9]+x[0-9]+$'; then
-    printf '%s\n' "$bounds"
-    return
-  fi
-  printf '%s\n' "$VM_DISPLAY_BOUNDS"
-}
-
-apply_display_bounds() {
-  local mode=$1 output
-  printf '%s' "$mode" | grep -Eq '^[0-9]+x[0-9]+$' || return 0
-  if [ -n "${ASH_XRANDR_OUTPUT:-}" ]; then
-    output="$ASH_XRANDR_OUTPUT"
-  else
-    output="$(xrandr --current 2>/dev/null | awk '/ connected primary/ { print $1; exit }')"
-    if [ -z "$output" ]; then
-      output="$(xrandr --current 2>/dev/null | awk '/ connected/ { print $1; exit }')"
-    fi
-  fi
-  [ -n "$output" ] || return 0
-  xrandr --output "$output" --mode "$mode" 2>/dev/null ||
-    log "note: could not set $output to $mode (continuing)"
 }
 
 # --- profile ---------------------------------------------------------------
@@ -254,7 +121,7 @@ prepare_profile() {
 
 # --- main loop -------------------------------------------------------------
 
-for tool in xrandr xrdb curl perl awk pgrep pkill; do
+for tool in xrdb curl perl awk pgrep pkill; do
   command -v "$tool" >/dev/null 2>&1 ||
     { echo "[session] missing '$tool'" >&2; exit 1; }
 done
@@ -267,11 +134,11 @@ command -v Xwayland >/dev/null 2>&1 ||
 export ASH_LOGIN_PROFILE="$TEST_USER"
 prepare_profile
 ensure_runtime_dir
-start_x_if_needed
-setup_display_auth
 
-export DISPLAY="${DISPLAY:-:0}"
-export XAUTHORITY=/tmp/ash-xauth
+# DRM mode has no host X display. Clear any inherited X11 environment so it
+# cannot leak into Chrome or the nested sommelier/Xwayland stack; guest apps
+# get DISPLAY=:10 explicitly from sommelier/shell-stub/crostini-bridge.
+unset DISPLAY XAUTHORITY
 export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 # Crash dumps land in <DIR_CONFIG_DIR>/chromium/Crash Reports. Before login
 # ChromeOS resolves the home directory to "/", so that becomes
@@ -279,10 +146,11 @@ export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 # crashpad logs "mkdir : No such file or directory", starting up without a
 # database. Anchor the config base inside the writable profile instead.
 export CHROME_CONFIG_HOME="$PROFILE/.config"
-log "runtime=$XDG_RUNTIME_DIR display=$DISPLAY profile=$PROFILE"
+log "runtime=$XDG_RUNTIME_DIR card=$ASH_DRM_CARD profile=$PROFILE"
 
-# Reap Chrome/compositor/Xorg(ours) on any teardown path — a plain `kill` of
-# this script must not leak them (that was the "long list of kills in the TTY").
+# Reap Chrome and the nested compositor on any teardown path — a plain `kill`
+# of this script must not leak them (that was the "long list of kills in the
+# TTY").
 trap cleanup EXIT
 trap 'log "interrupted"; exit 130' INT
 trap 'log "terminated";  exit 143' TERM
@@ -313,7 +181,7 @@ while true; do
       until curl -fsS --max-time 1 http://127.0.0.1:9222/json/version >/dev/null 2>&1; do
         sleep 0.5
       done
-      pkill -x Xwayland 2>/dev/null || true
+      pkill -f 'Xwayland :10' 2>/dev/null || true
       rm -f "$XDG_RUNTIME_DIR/wayland-1" "$XDG_RUNTIME_DIR/wayland-1.lock" \
             /tmp/.X10-lock /tmp/.X11-unix/X10
       (
@@ -347,20 +215,19 @@ while true; do
       #                           not exist here, so Xwayland would find no DRI
       #                           drivers without this hint.
       #
-      # Deliberately NOT passed: --glamor (it would drop -shm from Xwayland's
-      # command line and switch it to GPU rendering). Bisected as the flicker
-      # switch: without it the OBS preview is stable; adding it back makes the
-      # preview flicker — chrome blends a surface whose alpha byte is 0, so the
-      # xterm shows through and frames accumulate (x2/x3) — and hardware OBS
-      # goes blank. The opaque-region patch in sommelier did not help, so the
-      # trigger sits inside glamor itself. Client-side GPU rendering does NOT
-      # depend on --glamor: OBS and glxgears stay hardware-accelerated here.
+      # --glamor: Xwayland renders through glamor (GPU) instead of falling
+      # back to -shm, so the X server's own 2D operations (scroll, large-window
+      # copies) are accelerated too, not just client-side GL. The X11 branch
+      # used to leave this out because glamor made the OBS preview flicker
+      # (chrome blends a surface whose alpha byte is 0); it is enabled here on
+      # the DRM path. If that flicker or a blank hardware-OBS preview comes
+      # back, this flag is the first thing to bisect.
       SOMMELIER_DISPLAY=wayland-0 \
       WAYLAND_DISPLAY=wayland-0 \
       XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
         "$SOMMELIER" \
           --noop-driver \
-          -X \
+          -X --glamor \
           --socket=wayland-1 \
           --x-display=10 \
           --xwayland-path="$(command -v Xwayland || echo /usr/bin/Xwayland)" \
@@ -376,9 +243,6 @@ while true; do
   ) &
   sommelier_bg=$!
 
-  apply_display_bounds "${ASH_DISPLAY_BOUNDS:-}"
-  ASH_HOST_WINDOW_BOUNDS="$(detect_display_bounds)"
-
   login_flags=()
   if [ "${ASH_DIRECT_LOGIN:-1}" = "1" ]; then
     login_flags+=(--login-user="$LOGIN_USER" --login-profile="$TEST_USER")
@@ -386,8 +250,18 @@ while true; do
     login_flags+=(--login-manager --oobe-skip-to-login)
   fi
 
-  log "starting Ash (bounds=$ASH_HOST_WINDOW_BOUNDS)"
+  # --use-angle=gles-egl is required on DRM. ANGLE's default Linux backend is
+  # OpenGL/GLX; with no DISPLAY on a VT, eglInitialize fails with "Could not
+  # open the default X display", the GPU process exits, and Viz aborts with
+  # "Software compositing fallback is unavailable". gles-egl makes ANGLE use
+  # the native Mesa EGL/GLES path (and GBM), which works on KMS.
+  log "starting Ash (ozone=drm card=$ASH_DRM_CARD)"
   chrome_start=$(date +%s)
+  # --ash-host-window-bounds is deliberately omitted: without it
+  # DisplayManager::InitFromCommandLine() returns false and, because
+  # IsRunningAsSystemCompositor() is true, ForceInitialConfigureWithObservers()
+  # runs the real DRM/KMS configuration. Passing the switch would create a
+  # fake display from the size string instead.
   "$CHROME" \
     --ash-dev-shortcuts \
     --no-sandbox \
@@ -408,11 +282,10 @@ while true; do
     --remote-debugging-port=9222 \
     --ignore-gpu-blocklist \
     --enable-logging=stderr \
-    --x11-display="$DISPLAY" \
+    --ozone-platform=drm \
+    --use-angle=gles-egl \
     --user-data-dir="$PROFILE" \
     "${login_flags[@]}" \
-    --ozone-platform=x11 \
-    --ash-host-window-bounds="$ASH_HOST_WINDOW_BOUNDS" \
     2>>"$PROFILE/ash.log" &
   chrome_pid=$!
   # wait (not a foreground run) so the INT/TERM traps fire promptly; a plain
@@ -432,10 +305,10 @@ while true; do
     log "Chrome exited cleanly (code 0) — treating as sign-out; ending session"
     break
   fi
-  # The display we need is gone (logout/host X shut down). Respawning here is
-  # what produced the endless "platform failed to initialize" loop.
+  # The DRM device we need is gone (driver unload, VM teardown). Respawning
+  # here would only spin on "platform failed to initialize".
   if ! display_alive; then
-    log "display $DISPLAY is gone — cannot restart; ending session"
+    log "DRM device $ASH_DRM_CARD is gone — cannot restart; ending session"
     break
   fi
   # Guard against a genuine crash-loop: give up after a few quick failures

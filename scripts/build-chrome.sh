@@ -6,7 +6,13 @@
 # derivation): the binary patches fail loudly when the binary no longer
 # matches, and nothing is patchelf'ed — the snapshot already uses
 # /lib64/ld-linux-x86-64.so.2 and RUNPATH=$ORIGIN, so it runs on a stock
-# userspace as-is, with libdisplayfix.so injected by the launcher.
+# userspace as-is.
+#
+# This branch targets Ash directly on DRM/KMS (--ozone-platform=drm). The
+# X11-only patches (DisplayConfigurator::Init, RunPendingConfiguration,
+# HasInternalDisplay, the X11 keyboard engine and the XEvent key fix) are
+# deliberately NOT applied: on DRM the native display delegate must be
+# installed and the real KMS configuration must run.
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -116,9 +122,11 @@ done < <(grep -Fboa "'wasm-unsafe-eval'" "$CHROME" || true)
 DELTA=$(text_delta)
 [ -n "$DELTA" ] || die ".text section not found in $CHROME"
 
-va=$(sym_va ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display::NativeDisplayDelegate')
-verify_and_patch "DisplayConfigurator::Init (skip native display config)" \
-  "$(va_to_offset "$va" "$DELTA" 13)" "807f2101753749" '\351\070\000\000\000\220\220'
+# DisplayConfigurator::Init and RunPendingConfiguration are intentionally left
+# untouched: on DRM, Shell::InitializeDisplayManager() hands the configurator a
+# DrmNativeDisplayDelegate, ForceInitialConfigure() calls its Initialize(), and
+# the real KMS modeset must run. The X11 branch used to patch both of them out
+# because the X11 delegate is null.
 
 # WaylandDmabufFeedbackManager: the patch that used to live here zeroed the
 # version field at this+8 and skipped the gpu::Capabilities probe that fills
@@ -134,10 +142,6 @@ verify_and_patch "DisplayConfigurator::Init (skip native display config)" \
 #                crash/hang, restore the patch (git restore this file).
 # Original bytes at constructor+112 for reference: e8fdd63d08488bb80001000048
 
-va=$(sym_va ' display::DisplayConfigurator::RunPendingConfiguration\(\)')
-verify_and_patch "RunPendingConfiguration (no-op)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\303'
-
 va=$(sym_va ' ash::RedirectChromeLogging\(base::CommandLine const&\)')
 verify_and_patch "RedirectChromeLogging (no-op)" \
   "$(va_to_offset "$va" "$DELTA")" "55" '\303'
@@ -145,10 +149,6 @@ verify_and_patch "RedirectChromeLogging (no-op)" \
 va=$(sym_va ' ash::mojo_service_manager::.*::OnDisconnect\(')
 verify_and_patch "OnDisconnect (no-op)" \
   "$(va_to_offset "$va" "$DELTA")" "55" '\303'
-
-va=$(sym_va ' display::HasInternalDisplay\(\)' soft)
-verify_and_patch "HasInternalDisplay (returns true)" \
-  "$(va_to_offset "$va" "$DELTA")" "55" '\260\001\303' soft
 
 # System UI blur (shelf, quick settings, hotseat) is gated on RAM, not GPU:
 # chromeos::features::IsSystemBlurEnabled() is literally
@@ -164,54 +164,6 @@ verify_and_patch "HasInternalDisplay (returns true)" \
 va=$(sym_va ' chromeos::features::IsSystemBlurEnabled\(\)')
 verify_and_patch "IsSystemBlurEnabled (always true, blur on any RAM)" \
   "$(va_to_offset "$va" "$DELTA")" "55" '\270\001\000\000\000\303'
-
-# --- keyboard layout engine (RU/EN quick-settings chip drives typing) -------
-# OzonePlatformX11::InitializeUI registers StubKeyboardLayoutEngine, whose
-# Lookup always falls back to the hardcoded US layout, and the input
-# controller's SetCurrentLayoutByName is a no-op stub — so switching RU/EN
-# in Ash quick settings only moved the tray indicator. Mirror what
-# OzonePlatformDrm does instead: build an XkbEvdevCodes converter plus a
-# real XkbKeyboardLayoutEngine in one block, hand it to
-# KeyboardLayoutEngineManager, and forward the input controller's
-# SetCurrentLayoutByName through a thunk to the registered engine.
-
-ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(')
-
-# new[] size for the combined block: XkbKeyboardLayoutEngine (0xc8, same as
-# the DRM platform) + XkbEvdevCodes converter (0x10) = 0xd8, was 0x20.
-verify_and_patch "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 381)" "20" '\330'
-
-# Replace the StubKeyboardLayoutEngine construction with:
-#   lea 0xc8(%rax),%rdi / mov %rax,%r14 / call XkbEvdevCodesC1 /
-#   mov %r14,%rdi / lea 0xc8(%r14),%rsi / call XkbKeyboardLayoutEngineC1 /
-#   mov %r14,0x20(%rbx) / mov %r14,%rdi
-# then falls through into the existing SetKeyboardLayoutEngine call.
-verify_and_patch "OzonePlatformX11::InitializeUI (real Xkb engine)" \
-  "$(va_to_offset "$ui_va" "$DELTA" 390)" \
-  "4989c64889c7e8a9ce7206488b7b204c8973204885ff740a488b07ff50084c8b73204c89f7" \
-  '\110\215\270\310\000\000\000\111\211\306\350\353\317\162\006\114\211\367\111\215\266\310\000\000\000\350\020\320\162\006\114\211\163\040\114\211\367'
-
-# Overwrite the (now dead) StubKeyboardLayoutEngine::Lookup with a thunk
-# for StubInputController::SetCurrentLayoutByName(name, callback):
-#   load keyboard_layout_engine_; when set, tail-jump to
-#   engine->SetCurrentLayoutByName (vptr+0x20, identical signature), else
-#   jump back into the original stub body. The stub engine is no longer
-#   constructed after the patch above, so its Lookup is unreachable.
-lookup_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::Lookup\(')
-verify_and_patch "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
-  "$(va_to_offset "$lookup_va" "$DELTA")" \
-  "554889e5488b4708488b7f10" \
-  '\110\213\005\201\042\022\010\110\205\300\164\011\110\211\307\110\213\000\377\140\040\351\204\267\030\371'
-
-# Redirect the StubInputController vtable slot (vptr+0x80,
-# .rela.dyn entry for 0x15834f20, R_X86_64_RELATIVE addend 0x719c0de) to
-# the thunk: verify the whole 24-byte relocation, write it with the new
-# addend (thunk VA 0xe010940).
-verify_and_patch "StubInputController::SetCurrentLayoutByName -> thunk" \
-  "$((0x1020b20))" \
-  "204f8315000000000800000000000000dec0190700000000" \
-  '\040\117\203\025\000\000\000\000\010\000\000\000\000\000\000\000\100\011\001\016\000\000\000\000'
 
 # --- GPU: ozone X11 pixmap import ------------------------------------------
 # Without these, X11 clients on the sommelier display get white windows and a
@@ -274,10 +226,11 @@ verify_and_patch "exo dmabuf candidates (RGBA_8888 -> BGRA_8888)" \
   "$((0x337b0c4))" "0100000000000000" '\001\000\000\000\002\000\000\000'
 verify_and_patch "exo dmabuf candidates (RGBX_8888 -> BGRX_8888)" \
   "$((0x337b0cc))" "010000000c000000" '\001\000\000\000\015\000\000\000'
+va=$(sym_va ' gpu::gles2::PopulateMappableDrmFormatsForExo\(')
 verify_and_patch "exo dmabuf candidates (skip RGBA_F16)" \
-  "$((0xed67f39))" "7513" '\353\023'
+  "$(va_to_offset "$va" "$DELTA" 122)" "7513" '\353\023'
 verify_and_patch "exo dmabuf candidates (skip RGBA_1010102)" \
-  "$((0xed67f88))" "7513" '\353\023'
+  "$(va_to_offset "$va" "$DELTA" 201)" "7513" '\353\023'
 
 # --- libminigbm shim (Mesa stand-in) ---------------------------------------
 # Chrome is built against ChromeOS' minigbm, whose usage bits and import type
@@ -309,30 +262,15 @@ exec "$(dirname "$0")/chrome_crashpad_handler.real" "$@"
 CWRAP
 chmod +x "$OUT/chrome_crashpad_handler"
 
-# --- libdisplayfix + launcher ---------------------------------------------
-
-"${CC:-cc}" -shared -fPIC -Wl,-soname,libdisplayfix.so \
-  -o "$OUT/libdisplayfix.so" "$ASH_ROOT/scripts/displayfix.c"
+# --- launcher --------------------------------------------------------------
 
 cat > "$OUT/chromeos-ash" <<'WRAP'
 #!/usr/bin/env bash
 # Launcher for the patched Ash Chrome binary.
+#
+# DRM mode: Ash owns the KMS display itself, so there is no DISPLAY or
+# XAUTHORITY to set up here. The session script passes --ozone-platform=drm.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Ash is a ChromeOS build: it expects a live X display and a readable cookie.
-if [ -z "${DISPLAY:-}" ]; then
-  export DISPLAY=:0
-fi
-if [ -z "${XAUTHORITY:-}" ] || [ ! -r "${XAUTHORITY:-}" ]; then
-  if [ -r /tmp/ash-xauth ]; then
-    export XAUTHORITY=/tmp/ash-xauth
-  fi
-fi
-
-# The shim back-fills DISPLAY/XAUTHORITY for processes that bypass this
-# wrapper (Chrome re-execs). It is a no-op when the environment is sane.
-export LD_PRELOAD="$HERE/libdisplayfix.so${LD_PRELOAD:+:$LD_PRELOAD}"
-
 exec "$HERE/chrome" "$@"
 WRAP
 chmod +x "$OUT/chromeos-ash"

@@ -370,10 +370,9 @@ func initialScreenBrightness() float64 {
 }
 
 func applyScreenBrightness(percent float64) error {
-	if err := writeBacklightPercent(percent); err == nil {
-		return nil
-	}
-	return applyXrandrBrightness(percent)
+	// DRM mode: brightness is sysfs-only. There is no host X server, so the
+	// old xrandr fallback would just fail on every call.
+	return writeBacklightPercent(percent)
 }
 
 func readBacklightPercent() (float64, bool) {
@@ -417,58 +416,6 @@ func readFloatFile(path string) (float64, error) {
 		return 0, err
 	}
 	return strconv.ParseFloat(strings.TrimSpace(string(b)), 64)
-}
-
-func applyXrandrBrightness(percent float64) error {
-	xrandr := "xrandr"
-	outputs, err := connectedXrandrOutputs(xrandr)
-	if err != nil {
-		return err
-	}
-	if len(outputs) == 0 {
-		return os.ErrNotExist
-	}
-	ratio := clampPercent(percent) / 100
-	if ratio < 0.01 {
-		ratio = 0.01
-	}
-	value := strconv.FormatFloat(ratio, 'f', 3, 64)
-	for _, output := range outputs {
-		cmd := exec.Command(xrandr, "--output", output, "--brightness", value)
-		cmd.Env = x11Env()
-		if err := cmd.Run(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func connectedXrandrOutputs(xrandr string) ([]string, error) {
-	cmd := exec.Command(xrandr, "--query")
-	cmd.Env = x11Env()
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	var outputs []string
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == "connected" {
-			outputs = append(outputs, fields[0])
-		}
-	}
-	return outputs, nil
-}
-
-func x11Env() []string {
-	env := os.Environ()
-	if os.Getenv("DISPLAY") == "" {
-		env = append(env, "DISPLAY=:0")
-	}
-	if os.Getenv("XAUTHORITY") == "" {
-		env = append(env, "XAUTHORITY=/tmp/ash-xauth")
-	}
-	return env
 }
 
 func getProp[T any](obj dbus.BusObject, iface, prop string) T {

@@ -4,11 +4,11 @@
 
 ![screenshot](./ash.png)
 
-Этот репозиторий берёт готовый бинарник ChromiumOS Chrome, ставит его перед X11 и учит обычный Linux отвечать на ChromeOS D-Bus API, которые ждёт Ash.
+Этот репозиторий берёт готовый бинарник ChromiumOS Chrome и запускает его **напрямую на DRM/KMS** (`--ozone-platform=drm`), уча обычный Linux отвечать на ChromeOS D-Bus API, которые ждёт Ash. Ни X-сервера, ни хостового Wayland-композитора в основе нет.
 
 На выходе — десктопная оболочка ChromeOS: шельф, лаунчер, шторка быстрых настроек, системный трей, Terminal SWA — в качестве вашего Linux-десктопа.
 
-Всё здесь — обычные shell-скрипты, Go и Meson: **Nix не нужен** (старая Nix-упаковка удалена). Целевые системы — x86_64 Ubuntu/Debian и Arch; ничего ультра-Ubuntu-specific в коде нет, требуются рабочие glibc, D-Bus и X.
+Всё здесь — обычные shell-скрипты, Go и Meson: **Nix не нужен** (старая Nix-упаковка удалена). Целевые системы — x86_64 Ubuntu/Debian и Arch; ничего ультра-Ubuntu-specific в коде нет, требуются рабочие glibc, D-Bus, DRM/KMS и evdev.
 
 ## Содержание
 
@@ -29,23 +29,23 @@
 
 ## Как это устроено
 
-Три независимых куска, которые вместе притворяются Chromebook'ом:
+Ash сам владеет дисплеем через DRM/KMS и сам же хостит Wayland-композитор для гостевых Linux-приложений:
 
 ```
-┌─────────────────── ваш X-дисплей (:0) ───────────────────┐
+┌──────────────── /dev/dri/card0 (KMS) ────────────────────┐
 │  Ash Chrome  (dist/chrome/chromeos-ash)                  │
-│    --ozone-platform=x11 --x11-display=:0                  │
+│    --ozone-platform=drm                                   │
 │    │                                                      │
-│    └── хостит Wayland-композитор                          │
+│    └── хостит Wayland-композитор (exo)                    │
 │          $XDG_RUNTIME_DIR/wayland-0                       │
 │             └── sommelier (-X)  →  wayland-1              │
 │                    └── Xwayland :10 → Linux-приложения    │
 └──────────────────────────────────────────────────────────┘
 ```
 
-* **Ash — это X11-клиент**: он рисует себя на `:0` (настоящий X-сервер: LightDM/Xorg или поднятый самим скриптом).
+* **Ash — это KMS-клиент**: он открывает `/dev/dri/card0`, сам настраивает коннектор/CRTC и рисует десктоп напрямую, без Xorg и без чужого композитора. Поэтому запускать сессию нужно с чистой VT, где никто другой не держит DRM master.
 * **Ash же — Wayland-сервер**: Chrome запускается с `--enable-wayland-server --wayland-server-socket=wayland-0`, то есть сам принимает Wayland-соединения.
-* **sommelier** кладёт перед ним Xwayland на `:10`, поэтому «управляемые» Linux-приложения (Crostini-обвязка) попадают внутрь рабочего стола Ash, а не наружу. Запускаемые из Ash Linux-приложения обязаны ходить в `:10`, а не в хостовый Xorg — иначе их окна уходят наружу и в сессии не видны. За это отвечает `session/stubs/shell-stub.sh`: он форсит `DISPLAY=:10` для запускаемых приложений (хост у Ash на `:0`, поэтому коллизии нет).
+* **sommelier** кладёт перед ним Xwayland на `:10`, поэтому «управляемые» Linux-приложения (Crostini-обвязка) попадают внутрь рабочего стола Ash, а не наружу. Запускаемые из Ash Linux-приложения обязаны ходить в `:10`; за это отвечает `session/stubs/shell-stub.sh`: он форсит `DISPLAY=:10` для запускаемых приложений.
 
 Второй кусок — **Go-бриджи**. Ash уверен, что живёт в ChromeOS и общается с системными демонами по D-Bus системной шины. Бриджи занимают эти имена и переводят вызовы на Linux:
 
@@ -53,7 +53,7 @@
 |---|---|---|
 | `org.chromium.flimflam` | `shill-bridge` | NetworkManager (состояние сети, подключение Ethernet/Wi-Fi) |
 | `org.chromium.cras` | `cras-bridge` | PulseAudio/PipeWire через `pactl` (громкость, узлы Speaker/Headphone/Mic) |
-| `org.chromium.PowerManager` | `power-bridge` | яркость через sysfs (+ fallback на `xrandr`), UPower, `systemctl suspend/reboot` |
+| `org.chromium.PowerManager` | `power-bridge` | яркость через sysfs, UPower, `systemctl suspend/reboot` |
 | `org.chromium.SessionManager`<br>`org.chromium.UserDataAuth` | `session-bridge` | «запущенная сессия», состояние входа, гостевой профиль `/home/chronos/user` |
 | `org.chromium.VmConcierge`, `VmCicerone`,<br>`DlcService`, `ImageLoader`, `debugd` | `crostini-bridge` | локальные `.desktop`-файлы: регистрация в лаунчере и запуск приложений на `:10` |
 | `org.chromium.Rmad` | `rmad-bridge` | заглушка RMA-демона |
@@ -65,7 +65,8 @@
 ## Требования
 
 * x86_64 (снапшот ChromiumOS собирается только под это).
-* Рабочий D-Bus (системная шина) и X-сервер (или готовность дать скрипту поднять свой).
+* Рабочий D-Bus (системная шина) и рабочий DRM/KMS: `/dev/dri/card0`, evdev-ввод и udev. X-сервер не нужен.
+* Пользователь должен иметь доступ к `/dev/dri/card0` и `/dev/input/event*` (группы `video`, `render`, `input`) и активную logind-сессию на той же VT.
 * `./scripts/doctor.sh` печатает, чего именно не хватает на вашей машине — запускай его первым делом.
 
 **Ubuntu / Debian**
@@ -80,13 +81,10 @@ sudo apt install --no-install-recommends \
 
 # рантайм (libXcomposite — самая частая пропущенная библиотека у Chrome)
 sudo apt install --no-install-recommends \
-  xwayland x11-xserver-utils xauth dbus \
+  xwayland x11-xserver-utils dbus \
   libnss3 libnspr4 libcups2 libdbus-1-3 libexpat1 libxkbcommon0 libxcomposite1 \
   libasound2t64 pulseaudio-utils librsvg2-bin \
   network-manager gnome-keyring polkit-gnome xdg-desktop-portal-gtk
-
-# опционально: только если сессии нужен собственный X-сервер (запуск с TTY)
-sudo apt install xserver-xorg
 ```
 
 На Debian 12 пакет называется `libcups2`, на Ubuntu 24.04 — `libcups2t64`; `libasound2`/`libasound2t64` аналогично.
@@ -96,7 +94,7 @@ sudo apt install xserver-xorg
 ```bash
 sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja gcc make \
   wayland libxkbcommon libdrm libgbm pixman libxcb libxcomposite \
-  xorg-xwayland xorg-xrandr xorg-xrdb xorg-xhost xorg-xauth dbus \
+  xorg-xwayland xorg-xrdb xorg-xkbdata dbus \
   nss nspr cups alsa-lib libpulse pipewire-pulse librsvg \
   networkmanager gnome-keyring polkit-gnome xdg-desktop-portal-gtk unzip
 ```
@@ -104,7 +102,8 @@ sudo pacman -S --needed go meson ninja gawk pkgconf python python-jinja gcc make
 Зачем что-то из рантайма:
 
 * `xwayland` — без него Linux-приложения внутри Ash не рисуются;
-* `x11-xserver-utils` — `xrandr` (границы окна Ash) и `xrdb` (цвета для xterm);
+* `x11-xserver-utils` — только `xrdb` (цвета для xterm внутри `:10`); `xrandr`, `xhost`, `xauth` больше не нужны;
+* `xorg-xkbdata` (на Debian это `xkb-data`) — данные раскладок для RU/EN;
 * `pulseaudio-utils` — `pactl`, через который `cras-bridge` крутит громкость;
 * `librsvg2-bin` — `rsvg-convert` для SVG-иконок в лаунчере;
 * `network-manager` — `shill-bridge` без NM просто пишет в лог «NM not available»;
@@ -121,7 +120,7 @@ scripts/common.sh             общие хелперы ВСЕХ скрипто�
 scripts/build-chrome.sh       патчинг бинарника → dist/chrome/
 scripts/build-sommelier.sh    сборка sommelier → dist/sommelier/
 scripts/build-bridges.sh      сборка Go-бриджей → dist/bin/
-scripts/displayfix.c          C-шим libdisplayfix.so
+scripts/minigbm_shim.c        C-шим libminigbm.so (обёртка над системным libgbm)
 scripts/setup-system.sh       разовая установка под root
 scripts/doctor.sh             проверка зависимостей + преflight сессии
 scripts/verify.sh             проверка артефактов сборки
@@ -153,7 +152,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 Это всё: **интеграции с дисплейным менеджером нет и не будет, systemd-юнитов нет**. `start-session.sh` сам поднимает бриджи (каждый под watchdog-ом перезапуска), затем сессию, и по своему выходу всё убивает.
 
-Запускать `./session/start-session.sh` **из обычного терминала (TTY) либо из любого окна** — отдельно `startx` запускать не нужно: если `DISPLAY` не задан, скрипт сам поднимает X через `startx` (первый свободный `:N`) и становится его клиентом; если `DISPLAY` уже есть (X-сеанс LightDM/GDM/SDDM), используется он. Внутри уже поднятого X-сеанса `start-session.sh` просто работает поверх него.
+Запускать `./session/start-session.sh` нужно **с чистой VT**, где никто не держит DRM master: не из X-сеанса и не из другого Wayland-композитора (niri, sway, GNOME, KDE). Скрипт сам проверит карту, ввод, udev и отсутствие известных композиторов; если что-то не так — откажется стартовать с понятным сообщением. X-сервер и `startx` в этой ветке не используются вообще.
 
 Пересборка с нуля: `make clean && make`. Время сборки — около 5 минут, из них 4 — патчинг 603-мегабайтного бинарника.
 
@@ -174,11 +173,11 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 ### Чек-лист для прогона в VM
 
-1. Проверить `./scripts/doctor.sh` — все пункты `ok` (включая `== session preflight ==`).
+1. Проверить `./scripts/doctor.sh` — все пункты `ok` (включая `== DRM preflight ==` и `== session preflight ==`).
 2. `make` — завершается строкой `bridges -> .../dist/bin/`.
 3. `sudo ./scripts/setup-system.sh --user "$USER"` — печатает `setup-system: done`.
-4. `./scripts/smoke-test.sh` — 11 passed / 0 failed (можно и без X, это только D-Bus).
-5. `./session/start-session.sh` — появляется окно Ash; `ls /tmp/.X11-unix/` показывает два сокета: хост X (`X0` либо `X1`, какой свободный взял startx) и Xwayland `X10`.
+4. `./scripts/smoke-test.sh` — 11 passed / 0 failed (можно и без DRM, это только D-Bus).
+5. Переключиться на свободную VT (`chvt 2`), убедиться, что `fuser /dev/dri/card0` пуст и `pgrep -x niri` пуст, затем `./session/start-session.sh` — появляется рабочий стол Ash прямо на KMS.
 
 ## Что делает `setup-system.sh` (root, идемпотентен)
 
@@ -209,8 +208,9 @@ sudo ./scripts/setup-system.sh --user "$USER"
 `./session/start-session.sh`:
 
 1. Проверяет системную шину и что профиль (`/var/lib/ash-profile`) записываем — иначе вежливо просит прогнать `setup-system.sh`.
-2. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad` (с `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power` и `mojo-stub`. Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
-3. Запускает `session/chromeos-linux-session` и ждёт его; при выходе убивает бриджи и пробрасывает код возврата.
+2. Прогоняет DRM-preflight: карта `/dev/dri/card0` (rw), читаемые `/dev/input/event*`, `/run/udev/control`, отсутствие известных композиторов, ChromeOS-режим `/etc/lsb-release`; при провале отказывается стартовать.
+3. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad` (с `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power` и `mojo-stub`. Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
+4. Запускает `session/chromeos-linux-session` и ждёт его; при выходе убивает бриджи и пробрасывает код возврата.
 
 `chromeos-linux-session` (цикл):
 
@@ -218,18 +218,22 @@ sudo ./scripts/setup-system.sh --user "$USER"
 2. Прогоняет `register-apps` — пишет Linux-приложения в лаунчер Ash.
 3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), открывает `chrome-untrusted://terminal/`, кладёт `terminal/terminal-ui.js` в `localStorage.t` и перезагружает страницу. Это срабатывает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
 4. Поднимает в фоне sommelier + Xwayland на `:10` (ждёт появления `wayland-0` и ответа CDP, выставляет чёрно-белые цвета xterm через `xrdb`).
-5. Определяет границы окна Ash через `xrandr` и запускает Chrome с закреплённым набором флагов (`--enable-wayland-server`, `--ozone-platform=x11`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`, GPU-блок `--ignore-gpu-blocklist` + `--disable-gpu-sandbox` + `--enable-logging=stderr` — последний вместе с no-op `RedirectChromeLogging` и есть то, что кладёт ERROR'ы в `ash.log`).
+5. Запускает Chrome с `--ozone-platform=drm --use-angle=gles-egl` (`--enable-wayland-server`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`, GPU-блок `--ignore-gpu-blocklist` + `--disable-gpu-sandbox` + `--enable-logging=stderr` — последний вместе с no-op `RedirectChromeLogging` и есть то, что кладёт ERROR'ы в `ash.log`). `--use-angle=gles-egl` обязателен: на этом снапшоте ANGLE по умолчанию выбирает OpenGL/GLX-бэкенд, который на VT без X-сервера падает с `Could not open the default X display`, после чего Viz убивает браузер (`Software compositing fallback is unavailable`). С `gles-egl` ANGLE работает поверх нативного Mesa EGL/GLES и GBM. `--ash-host-window-bounds` намеренно не передаётся: без него `DisplayManager::InitFromCommandLine()` возвращает false, и Ash выполняет настоящую настройку KMS.
 6. Когда Chrome вышел — убивает sommelier/Xwayland, ждёт остаточных процессов `chrome` и начинает заново.
 
-### Дисплейные режимы
+### Дисплейный режим
 
-| Как запустил | Что произойдёт |
+Дисплей один и он же — DRM/KMS. Никаких «режимов» и выбора `DISPLAY` нет:
+
+| Что нужно | Требование |
 |---|---|
-| Из терминала в X-сеансе | используется ваш `DISPLAY` и ваш `XAUTHORITY` (копируется в `/tmp/ash-xauth`) |
-| С TTY (нет `DISPLAY`) | `start-session.sh` сам поднимает X через `startx` (первый свободный `:N`), становясь его клиентом; X убивается при выходе |
-| `XAUTHORITY` недоступен (как у LightDM без копии cookie) | делается `xhost +local:` (фолбэк) |
+| Карта | `/dev/dri/card0` (переопределяется `ASH_DRM_CARD`), rw у пользователя |
+| Ввод | читаемые `/dev/input/event*` и работающий `systemd-udevd` |
+| DRM master | никто другой не держит карту: не запущены niri/Xorg/sway/Hyprland/weston/GNOME/KDE |
+| ChromeOS-режим | `/etc/lsb-release` с `CHROMEOS_RELEASE_NAME=` — иначе `IsRunningAsSystemCompositor()` = false и KMS не настраивается |
+| VT | сессия сама уходит в `setsid`; переключение VT/logind-интеграции нет (см. «Ограничения») |
 
-Если на машине уже есть `wayland-0` (например, вы внутри другого Ash или Wayland-сессии) — старые сокеты удаляются, `--enable-wayland-server` Ash займёт этот слот.
+Если на машине уже есть `wayland-0` (например, вы внутри другого Ash) — старые сокеты удаляются, `--enable-wayland-server` Ash займёт этот слот.
 
 Перед подъёмом бриджей `start-session.sh` отцепляет всё дерево сессии от управляющего терминала (`exec setsid --wait`), чтобы чтение `/dev/tty` кем-либо из процессов сессии не могло остановить группой всю оболочку — подробности и разбор инцидента во врезке в «Типовых проблемах».
 
@@ -242,9 +246,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | `ASH_LOGIN_PROFILE` | `test-user` | подкаталог профиля (`--login-profile`) |
 | `ASH_DIRECT_LOGIN` | `1` | `0` — не передавать флаги входа вообще |
 | `ASH_LOGIN_MANAGER` | `0` | `1` — вместо прямого входа `--login-manager --oobe-skip-to-login` |
-| `ASH_DISPLAY_SIZE` | `1920x1080` | запасные границы окна, если `xrandr` ничего не сообщает |
-| `ASH_DISPLAY_BOUNDS` | — | явные границы `ШxВ` (без промеров) |
-| `ASH_XRANDR_OUTPUT` | основной вывод | принудительно указать, какой xrandr-вывод менять по размеру |
+| `ASH_DRM_CARD` | `/dev/dri/card0` | DRM-карта, которой владеет Ash; проверяется preflight'ом и используется в `display_alive()` |
 | `ASH_MOJO` | `1` | `0` — не запускать `mojo-stub` в `start-session.sh` |
 | `ASH_SMOKE_TIMEOUT` | `6` | сколько секунд `make test` ждёт появления имени на шине |
 | `ASH_TERMINAL_UI` | — | путь к `terminal-ui.js` для `terminal-inject.pl` (по умолчанию аргумент из сессии) |
@@ -254,28 +256,26 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 Снапшот патчится в `scripts/build-chrome.sh`. Каждый патч сверяет ожидаемые байты и **падает с ошибкой**, если бинарник не совпал — молчаливо «починить» чужой бинарник нельзя.
 
+Важно: патчи, нужные только для старого X11-хоста (`DisplayConfigurator::Init`, `RunPendingConfiguration`, `HasInternalDisplay`, X11-движок раскладки и фикс `GetEventPropertiesFromXEvent`), в этой ветке **не применяются**. На DRM нативный display delegate обязан остаться на месте, а реальная настройка KMS — выполняться; `scripts/verify.sh` проверяет, что оригинальные байты на месте.
+
 | Патч | Что делает | Без него |
 |---|---|---|
 | Терминальный стаб | `chrome.terminalPrivate.openVmshellProcess(...)` → `eval(localStorage.t||"")` | Terminal SWA пытается стартовать VM-шелл и падает |
 | Расслабление CSP | `'wasm-unsafe-eval'` → `'unsafe-eval'` (10 мест) | инжектированный UI терминала не выполняется |
-| `DisplayConfigurator::Init` | прыжок через нативную настройку дисплея | крэш на X11 (нет `NativeDisplayDelegate`) |
-| `RunPendingConfiguration` | `ret` (no-op) | крэш при смене конфигурации дисплея |
 | `RedirectChromeLogging` | `ret` (no-op) | Chrome уводит логи в ChromeOS-путь |
 | `OnDisconnect` | `ret` (no-op) | крэш при таймауте mojo-канала |
-| `HasInternalDisplay` | всегда `true` | нет ползунка яркости |
 | `IsSystemBlurEnabled` | всегда `true` | blur панели/шторки гейтится не на GPU, а на ОЗУ: `chromeos::features::IsSystemBlurEnabled()` — это буквально `AmountOfTotalPhysicalMemory() > 4GiB` из `/proc/meminfo`, без FeatureList и без флага. На хостах ≤4 ГБ (гости VirtualBox, типовые Haswell-ноутбуки) панель и шторка рисуются непрозрачными, хотя композитор blur умеет рисовать на чём угодно (`viz::SoftwareRenderer::GetBackdropFilterShader` есть). С патчем — blur при любом объёме RAM; на малорамных хостах это стоит части FPS в анимациях |
-| Раскладка RU/EN | `OzonePlatformX11::InitializeUI` вместо `StubKeyboardLayoutEngine` собирает пару `XkbEvdevCodes` + `XkbKeyboardLayoutEngine` (как DRM-платформа) и регистрирует её в `KeyboardLayoutEngineManager`, а thunk на месте мёртвого `Stub::Lookup` перенаправляет `StubInputController::SetCurrentLayoutByName` в зарегистрированный движок | смена RU/EN в шторке двигает только индикатор в трее: набор текста остаётся US (нужны xkb-данные из `xkb-data` / `xorg-xkbdata`) |
 | `IsSharedImageFormatSupported` | всегда `true` | exo отдаёт `BGRX_8888`, а проверка пропускает только `BGRA_8888` → `CanImportNativePixmap` говорит «нет» и `OzoneImageBackingFactory` не регистрируется: `Could not find SharedImageBackingFactory` |
 | `GetNativePixmapSupportType` | всегда `kX11Pixmap` (2) | выбирается ветка `kDMABuf`, требующая `EGL_EXT_image_dma_buf_import`, которой у ANGLE здесь нет → импорт не создаётся |
 | `NativePixmapEGLX11Binding::Create` | вырезан встроенный чек `format == kBGRA_8888` (NOP на `je`) | тот же чек, но вызываемый уже **внутри** `Create`: отказ приходит как `ProduceSkiaGanesh failed to create GL representation` (в release это только VLOG, в логе тишина) → белые окна |
 | `PopulateMappableDrmFormatsForExo` | из набора кандидатов убраны RGB-порядочные форматы: в rodata-таблице `RGBA_8888`→`BGRA_8888`, `RGBX_8888`→`BGRX_8888`, плюс `jne`→`jmp` пропускает условные `RGBA_F16` и `RGBA_1010102` | exo рекламирует в dmabuf-фидбеке `AB24`/`XB24`/`AB30`/`AB4H` — память R,G,B,A, а импорт идёт через X11-визуал depth-32 (память B,G,R,A), где fourcc теряется → **красный уходит в синий** во всех wayland-клиентах, рисующих через dmabuf (helium, Qt). shm-клиенты (GTK, Xwayland) не страдают — их память и так B,G,R,A |
 | crashpad-wrapper | всегда добавляет `--database` | падение на старте crashpad-handler'а |
 
+Отдельно от бинарных патчей важен выбор GL-бэкенда. В снапшоте 1670871 ANGLE по умолчанию на Linux поднимает OpenGL/GLX-бэкенд: в X11-ветке это работало, а на DRM/VT без `DISPLAY` `eglInitialize` падает с `ANGLE Display::initialize error 12289: Could not open the default X display`. GPU-процесс завершается, `VizProcessTransportFactory::DisableGpuCompositing()` упирается в `Software compositing fallback is unavailable` и Ash аварийно завершается (signal 6). Поэтому сессия передаёт `--use-angle=gles-egl`: ANGLE идёт через нативный Mesa EGL/GLES, находит GBM-устройство (`EGL_DEFAULT_DISPLAY`) и GPU-процесс стартует с `init_success:1`. На более старом снапшоте (1040000, ветка `old_drm`) этот флаг не нужен — там по умолчанию уже использовался нативный EGL; поэтому «на другой ветке работало».
+
 Чего патч **не** делает: он не трогает интерпретатор и RPATH. Снапшот уже использует `/lib64/ld-linux-x86-64.so.2` и `RUNPATH=$ORIGIN`, поэтому patchelf не нужен вообще — `ldd` на обычном дистрибутиве всё резолвит, а `libminigbm.so` подхватывается из каталога бинарника.
 
 Отдельно от патчей бинарника собирается **шим `libminigbm.so`** (`scripts/minigbm_shim.c`) — Chrome слинкован против ChromeOS-овского minigbm, а на хосте есть только Mesa `libgbm`, и они не сходятся в двух местах: биты usage (у minigbm есть биты, которых нет у Mesa) и коды типа импорта (`GBM_BO_IMPORT_FD_MODIFIER` = `0x5505` у minigbm против `0x5504` у Mesa → `default: return NULL`). Шим кладётся **вместо** оригинала (он остаётся рядом как `libminigbm.so.orig`), резолвит 19 точек входа в `libgbm.so.1` через `dlopen`, транслирует тип импорта, маскирует usage, при неудаче падает обратно на `modifier=0`, затем на legacy `FD`-импорт и пишет трассировку в `/tmp/gbm-shim.log`. Без шима GPU-процесс не находит backing'и для `SharedImage` — см. таблицу GPU-патчей выше, они дополняют его, а не заменяют.
-
-Отдельно собирается `libdisplayfix.so` (`scripts/displayfix.c`) — крошечный shim, который лаунчер кладёт в `LD_PRELOAD`. Он всегда ставит `XAUTHORITY=/tmp/ash-xauth`, а если `DISPLAY` пуст — ставит `:0` и пишет диагностику в `/tmp/xwrap.log`. Shim молчит, если чинить нечего (иначе лог раздулся бы от каждой дочерней процессии Chrome).
 
 ## Режим ChromeOS: lsb-release и mojo
 
@@ -285,6 +285,8 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * `start-session.sh` по умолчанию запускает `mojo-stub`, который делает ACCEPT_INVITEE и сливает сообщения (заглушка, но рабочая).
 
 Отключить: `sudo ./scripts/setup-system.sh --no-mojo` (и при желании `ASH_MOJO=0` перед запуском сессии). Тогда Ash вернётся на встроенные fallback-клиенты, а мосты станут почти не нужны.
+
+**В DRM-ветке `--no-mojo` фактически несовместим с рабочим экраном:** без `CHROMEOS_RELEASE_NAME` `IsRunningAsSystemCompositor()` возвращает false, `DisplayConfigurator` не настраивает KMS, и вы получите чёрный экран. Флаг оставлен для отладки, но `setup-system.sh` теперь печатает об этом предупреждение.
 
 Без `DEVICETYPE=CHROMEBOOK` Ash считает машину «обычным Linux» и ведёт себя заметно скучнее.
 
@@ -301,11 +303,11 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * NetworkManager отдаёт шилл-бриджу реальное состояние сети.
 * Громкость работает через CRAS-бридж (PulseAudio/PipeWire).
 * UPower кормит бридж питания состоянием батареи.
-* Яркость работает через sysfs с фолбэком на `xrandr`.
+* Яркость работает через sysfs.
 * Работает Linux-сантехника: выбор файлов, xdg-desktop-portal-gtk, polkit-промпты, gnome-keyring.
 * Работает **нативный лок-экран Ash** (`Ctrl+Shift+L`) и разлочка **любым паролем** (см. «Лок-экран и разлочка»).
-* Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — см. патч «Раскладка RU/EN».
-* Linux-приложения рендерятся через GPU: sommelier запускает Xwayland с `--force-drm-device` и `--enable-linux-dmabuf`, поэтому клиенты получают `zwp_linux_dmabuf_v1`, а путь dmabuf → exo → `OzoneImageBacking` закрыт тремя GPU-патчами бинарника вместе с шимом `libminigbm.so` (см. «Патчи бинарника»). `glxgears` на `:10` держит ~60 FPS, и сессия при этом не подвисает. **`--glamor` намеренно НЕ передаётся** — почему, см. «Сырые места».
+* Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — на DRM это делает нативный `XkbKeyboardLayoutEngine`.
+* Linux-приложения рендерятся через GPU: sommelier запускает Xwayland с `--force-drm-device` и `--enable-linux-dmabuf`, поэтому клиенты получают `zwp_linux_dmabuf_v1`, а путь dmabuf → exo → `OzoneImageBacking` закрыт тремя GPU-патчами бинарника вместе с шимом `libminigbm.so` (см. «Патчи бинарника»). `glxgears` на `:10` держит ~60 FPS, и сессия при этом не подвисает. **`--glamor` передаётся**: Xwayland рендерит через GPU (glamor), так что ускоряются и внутренние 2D-операции X-сервера; подробности и исторический нюанс с мерцанием OBS — в «Сырых местах».
 
 ## Сырые места
 
@@ -313,6 +315,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 | Область | Состояние |
 |---|---|
+| DRM/VT | Ash сам держит `/dev/dri/card0`; переключения VT и интеграции с logind нет. Зависший Chrome не отдаёт карту — спасает только SSH/другая TTY и `pkill` |
 | Данные сети/аудио/батареи в трее | Реальные данные есть, но очень ограничены |
 | Интеграция Linux-приложений в лаунчер | `.desktop`-файлы пишутся в настройки Crostini, но запускаться могут не все (большинство — да) |
 | Эмуляция терминала | Базовый VT100 хватает на fastfetch; для работы бери нормальный терминал |
@@ -321,7 +324,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | Гостевой профиль | `/home/chronos/user` — обычная директория, а не cryptohome |
 | Лок-экран | Настоящий, но **разлочивается любым паролем** (в т.ч. пустым): `session-bridge` отдаёт фиктивный `StartAuthSessionReply` с password-фактором `local-password` и всегда успешный `AuthenticateAuthFactor`. Системная соль — константа из моста. `ListAuthFactors` возвращает пусто, поэтому в логе безвредный warning `lock_contents_view.cc:937` (поле ввода пароля показывается дефолтно) |
 | Трей-иконки приложений | StatusNotifierItem не реализован |
-| `--glamor` у Xwayland (ускорение самого X-сервера) | **Намеренно выключен.** Бисекция по одному флагу: без glamor превью OBS стабильно, с ним — мерцание (chrome композитит поверхность с альфой=0: xterm просвечивает насквозь и кадры накапливаются ×1→×2→×3), а железный OBS вообще не показывает картинку; патч opaque-региона в sommelier не помог, триггер лежит внутри glamor. Без glamor Xwayland работает с `-shm` и отдаёт непрозрачные `XRGB8888`-буферы — поэтому и стабильно. Теряется только ускорение внутренних 2D-операций самого X-сервера (скроллинг/копии гигантских окон); клиентский GPU-рендер (OBS, glxgears, видео) от glamor не зависит и остаётся железным |
+| `--glamor` у Xwayland (ускорение самого X-сервера) | **Включён.** Xwayland рендерит через glamor, поэтому ускоряются не только клиентские GL-приложения, но и 2D-операции самого X-сервера (скроллинг, копии больших окон). Исторический нюанс: в X11-ветке флаг был выключен из-за мерцания превью OBS (chrome композитит поверхность с альфой=0: xterm просвечивает и кадры накапливаются ×1→×2→×3), а железный OBS мог показывать пустую картинку. На DRM-ветке флаг включён; если это мерцание вернётся, первым делом убирайте `--glamor` (тогда Xwayland откатится на `-shm`/`XRGB8888`) |
 
 ## Лок-экран и разлочка
 
@@ -353,13 +356,22 @@ make verify           # артефакты: библиотеки, интерпр
 make test             # бриджи на реальной системной шине + реальные вызовы методов
 ```
 
+Блок `== DRM preflight ==` в `doctor.sh` проверяет то, без чего Ash просто не сможет занять экран:
+
+* **`/dev/dri/card0` отсутствует или не rw** → Chrome не сможет стать DRM-мастером и настроить KMS. Лечение: загрузить драйвер, добавить пользователя в группу `video`.
+* **нет читаемых `/dev/input/event*`** → не будет клавиатуры и мыши. Лечение: группа `input`.
+* **`/run/udev/control` отсутствует** → `DeviceManagerUdev` не перечислит устройства. Лечение: запустить `systemd-udevd`.
+* **`/etc/lsb-release` не в ChromeOS-режиме** → `IsRunningAsSystemCompositor()` = false, `DisplayConfigurator` не трогает KMS, экран остаётся чёрным. Лечение: `sudo ./scripts/setup-system.sh`.
+* **запущен niri/Xorg/sway/...** → они держат DRM master. Лечение: остановить их и запускать сессию с чистой VT.
+* **`fuser /dev/dri/card0` показывает чужие pid** — предупреждение: возможно, карту уже открыл другой процесс.
+
 Блок `== session preflight ==` в `doctor.sh` ловит «тихие» поломки, которые иначе выглядят как «всё собралось, но почему-то не работает»:
 
 * **`/dev/kvm` отсутствует** → Chrome при старте сессии видит, что виртуализации нет, и **молча** отказывается открывать любые Linux-приложения (в UI нет ошибки — просто не открывается). Заглушки-файлы создаёт `setup-system.sh` (tmpfiles), пересоздаются при каждой перезагрузке — но **только на хостах без KVM**; если KVM есть, `setup-system.sh` заглушку не ставит (а заодно снимает уже установленную — она перекрывает настоящий device-node, и udev не может его создать), и `doctor.sh` это отдельно проверяет.
 * **`/usr/bin/vsh` / `/usr/bin/crosh` отсутствуют** → терминал падает с `failed to execvp /usr/bin/vsh`. Ash вызывает их по **абсолютному** пути, `PATH` не ищет, поэтому заглушка обязана лежать именно в `/usr/bin`.
 * **D-Bus-политика** не установлена → бриджи не могут занять имена `org.chromium.*`, и шина молча отклоняет всё.
 * **systemd-logind** неактивен → suspend/reboot из трея мертвы. Обычно за этим стоит мёртвый polkit: polkitd выходит в момент падения системной шины (теряет `org.freedesktop.PolicyKit1`, а `polkit.service` — static, без `Restart=`), после чего logind зависает, дожидаясь polkit-авторизации. Раньше `setup-system.sh` при каждом изменении политики делал `restart dbus` и ронял polkit вместе с шиной — теперь он применяет политику `reload`-ом (без разрыва соединений) и отдельно поднимает polkit.
-* **logind «active», но без D-Bus-имени** → Xorg не стартует: `Cannot open virtual console 1 (Permission denied)`. Тонкость в том, что `is-active` тут врёт — перезапуск шины рвёт соединение logind, а юнит остаётся «active»; имя `org.freedesktop.login1` logind занимает только при (пере)подключении. Xorg просит logind взять VT (`TakeControl`/`TakeDevice`), ответа нет, и он падает в ветку прямого открытия `/dev/tty1`, на которое у обычного пользователя прав нет. Лечение: `sudo ./scripts/setup-system.sh` (он сам перезапустит logind) или вручную `sudo systemctl restart systemd-logind` — после чего имя возвращается и `startx` поднимается. Проверка: `busctl status org.freedesktop.login1` (должен быть владелец, а не `(activatable)`).
+* **logind «active», но без D-Bus-имени** → в DRM-режиме Chrome не просит logind о VT (он сам открывает `/dev/dri/card0`), но активная logind-сессия даёт uaccess-ACL на карту и input-узлы, а через неё же идут suspend/reboot из трея. Если имя `org.freedesktop.login1` пропало (перезапуск шины рвёт соединение, а юнит остаётся «active»), эти вещи ломаются. Лечение: `sudo ./scripts/setup-system.sh` (он сам перезапустит logind) или вручную `sudo systemctl restart systemd-logind`. Проверка: `busctl status org.freedesktop.login1` (должен быть владелец, а не `(activatable)`).
 
 `make test` — самый полезный предварительный прогон: он поднимает каждый бридж, ждёт, пока его имя появится на шине (это возможно только при корректной политике), дёргает `GetVolumeState` и `RetrieveSessionState`, проверяет mojo-сокет и `register-apps`. При провале логи не удаляются, а печатаются.
 
@@ -371,17 +383,30 @@ make test             # бриджи на реальной системной ш
 | `/var/lib/ash-profile/sommelier.log` | sommelier и Xwayland |
 | `/var/lib/ash-profile/*-bridge.log` | по одному на бридж |
 | `/var/lib/ash-profile/bridges.log` | записи watchdog-ов о перезапусках |
-| `/var/lib/ash-profile/xorg.log` | свой Xorg, если поднимал скрипт |
 | `/var/lib/ash-profile/test-user/log/ash` | собственный сессионный лог Chrome |
-| `/tmp/xwrap.log` | случаи, когда `libdisplayfix.so` чинил `DISPLAY` |
+| `/tmp/gbm-shim.log` | каждый вызов шима `libminigbm.so` (очищается при старте сессии) |
 | `/tmp/chromeos-linux/shell-stub.log` | вызовы заглушек `vsh` / `crosh` |
+
+Быстрая диагностика DRM-слоя:
+
+```bash
+fuser /dev/dri/card0           # кто держит карту (должно быть пусто до старта)
+modetest -M vmwgfx -c          # коннекторы/режимы (libdrm-tests), на других GPU — свой драйвер
+cat /sys/class/drm/card0-*/status
+grep -iE 'ozone|drm|gbm|Failed to|Invalid' /var/lib/ash-profile/ash.log
+```
+
+Если экран чёрный, а процесс жив — почти всегда либо не ChromeOS-режим `lsb-release`, либо карту уже держит другой композитор, либо `--ash-host-window-bounds` попал в аргументы (тогда KMS не настраивается).
 
 ### Типовые проблемы
 
 | Симптом | Причина | Действие |
 |---|---|---|
 | Бриджи пишут `not allowed to own … due to security policies` | политика не установлена или dbus её отбросил | `sudo ./scripts/setup-system.sh --user "$USER"`, перезапуск dbus/перезагрузка; `make verify` ловит это заранее |
-| `no DISPLAY and no Xorg to start` | запущено не из X-сеанса и нет `xserver-xorg` | запусти из терминала в X или поставь `xserver-xorg` |
+| `DRM mode: /dev/dri/card0 not found` / `no read/write access` | нет карты или пользователь не в группах `video`/`render` | загрузи драйвер, `sudo usermod -aG video,render,input $USER`, перелогинься |
+| `DRM mode: niri is running and likely holds DRM master` | сессия запущена поверх другого композитора | останови его и запусти с чистой VT |
+| Экран чёрный, Chrome жив | не ChromeOS-режим `lsb-release` или передан `--ash-host-window-bounds` | `sudo ./scripts/setup-system.sh`; проверь аргументы в `chromeos-linux-session` |
+| `Failed to open primary graphics card` в `ash.log` | нет прав на `/dev/dri/card0` или карту держит другой процесс | `fuser /dev/dri/card0`, группы `video`/`render` |
 | Linux-приложения не рисуются | нет `Xwayland` в `$PATH` | поставь пакет `xwayland` |
 | Chrome вылетает сразу | смотри `ash.log`; либо снапшот не тот (только x86_64, только пин из `chromeos-bin/REVISION`) | сверь пины (`./chromeos-bin/fetch.sh --force` перескачает и напечатает sums; `make fetch` аргументов не принимает) |
 | `Pactl not found` / громкость не регулируется | нет `pulseaudio-utils` | поставь пакет |
@@ -393,7 +418,18 @@ make test             # бриджи на реальной системной ш
 
 > **Врезка про D-Bus-политику.** Debian/Ubuntu поставляют dbus 1.14, который не знает, например, `receive_sender_prefix`. Ошибка разбора через `<includedir>` — это не предупреждение, а тихое удаление файла из конфигурации, после чего *ни одно* имя `org.chromium.*` занять нельзя. Поэтому: проверяйте правки политики через `make verify` (он реально поднимает `dbus-daemon` на файле) и держите в голове, что поддерживаются только классические атрибуты `own`, `own_prefix`, `send_destination`, `send_destination_prefix`, `send_interface`, `receive_sender`.
 
-> **Врезка про зависание всей сессии (состояние `T`).** Сессия, запущенная через `startx`, наследует управляющий терминал `/dev/tty1`, оставаясь при этом *фоновой* группой tty1 (foreground-группа — у самого xinit). Читать/писать `/dev/tty` из фоновой группы нельзя: ядро шлёт SIGTTIN/SIGTSTP **всей** группе. Типичный триггер — `pkexec` без запущенного polkit-агента: его внутренний текстовый агент лезет на терминал за паролем, и целиком встаёт всё — Chrome, бриджи, скрипты. Поэтому `session/start-session.sh` теперь делает `exec setsid --wait "$0"` сразу после startx-блока: всё дерево сессии уходит в отдельную сессию **без** управляющего терминала, чтение `/dev/tty` возвращает `ENXIO`, и посторонний читатель роняет только себя. `--wait` тут не косметика: без него, если процесс уже лидер группы, `setsid` форкается, родитель выходит, и xinit считает клиент мёртвым — с `--wait` родитель дожидается ребёнка и teardown startx работает как прежде. Чего это **не** лечит: без агента `pkexec` теперь быстро откажется с ошибкой вместо запроса пароля — агента запускай сам (`polkit-gnome-authentication-agent-1`, `lxpolkit`, что угодно своё; в скрипты он не добавлен). Восстановление после зависания (для запусков до этого фикса): `kill -KILL` на pkexec-цепочку (например `pkill -x synaptic-pkexec`), затем `kill -CONT -- -<PGID>`.
+> **Врезка про зависание всей сессии (состояние `T`).** Сессия наследует управляющий терминал VT, оставаясь при этом *фоновой* группой этого tty. Читать/писать `/dev/tty` из фоновой группы нельзя: ядро шлёт SIGTTIN/SIGTSTP **всей** группе. Типичный триггер — `pkexec` без запущенного polkit-агента: его внутренний текстовый агент лезет на терминал за паролем, и целиком встаёт всё — Chrome, бриджи, скрипты. Поэтому `session/start-session.sh` делает `exec setsid --wait "$0"`: всё дерево сессии уходит в отдельную сессию **без** управляющего терминала, чтение `/dev/tty` возвращает `ENXIO`, и посторонний читатель роняет только себя. `--wait` тут не косметика: без него, если процесс уже лидер группы, `setsid` форкается, родитель выходит, и вызывающая оболочка теряет сессию. Чего это **не** лечит: без агента `pkexec` теперь быстро откажется с ошибкой вместо запроса пароля — агента запускай сам (`polkit-gnome-authentication-agent-1`, `lxpolkit`, что угодно своё; в скрипты он не добавлен). Восстановление после зависания: `kill -KILL` на pkexec-цепочку (например `pkill -x synaptic-pkexec`), затем `kill -CONT -- -<PGID>`.
+
+> **Врезка про восстановление DRM-сессии.** VT-switching и logind-интеграции у этой ветки нет: Chrome открывает карту сам и не отдаёт её при `Ctrl+Alt+F2`. Поэтому при зависании переключайтесь на другую TTY по SSH или через `chvt` с соседнего терминала и убивайте процессы:
+>
+> ```bash
+> pkill -f 'dist/chrome/chrome'
+> pkill -f 'session/chromeos-linux-session'
+> pkill -f 'session/start-session.sh'
+> chvt 1
+> ```
+>
+> `stop_compositor()` в сессии убивает только `Xwayland :10`, а не любой `Xwayland`, чтобы не задеть чужой хост-композитор.
 
 ## Обновление ревизии Chrome
 
@@ -422,9 +458,8 @@ make test             # бриджи на реальной системной ш
 
 * Chrome запускается с `--no-sandbox` (и `--disable-*-sandbox`).
 * D-Bus-политика разрешает **любому локальному пользователю** занять имена `org.chromium.*` — то есть любому юзеру машины доступны методы, которые Ash считает «системными».
-* Фолбэк `xhost +local:` открывает X-дисплей для всех локальных клиентов (срабатывает только если cookie скопировать не удалось).
+* Сессия работает на голом DRM/KMS и не интегрирована с logind/VT: зависший Chrome удерживает карту, пока его не убьют извне.
 * CDP-порт `9222` открыт на localhost на всё время работы сессии.
-* `/tmp/ash-xauth` создаётся с правами 0644.
 
 Запускайте это в VM или на машине, которую не жалко.
 

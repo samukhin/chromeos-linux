@@ -20,9 +20,12 @@ fi
 
 echo "== dist/chrome =="
 for f in chrome chrome_crashpad_handler chrome_crashpad_handler.real \
-         chromeos-ash libdisplayfix.so libminigbm.so; do
+         chromeos-ash libminigbm.so; do
   [ -e "$ASH_ROOT/dist/chrome/$f" ] || fail "dist/chrome/$f missing"
 done
+if [ -e "$ASH_ROOT/dist/chrome/libdisplayfix.so" ]; then
+  fail "dist/chrome/libdisplayfix.so present — this is the DRM branch, X11 shim must be gone"
+fi
 if [ -x "$ASH_ROOT/dist/chrome/chromeos-ash" ]; then
   ok "launcher present"
 fi
@@ -48,6 +51,64 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
     ok "terminal stub patch applied"
   else
     fail "terminal stub patch missing"
+  fi
+
+  # DRM-ветка: X11-патчи не должны присутствовать. Проверяем оригинальные байты
+  # в точках, которые старый X11-билд перезаписывал. Если байты не совпали,
+  # значит DisplayConfigurator по-прежнему пропускает настройку дисплея, а
+  # RunPendingConfiguration — no-op: реальный KMS-modeset не выполнится.
+  if have nm && have objdump && have gawk; then
+    chrome="$ASH_ROOT/dist/chrome/chrome"
+    delta=$(objdump -h "$chrome" | awk '$2 == ".text" {
+      printf "%d\n", strtonum("0x"$6) - strtonum("0x"$4)
+    }')
+    if [ -z "$delta" ]; then
+      fail "cannot find .text section in chrome"
+    else
+      sym_va() {
+        # nm gets SIGPIPE when awk stops at the first match; the `|| true`
+        # keeps `set -o pipefail` from treating that as a failure.
+        local out
+        out=$(nm -C "$chrome" | SYM_PATTERN="$1" \
+          awk '$0 ~ ENVIRON["SYM_PATTERN"] { print "0x"$1; exit }') || true
+        printf '%s' "$out"
+      }
+      bytes_at() { # <offset> <count>
+        dd if="$chrome" bs=1 skip="$1" count="$2" 2>/dev/null |
+          od -An -v -tx1 | tr -d ' \n'
+      }
+      va_offset() { awk -v va="$1" -v delta="$2" -v extra="${3:-0}" \
+        'BEGIN { printf "%d\n", strtonum(va) + extra + delta }'; }
+
+      va=$(sym_va ' display::DisplayConfigurator::Init\(std::.*unique_ptr<display::NativeDisplayDelegate')
+      if [ -z "$va" ]; then
+        fail "DisplayConfigurator::Init symbol not found"
+      elif [ "$(bytes_at "$(va_offset "$va" "$delta" 13)" 7)" = "807f2101753749" ]; then
+        ok "DisplayConfigurator::Init is original (native display config enabled)"
+      else
+        fail "DisplayConfigurator::Init still patched — DRM modeset will be skipped"
+      fi
+
+      va=$(sym_va ' display::DisplayConfigurator::RunPendingConfiguration\(\)')
+      if [ -z "$va" ]; then
+        fail "RunPendingConfiguration symbol not found"
+      elif [ "$(bytes_at "$(va_offset "$va" "$delta")" 1)" = "55" ]; then
+        ok "RunPendingConfiguration is original (push %rbp)"
+      else
+        fail "RunPendingConfiguration still patched to a no-op"
+      fi
+
+      va=$(sym_va ' display::HasInternalDisplay\(\)')
+      if [ -z "$va" ]; then
+        fail "HasInternalDisplay symbol not found"
+      elif [ "$(bytes_at "$(va_offset "$va" "$delta")" 3)" = "554889" ]; then
+        ok "HasInternalDisplay is original (push %rbp; mov %rsp,%rbp)"
+      else
+        fail "HasInternalDisplay still forced to true"
+      fi
+    fi
+  else
+    echo "  skip: nm/objdump/gawk not installed"
   fi
 
   # Три GPU-патча из build-chrome.sh (зачем они — см. там же и в README).
@@ -135,6 +196,13 @@ for s in start-session.sh chromeos-linux-session terminal-inject.pl chromeos-ash
     fail "session/$s missing"
   fi
 done
+# Without gles-egl, ANGLE's default GLX backend cannot initialize on a VT
+# (no DISPLAY), the GPU process dies and Viz aborts the browser.
+if grep -q -- '--use-angle=gles-egl' "$ASH_ROOT/session/chromeos-linux-session"; then
+  ok "DRM session forces ANGLE gles-egl backend"
+else
+  fail "session/chromeos-linux-session missing --use-angle=gles-egl (GPU init fails without DISPLAY)"
+fi
 
 echo "== dbus policy =="
 # dbus < 1.15 refuses unknown attributes (e.g. receive_sender_prefix) and then

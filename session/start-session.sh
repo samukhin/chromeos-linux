@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Bring up the ChromeOS D-Bus bridges and then the Ash session.
 #
+# Ash runs directly on DRM/KMS (--ozone-platform=drm): there is no X server
+# and no host Wayland compositor. Start this from a free VT, with no other
+# DRM master (no niri/Xorg/sway/...) and no X session on the same seat.
+#
 # This replaces the systemd units the NixOS module generated: every bridge runs
 # as the current user with a small watchdog that restarts it, and everything is
 # torn down when this script exits.
@@ -17,37 +21,72 @@ PROFILE="${ASH_PROFILE_DIR:-/var/lib/ash-profile}"
 TEST_USER="${ASH_LOGIN_PROFILE:-test-user}"
 LOGS="$PROFILE"
 MOJO="${ASH_MOJO:-1}"
+ASH_DRM_CARD="${ASH_DRM_CARD:-/dev/dri/card0}"
 
-# Self-launch an X server when there is no display yet, so this script can be
-# run directly (`./session/start-session.sh`) instead of `startx ./session/...`.
-# Ash's Chrome needs a real X display (it runs --ozone-platform=x11). We re-exec
-# ourselves under startx, which picks a free display and vt, runs us as its
-# client, and tears the X server down when we exit. ASH_UNDER_STARTX guards
-# against a loop if startx somehow fails to provide $DISPLAY.
-if [ -z "${DISPLAY:-}" ] && [ "${ASH_UNDER_STARTX:-0}" != "1" ]; then
-  command -v startx >/dev/null 2>&1 ||
-    die "no \$DISPLAY and no startx — install xinit, or run inside an existing X session"
-  export ASH_UNDER_STARTX=1
-  log "no display; launching X via startx, then starting the session"
-  # No server args on purpose: startx already picks the FIRST FREE display
-  # (/usr/bin/startx scans for an unused :N) and adds the current vt with
-  # -keeptty itself. Forcing ":0 vt1" would collide when :0 is busy (a real
-  # session here once had to land on :1) or when not on tty1.
-  exec startx "$ASH_ROOT/session/start-session.sh"
-fi
+# Fail early with a clear message instead of letting Chrome die inside the
+# display configurator (where the only symptom is a black screen in ash.log).
+drm_preflight() {
+  [ -e "$ASH_DRM_CARD" ] ||
+    die "DRM mode: $ASH_DRM_CARD not found — is the graphics driver loaded?"
+  [ -r "$ASH_DRM_CARD" ] && [ -w "$ASH_DRM_CARD" ] ||
+    die "DRM mode: no read/write access to $ASH_DRM_CARD — add $(id -un) to the video group"
 
-# Detach the whole tree from the controlling terminal. Under startx/xinit the
-# session inherits /dev/tty1 while staying a BACKGROUND process group there
-# (xinit's own group is the foreground one), and a background group stops on
-# any tty read/write: with no polkit agent running, pkexec's internal text
-# agent prompts on the tty and the kernel delivers SIGTSTP/SIGTTIN to the
-# ENTIRE group — Chrome, bridges, everything freezes in state T. In a fresh
-# session with no ctty, /dev/tty reads fail with ENXIO instead.
+  # EventFactoryEvdev / DeviceManagerUdev enumerate devices through udev.
+  [ -e /run/udev/control ] ||
+    die "DRM mode: /run/udev/control missing — is systemd-udevd running?"
+
+  local ev found=0
+  for ev in /dev/input/event*; do
+    [ -e "$ev" ] || continue
+    if [ -r "$ev" ]; then found=1; break; fi
+  done
+  [ "$found" = 1 ] ||
+    die "DRM mode: no readable /dev/input/event* — add $(id -un) to the input group"
+
+  # Another compositor would hold DRM master, so Chrome could not modeset.
+  local c
+  for c in niri Xorg X sway Hyprland weston gnome-shell kwin_wayland; do
+    pgrep -x "$c" >/dev/null 2>&1 &&
+      die "DRM mode: $c is running and likely holds DRM master — stop it first"
+  done
+
+  # logind is not required for DRM, but an active seat session gives uaccess
+  # ACLs for the card and input nodes.
+  if [ -n "${XDG_SESSION_ID:-}" ] && command -v loginctl >/dev/null 2>&1; then
+    loginctl show-session "$XDG_SESSION_ID" -p Active 2>/dev/null |
+      grep -q 'Active=yes' ||
+      log "WARNING: logind session $XDG_SESSION_ID is not active (running from SSH?)"
+  else
+    log "WARNING: XDG_SESSION_ID unset (running from SSH?) — input/DRM ACLs may be missing"
+  fi
+
+  # IsRunningAsSystemCompositor() must be true, otherwise DisplayConfigurator
+  # skips the native configuration entirely and the screen stays black.
+  # setup-system.sh puts the machine into ChromeOS mode via /etc/lsb-release.
+  grep -qs '^CHROMEOS_RELEASE_NAME=' /etc/lsb-release ||
+    die "DRM mode: /etc/lsb-release is not in ChromeOS mode — run: sudo ./scripts/setup-system.sh"
+
+  # fuser is optional; warn if somebody already has the card open.
+  if command -v fuser >/dev/null 2>&1; then
+    local holders
+    holders="$(fuser "$ASH_DRM_CARD" 2>/dev/null || true)"
+    [ -z "$holders" ] ||
+      log "WARNING: $ASH_DRM_CARD is already open by pid(s):$holders"
+  fi
+
+  log "DRM preflight ok (card=$ASH_DRM_CARD)"
+}
+
+# Detach the whole tree from the controlling terminal. A session that stays a
+# BACKGROUND process group on a tty stops on any tty read/write: with no
+# polkit agent running, pkexec's internal text agent prompts on the tty and
+# the kernel delivers SIGTSTP/SIGTTIN to the ENTIRE group — Chrome, bridges,
+# everything freezes in state T. In a fresh session with no ctty, /dev/tty
+# reads fail with ENXIO instead.
 #
 # `--wait` covers the single case where setsid(1) must fork (we are already a
 # process group leader): the parent then waits for the child instead of
-# exiting, so startx/xinit still tracks the client to completion and its
-# teardown is unaffected. util-linux is already required (mcookie).
+# exiting, so a caller that tracks this script still sees it finish.
 if [ "${ASH_UNDER_SETSID:-0}" != "1" ]; then
   command -v setsid >/dev/null 2>&1 ||
     die "setsid missing — install util-linux"
@@ -118,6 +157,10 @@ for f in "$LOGS"/*.log; do
     log "rotated $(basename "$f") (> ${LOG_CAP_MB}MB)"
   fi
 done
+
+# Ash owns the display in this branch; bail out before starting bridges if the
+# DRM/input side cannot work.
+drm_preflight
 
 # --- bridges ---------------------------------------------------------------
 
