@@ -23,7 +23,12 @@ SOMMELIER="$ASH_ROOT/dist/sommelier/bin/sommelier"
 PROFILE="${ASH_PROFILE_DIR:-/var/lib/ash-profile}"
 TEST_USER="${ASH_LOGIN_PROFILE:-test-user}"
 
-ASH_DRM_CARD="${ASH_DRM_CARD:-/dev/dri/card0}"
+# start-session.sh exports the card it preflighted; when this script is run
+# directly, detect it the same way instead of assuming card0/card1.
+ASH_DRM_CARD="$(detect_drm_card)" || {
+  log "no usable /dev/dri/card* (set ASH_DRM_CARD to override)"
+  exit 1
+}
 LOGIN_USER="${ASH_LOGIN_USER:-linux@local}"
 
 chrome_pid=""        # live Chrome, so a single kill/teardown can reap it
@@ -130,6 +135,23 @@ done
 [ -x "$BIN/register-apps" ] || die "bridges missing — run: make bridges"
 command -v Xwayland >/dev/null 2>&1 ||
   log "WARNING: Xwayland not in PATH — Linux apps will not render (install xwayland)"
+
+# --- touchpad shim ---------------------------------------------------------
+# The snapshot is a generic ChromeOS build with use_evdev_gestures=false: its
+# evdev backend has no gesture/libinput glue and ignores EV_ABS, so the
+# touchpad cannot move the pointer at all (the TrackPoint still works because
+# it emits REL_X/REL_Y). Preload a small interposer that turns the touchpad's
+# MT stream into REL_X/REL_Y + tap/click buttons; see
+# scripts/ash_touchpad_shim.c. Set ASH_TOUCHPAD_SHIM=0 to disable.
+TOUCHPAD_SHIM="$ASH_ROOT/dist/chrome/libash-touchpad.so"
+chrome_env=()
+if [ "${ASH_TOUCHPAD_SHIM:-1}" = "0" ]; then
+  log "touchpad shim disabled (ASH_TOUCHPAD_SHIM=0)"
+elif [ -f "$TOUCHPAD_SHIM" ]; then
+  chrome_env=(env "LD_PRELOAD=$TOUCHPAD_SHIM")
+else
+  log "WARNING: $TOUCHPAD_SHIM missing — touchpad will not work (run: make chrome)"
+fi
 
 export ASH_LOGIN_PROFILE="$TEST_USER"
 prepare_profile
@@ -262,7 +284,7 @@ while true; do
   # IsRunningAsSystemCompositor() is true, ForceInitialConfigureWithObservers()
   # runs the real DRM/KMS configuration. Passing the switch would create a
   # fake display from the size string instead.
-  "$CHROME" \
+  "${chrome_env[@]}" "$CHROME" \
     --ash-dev-shortcuts \
     --no-sandbox \
     --disable-setuid-sandbox \

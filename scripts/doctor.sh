@@ -23,7 +23,7 @@ check ninja         "sommelier build"              ninja-build      ninja
 check pkg-config    "sommelier build"              pkg-config       pkgconf
 check wayland-scanner "sommelier build"            libwayland-bin   wayland
 check python3       "sommelier patches"            python3          python
-check gcc           "libminigbm.so shim"           build-essential  base-devel
+check gcc           "libminigbm/touchpad shims"   build-essential  base-devel
 check gawk          "chrome binary patches"        gawk             gawk
 check nm            "chrome binary patches"        binutils         binutils
 check objdump       "chrome binary patches"        binutils         binutils
@@ -77,16 +77,22 @@ ps_miss() { printf '  MISSING %-14s %s  -> %s\n' "$1" "$2" "$3"; status=1; }
 # single line in ash.log.
 echo "== DRM preflight =="
 
-ASH_DRM_CARD="${ASH_DRM_CARD:-/dev/dri/card0}"
+# Same runtime detection as the session scripts: card0 is not guaranteed to be
+# the panel's card (simpledrm can take card0; i915/amdgpu then becomes card1).
+ASH_DRM_CARD="$(detect_drm_card)" || ASH_DRM_CARD=""
 
-if [ -e "$ASH_DRM_CARD" ] && [ -r "$ASH_DRM_CARD" ] && [ -w "$ASH_DRM_CARD" ]; then
+if [ -n "$ASH_DRM_CARD" ] && [ -e "$ASH_DRM_CARD" ] &&
+   [ -r "$ASH_DRM_CARD" ] && [ -w "$ASH_DRM_CARD" ]; then
   ps_ok "drm card" "$ASH_DRM_CARD readable/writable"
-elif [ -e "$ASH_DRM_CARD" ]; then
+elif [ -n "$ASH_DRM_CARD" ] && [ -e "$ASH_DRM_CARD" ]; then
   ps_miss "drm card" "$ASH_DRM_CARD not readable/writable by $(id -un)" \
           "add $(id -un) to the video group and re-login"
-else
+elif [ -n "$ASH_DRM_CARD" ]; then
   ps_miss "drm card" "$ASH_DRM_CARD missing (no graphics driver?)" \
           "check dmesg / the kernel module (vmwgfx, i915, amdgpu, ...)"
+else
+  ps_miss "drm card" "no usable /dev/dri/card* (no graphics driver?)" \
+          "check dmesg / the kernel module (vmwgfx, i915, amdgpu, ...); ASH_DRM_CARD overrides detection"
 fi
 
 ev_found=0
@@ -127,7 +133,7 @@ else
           "stop them and start the session from a free VT"
 fi
 
-if command -v fuser >/dev/null 2>&1; then
+if [ -n "$ASH_DRM_CARD" ] && command -v fuser >/dev/null 2>&1; then
   users="$(fuser "$ASH_DRM_CARD" 2>/dev/null || true)"
   if [ -z "$users" ]; then
     ps_ok "card holders" "$ASH_DRM_CARD is not open"
@@ -197,7 +203,7 @@ fi
 # is-active alone is NOT enough: a bus restart drops logind's connection while
 # the unit stays 'active', and logind only claims org.freedesktop.login1 when it
 # (re)connects. In DRM mode logind is not what takes the VT (Chrome opens
-# /dev/dri/card0 itself), but an active logind session still provides the
+# /dev/dri/cardN itself), but an active logind session still provides the
 # uaccess ACLs for the card and input nodes, and the tray's suspend/reboot goes
 # through it. So check the name owner.
 if command -v systemctl >/dev/null 2>&1; then

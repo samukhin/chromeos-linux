@@ -21,7 +21,11 @@ PROFILE="${ASH_PROFILE_DIR:-/var/lib/ash-profile}"
 TEST_USER="${ASH_LOGIN_PROFILE:-test-user}"
 LOGS="$PROFILE"
 MOJO="${ASH_MOJO:-1}"
-ASH_DRM_CARD="${ASH_DRM_CARD:-/dev/dri/card0}"
+# Pick the card that actually drives the panel (card0/card1 order is not
+# stable across boots); ASH_DRM_CARD still overrides the detection.
+ASH_DRM_CARD="$(detect_drm_card)" ||
+  die "DRM mode: no usable /dev/dri/card* — is the graphics driver loaded? (set ASH_DRM_CARD to override)"
+export ASH_DRM_CARD
 
 # Fail early with a clear message instead of letting Chrome die inside the
 # display configurator (where the only symptom is a black screen in ash.log).

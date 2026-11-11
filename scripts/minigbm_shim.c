@@ -27,10 +27,12 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -48,6 +50,24 @@ union gbm_bo_handle {
 #define MINIGBM_IMPORT_FD_MODIFIER 0x5505
 #define MESA_IMPORT_FD_MODIFIER 0x5504
 #define MESA_IMPORT_FD 0x5503
+
+/* struct drm_mode_fb_cmd2 from the kernel UAPI; kept local so the shim does
+ * not need libdrm headers at build time. */
+struct shim_fb_cmd2 {
+  uint32_t fb_id;
+  uint32_t width;
+  uint32_t height;
+  uint32_t pixel_format;
+  uint32_t flags;
+  uint32_t handles[4];
+  uint32_t pitches[4];
+  uint32_t offsets[4];
+  uint64_t modifier[4];
+};
+
+/* DRM_IOCTL_MODE_ADDFB2 = _IOWR('d', 0xb8, struct drm_mode_fb_cmd2). */
+#define SHIM_DRM_IOCTL_MODE_ADDFB2 \
+  _IOWR('d', 0xb8, struct shim_fb_cmd2)
 
 /* Bits Mesa's gbm understands; anything above is minigbm-specific. */
 #define GBM_USAGE_MASK 0x3f
@@ -96,6 +116,9 @@ static void *(*p_bo_map)(struct gbm_bo *bo,
                          void *map_data);
 static void (*p_bo_unmap)(struct gbm_bo *bo, void *map_data);
 
+/* Real libc ioctl, used by the scanout-format fallback below. */
+static int (*p_ioctl)(int fd, unsigned long request, ...);
+
 #define SHIM_LOG_PATH "/tmp/gbm-shim.log"
 
 __attribute__((constructor)) static void shim_init(void) {
@@ -130,6 +153,8 @@ __attribute__((constructor)) static void shim_init(void) {
   RESOLVE("gbm_bo_map", p_bo_map);
   RESOLVE("gbm_bo_unmap", p_bo_unmap);
 #undef RESOLVE
+
+  p_ioctl = (__typeof__(p_ioctl))dlsym(RTLD_NEXT, "ioctl");
 }
 
 /* Append-only diagnostic log; a failed open/write is silently ignored. */
@@ -172,6 +197,70 @@ static uint64_t mask_usage(uint32_t usage) {
 /* Little-endian byte `i` of a DRM fourcc, for the '%c%c%c%c' log fields. */
 static char fourcc_char(uint32_t format, int i) {
   return (char)(format >> (8 * i));
+}
+
+/* i915's primary plane only exposes alpha-less RGB formats (XR24/XB24 on
+ * Haswell). Chrome asks for an ARGB8888 scanout buffer (BGRA_8888);
+ * drmModeAddFB2 then fails with EINVAL for the X-tiled buffer, the compositor
+ * never gets a framebuffer to flip, and the screen stays on the initial black
+ * buffer while the hardware cursor still moves.
+ *
+ * ARGB8888 and XRGB8888 have the same memory layout (B,G,R,A vs B,G,R,X),
+ * bpp and tiling, so the same buffer can be described as XRGB for scanout;
+ * the primary plane ignores the alpha byte. Retry only after the kernel
+ * rejects an alpha-format *tiled* framebuffer, which leaves the cursor
+ * (linear AR24) and every working path untouched. */
+static uint32_t alpha_less_format(uint32_t format) {
+  switch (format) {
+    case 0x34325241: /* 'AR24' ARGB8888 */
+      return 0x34325258; /* 'XR24' XRGB8888 */
+    case 0x34324241: /* 'AB24' ABGR8888 */
+      return 0x34324258; /* 'XB24' XBGR8888 */
+    case 0x30335241: /* 'AR30' ARGB2101010 */
+      return 0x30335258; /* 'XR30' XRGB2101010 */
+    case 0x30334241: /* 'AB30' ABGR2101010 */
+      return 0x30334258; /* 'XB30' XBGR2101010 */
+    default:
+      return format;
+  }
+}
+
+/* Interpose ioctl for the scanout-format fallback above. Only ADDFB2 failures
+ * are inspected (and only tiled alpha formats are retried); everything else
+ * is forwarded verbatim. */
+int ioctl(int fd, unsigned long request, ...) {
+  void *arg;
+  va_list ap;
+  va_start(ap, request);
+  arg = va_arg(ap, void *);
+  va_end(ap);
+
+  if (!p_ioctl) {
+    p_ioctl = (__typeof__(p_ioctl))dlsym(RTLD_NEXT, "ioctl");
+  }
+  if (!p_ioctl) {
+    errno = ENOSYS;
+    return -1;
+  }
+
+  int ret = p_ioctl(fd, request, arg);
+  if (ret < 0 && errno == EINVAL && request == SHIM_DRM_IOCTL_MODE_ADDFB2) {
+    struct shim_fb_cmd2 *fb = (struct shim_fb_cmd2 *)arg;
+    if (fb && fb->modifier[0] != 0) {
+      uint32_t requested = fb->pixel_format;
+      uint32_t fallback = alpha_less_format(requested);
+      if (fallback != requested) {
+        int original_errno = errno;
+        fb->pixel_format = fallback;
+        ret = p_ioctl(fd, request, fb);
+        if (ret < 0) {
+          fb->pixel_format = requested;
+          errno = original_errno;
+        }
+      }
+    }
+  }
+  return ret;
 }
 
 /* Layout of struct gbm_import_fd_modifier_data — identical in minigbm and
