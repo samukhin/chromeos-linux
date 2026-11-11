@@ -32,7 +32,7 @@
 Ash сам владеет дисплеем через DRM/KMS и сам же хостит Wayland-композитор для гостевых Linux-приложений:
 
 ```
-┌──────────────── /dev/dri/card0 (KMS) ────────────────────┐
+┌──────────────── /dev/dri/cardN (KMS) ────────────────────┐
 │  Ash Chrome  (dist/chrome/chromeos-ash)                  │
 │    --ozone-platform=drm                                   │
 │    │                                                      │
@@ -43,7 +43,7 @@ Ash сам владеет дисплеем через DRM/KMS и сам же х�
 └──────────────────────────────────────────────────────────┘
 ```
 
-* **Ash — это KMS-клиент**: он открывает `/dev/dri/card0`, сам настраивает коннектор/CRTC и рисует десктоп напрямую, без Xorg и без чужого композитора. Поэтому запускать сессию нужно с чистой VT, где никто другой не держит DRM master.
+* **Ash — это KMS-клиент**: он открывает `/dev/dri/cardN` (номер карты определяется автоматически по подключённому коннектору, `ASH_DRM_CARD` переопределяет), сам настраивает коннектор/CRTC и рисует десктоп напрямую, без Xorg и без чужого композитора. Поэтому запускать сессию нужно с чистой VT, где никто другой не держит DRM master.
 * **Ash же — Wayland-сервер**: Chrome запускается с `--enable-wayland-server --wayland-server-socket=wayland-0`, то есть сам принимает Wayland-соединения.
 * **sommelier** кладёт перед ним Xwayland на `:10`, поэтому «управляемые» Linux-приложения (Crostini-обвязка) попадают внутрь рабочего стола Ash, а не наружу. Запускаемые из Ash Linux-приложения обязаны ходить в `:10`; за это отвечает `session/stubs/shell-stub.sh`: он форсит `DISPLAY=:10` для запускаемых приложений.
 
@@ -66,8 +66,8 @@ Ash сам владеет дисплеем через DRM/KMS и сам же х�
 ## Требования
 
 * x86_64 (снапшот ChromiumOS собирается только под это).
-* Рабочий D-Bus (системная шина) и рабочий DRM/KMS: `/dev/dri/card0`, evdev-ввод и udev. X-сервер не нужен.
-* Пользователь должен иметь доступ к `/dev/dri/card0` и `/dev/input/event*` (группы `video`, `render`, `input`) и активную logind-сессию на той же VT.
+* Рабочий D-Bus (системная шина) и рабочий DRM/KMS: `/dev/dri/cardN`, evdev-ввод и udev. X-сервер не нужен.
+* Пользователь должен иметь доступ к `/dev/dri/cardN` и `/dev/input/event*` (группы `video`, `render`, `input`) и активную logind-сессию на той же VT.
 * `./scripts/doctor.sh` печатает, чего именно не хватает на вашей машине — запускай его первым делом.
 
 **Ubuntu / Debian**
@@ -178,7 +178,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 2. `make` — завершается строкой `bridges -> .../dist/bin/`.
 3. `sudo ./scripts/setup-system.sh --user "$USER"` — печатает `setup-system: done`.
 4. `./scripts/smoke-test.sh` — 11 passed / 0 failed (можно и без DRM, это только D-Bus).
-5. Переключиться на свободную VT (`chvt 2`), убедиться, что `fuser /dev/dri/card0` пуст и `pgrep -x niri` пуст, затем `./session/start-session.sh` — появляется рабочий стол Ash прямо на KMS.
+5. Переключиться на свободную VT (`chvt 2`), убедиться, что `fuser /dev/dri/card*` пуст и `pgrep -x niri` пуст, затем `./session/start-session.sh` — появляется рабочий стол Ash прямо на KMS.
 
 ## Что делает `setup-system.sh` (root, идемпотентен)
 
@@ -210,7 +210,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 `./session/start-session.sh`:
 
 1. Проверяет системную шину и что профиль (`/var/lib/ash-profile`) записываем — иначе вежливо просит прогнать `setup-system.sh`.
-2. Прогоняет DRM-preflight: карта `/dev/dri/card0` (rw), читаемые `/dev/input/event*`, `/run/udev/control`, отсутствие известных композиторов, ChromeOS-режим `/etc/lsb-release`; при провале отказывается стартовать.
+2. Прогоняет DRM-preflight: карта `/dev/dri/cardN` (выбирается автоматически как первая с подключённым коннектором, rw; `ASH_DRM_CARD` переопределяет), читаемые `/dev/input/event*`, `/run/udev/control`, отсутствие известных композиторов, ChromeOS-режим `/etc/lsb-release`; при провале отказывается стартовать.
 3. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad` (эти пять — с `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power`, `stub` (заглушки для отсутствующих демонов ChromeOS) и `mojo-stub` (если `ASH_MOJO=1`). Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
 4. Запускает `session/chromeos-linux-session` и ждёт его; при выходе убивает бриджи и пробрасывает код возврата.
 
@@ -229,7 +229,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 | Что нужно | Требование |
 |---|---|
-| Карта | `/dev/dri/card0` (переопределяется `ASH_DRM_CARD`), rw у пользователя |
+| Карта | `/dev/dri/cardN` — первая карта с подключённым коннектором (автоопределение, `ASH_DRM_CARD` переопределяет), rw у пользователя |
 | Ввод | читаемые `/dev/input/event*` и работающий `systemd-udevd` |
 | DRM master | никто другой не держит карту: не запущены niri/Xorg/sway/Hyprland/weston/GNOME/KDE |
 | ChromeOS-режим | `/etc/lsb-release` с `CHROMEOS_RELEASE_NAME=` — иначе `IsRunningAsSystemCompositor()` = false и KMS не настраивается |
@@ -248,10 +248,12 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | `ASH_LOGIN_PROFILE` | `test-user` | подкаталог профиля (`--login-profile`) |
 | `ASH_DIRECT_LOGIN` | `1` | `0` — не передавать флаги входа вообще |
 | `ASH_LOGIN_MANAGER` | `0` | `1` — вместо прямого входа `--login-manager --oobe-skip-to-login` |
-| `ASH_DRM_CARD` | `/dev/dri/card0` | DRM-карта, которой владеет Ash; проверяется preflight'ом и используется в `display_alive()` |
+| `ASH_DRM_CARD` | автоопределение | DRM-карта, которой владеет Ash (`/dev/dri/cardN` с подключённым коннектором); явное значение отключает автоопределение. Проверяется preflight'ом и используется в `display_alive()` |
 | `ASH_DRM_DEVICE` | `/dev/dri/renderD128` | render-node для `--force-drm-device` sommelier'а — без него нет `ctx.gbm`, dmabuf-гейты закрыты и Xwayland стартует с `-shm` |
 | `ASH_MOJO` | `1` | `0` — не запускать `mojo-stub` в `start-session.sh` |
 | `ASH_SMOKE_TIMEOUT` | `6` | сколько секунд `make test` ждёт появления имени на шине |
+| `ASH_TOUCHPAD_SHIM` | `1` | `0` — не прелоадить `libash-touchpad.so` (тачпад перестанет двигать курсор) |
+| `ASH_TOUCHPAD_DEBUG` | `0` | `1` — писать обнаружение тачпада, тапы и клики в `/tmp/ash-touchpad.log`; `2` — ещё и движение (каждый 25-й кадр) |
 | `ASH_TERMINAL_UI` | — | путь к `terminal-ui.js` для `terminal-inject.pl` (по умолчанию аргумент из сессии) |
 | `ASH_LOG_DIR` | `${TMPDIR:-/tmp}/chromeos-linux` | куда пишут заглушки `vsh`/`crosh` |
 
@@ -271,6 +273,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | `exo::Surface::Damage` | cave клампит координаты incoming `gfx::Rect` в `[0, 30000]` перед union'ом: `wl_surface.damage(0,0,INT_MAX,INT_MAX)` от Mesa гасится в `SkRegion`, и регион повреждений остаётся пустым | нативные Wayland-клиенты «замерзают»: текст появляется только при полной перерисовке десктопа |
 | `GLOzoneEGLX11::CanImportNativePixmap` + `gpu::OzoneImageBackingFactory::IsSupported` | два гейта импорта нативного pixmap'а всегда `true` | белые окна всех X11-клиентов на дисплее sommelier и «Could not find SharedImageBackingFactory» в GPU-логе |
 | `libminigbm.so` | снапшотный `libminigbm.so` отодвигается в `.orig`, вместо него собирается шим (`scripts/minigbm_shim.c`), который `dlopen`-ит системный `libgbm.so.1`: коды usage/import у ChromeOS-`minigbm` и Mesa различаются (`GBM_BO_IMPORT_FD_MODIFIER` `0x5505` против `0x5504`) | Mesa возвращает `NULL`, GPU-процесс не находит shared image backing |
+| `libash-touchpad.so` | `LD_PRELOAD`-шим (`scripts/ash_touchpad_shim.c`): разбирает MT-B поток тачпада и отдаёт `REL_X/REL_Y`, тапы и клики, которые штатный evdev-конвертер понимает | тачпад не двигает курсор: в снапшоте `use_evdev_gestures=false`, и `EV_ABS` отбрасывается |
 | crashpad-wrapper | всегда добавляет `--database` | падение на старте crashpad-handler'а |
 
 Чего патч **не** делает: он не трогает интерпретатор и RPATH. Снапшот уже использует `/lib64/ld-linux-x86-64.so.2` и `RUNPATH=$ORIGIN`, поэтому patchelf не нужен вообще — `ldd` на обычном дистрибутиве всё резолвит, а `libminigbm.so` лежит в каталоге бинарника (правда, это уже не оригинал, а собранный шим; исходный файл сохранён рядом как `libminigbm.so.orig`).
@@ -303,6 +306,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * `power-bridge` крутит яркость через sysfs и шлёт в systemd запросы suspend/reboot (см. «Сырые места»). Батарея читается из UPower — на хосте без него её нет.
 * Работает Linux-сантехника: выбор файлов, xdg-desktop-portal-gtk, polkit-промпты, gnome-keyring.
 * Работает **нативный лок-экран Ash** (`Ctrl+Shift+L`) и разлочка **любым паролем** (см. «Лок-экран и разлочка»).
+* Тачпад двигает курсор, работают тап и физический клик (в т.ч. правый клик двумя пальцами). Это делает `LD_PRELOAD`-шим `scripts/ash_touchpad_shim.c`: в снапшоте нет ChromeOS-libgestures, и штатный evdev-конвертер Ash игнорирует `EV_ABS`; шим превращает MT-поток тачпада в понятные ему `REL_X/REL_Y` и кнопки.
 * Переключение RU/EN в шторке быстрых настроек меняет раскладку и для **набора текста** (адресная строка, оконный менеджер, экранная клавиатура), а не только для индикатора в трее — см. патч «Раскладка RU/EN».
 
 ## Сырые места
@@ -311,7 +315,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 | Область | Состояние |
 |---|---|
-| DRM/VT | Ash сам держит `/dev/dri/card0`; переключения VT и интеграции с logind нет. Зависший Chrome не отдаёт карту — спасает только SSH/другая TTY и `pkill` |
+| DRM/VT | Ash сам держит `/dev/dri/cardN`; переключения VT и интеграции с logind нет. Зависший Chrome не отдаёт карту — спасает только SSH/другая TTY и `pkill` |
 | Данные сети/аудио/батареи в трее | Сеть и аудио — реальные, но очень ограничены; батареи нет без UPower |
 | Интеграция Linux-приложений в лаунчер | `.desktop`-файлы пишутся в настройки Crostini, но запускаться могут не все (большинство — да) |
 | Эмуляция терминала | Базовый VT100 хватает на fastfetch; для работы бери нормальный терминал |
@@ -321,6 +325,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 | Гостевой профиль | `/home/chronos/user` — обычная директория, а не cryptohome |
 | Лок-экран | Настоящий, но **разлочивается любым паролем** (в т.ч. пустым): `session-bridge` отдаёт фиктивный `StartAuthSessionReply` с password-фактором `local-password` и всегда успешный `AuthenticateAuthFactor`. Системная соль — константа из моста. `ListAuthFactors` возвращает пусто, поэтому в логе безвредный warning `lock_contents_view.cc:937` (поле ввода пароля показывается дефолтно) |
 | Трей-иконки приложений | StatusNotifierItem не реализован |
+| Прокрутка тачпадом и колесом | Курсор, тап и клик тачпада работают, но two-finger scroll и колесо — нет: в снапшоте отсутствует libgestures, а evdev-конвертер Ash отбрасывает `EV_ABS` и `REL_WHEEL`. Шим `libash-touchpad.so` прокрутку сознательно не эмулирует |
 
 ## Лок-экран и разлочка
 
@@ -355,12 +360,12 @@ make test             # бриджи на реальной системной ш
 
 Блок `== DRM preflight ==` в `doctor.sh` проверяет то, без чего Ash просто не сможет занять экран:
 
-* **`/dev/dri/card0` отсутствует или не rw** → Chrome не сможет стать DRM-мастером и настроить KMS. Лечение: загрузить драйвер, добавить пользователя в группу `video`.
+* **`/dev/dri/card*` отсутствует или не rw** → Chrome не сможет стать DRM-мастером и настроить KMS. Лечение: загрузить драйвер, добавить пользователя в группу `video`.
 * **нет читаемых `/dev/input/event*`** → не будет клавиатуры и мыши. Лечение: группа `input`.
 * **`/run/udev/control` отсутствует** → `DeviceManagerUdev` не перечислит устройства. Лечение: запустить `systemd-udevd`.
 * **`/etc/lsb-release` не в ChromeOS-режиме** → `IsRunningAsSystemCompositor()` = false, `DisplayConfigurator` не трогает KMS, экран остаётся чёрным. Лечение: `sudo ./scripts/setup-system.sh`.
 * **запущен niri/Xorg/sway/...** → они держат DRM master. Лечение: остановить их и запускать сессию с чистой VT.
-* **`fuser /dev/dri/card0` показывает чужие pid** — предупреждение: возможно, карту уже открыл другой процесс.
+* **`fuser /dev/dri/card*` показывает чужие pid** — предупреждение: возможно, карту уже открыл другой процесс.
 
 Блок `== session preflight ==` ловит «тихие» поломки, которые иначе выглядят как «всё собралось, но почему-то не работает»:
 
@@ -368,7 +373,7 @@ make test             # бриджи на реальной системной ш
 * **`/usr/bin/vsh` / `/usr/bin/crosh` отсутствуют** → терминал падает с `failed to execvp /usr/bin/vsh`. Ash вызывает их по **абсолютному** пути, `PATH` не ищет, поэтому заглушка обязана лежать именно в `/usr/bin`.
 * **D-Bus-политика** не установлена → бриджи не могут занять имена `org.chromium.*`, и шина молча отклоняет всё.
 * **systemd-logind** неактивен → suspend/reboot из трея мертвы. Обычно за этим стоит мёртвый polkit: polkitd выходит в момент падения системной шины (теряет `org.freedesktop.PolicyKit1`, а `polkit.service` — static, без `Restart=`), после чего logind зависает, дожидаясь polkit-авторизации. Раньше `setup-system.sh` при каждом изменении политики делал `restart dbus` и ронял polkit вместе с шиной — теперь он применяет политику `reload`-ом (без разрыва соединений) и отдельно поднимает polkit.
-* **logind «active», но без D-Bus-имени** → в DRM-режиме Chrome не просит logind о VT (он сам открывает `/dev/dri/card0`), но активная logind-сессия даёт uaccess-ACL на карту и input-узлы, а через неё же идут suspend/reboot из трея. Если имя `org.freedesktop.login1` пропало (перезапуск шины рвёт соединение, а юнит остаётся «active»), эти вещи ломаются. Лечение: `sudo ./scripts/setup-system.sh` (он сам перезапустит logind) или вручную `sudo systemctl restart systemd-logind`. Проверка: `busctl status org.freedesktop.login1` (должен быть владелец, а не `(activatable)`).
+* **logind «active», но без D-Bus-имени** → в DRM-режиме Chrome не просит logind о VT (он сам открывает `/dev/dri/cardN`), но активная logind-сессия даёт uaccess-ACL на карту и input-узлы, а через неё же идут suspend/reboot из трея. Если имя `org.freedesktop.login1` пропало (перезапуск шины рвёт соединение, а юнит остаётся «active»), эти вещи ломаются. Лечение: `sudo ./scripts/setup-system.sh` (он сам перезапустит logind) или вручную `sudo systemctl restart systemd-logind`. Проверка: `busctl status org.freedesktop.login1` (должен быть владелец, а не `(activatable)`).
 
 `make test` — самый полезный предварительный прогон: он поднимает бриджи `shill`, `cras`, `power`, `session`, `crostini`, `rmad` и `mojo-stub` (`stub` не проверяется — он просто держит имена), ждёт, пока имя появится на шине (это возможно только при корректной политике), дёргает `GetVolumeState` и `RetrieveSessionState`, проверяет mojo-сокет и прогоняет `register-apps`. При провале логи не удаляются, а печатаются.
 
@@ -388,9 +393,9 @@ make test             # бриджи на реальной системной ш
 Быстрая диагностика DRM-слоя:
 
 ```bash
-fuser /dev/dri/card0           # кто держит карту (должно быть пусто до старта)
+fuser /dev/dri/card*           # кто держит карту (должно быть пусто до старта)
 modetest -M vmwgfx -c          # коннекторы/режимы (libdrm-tests), на других GPU — свой драйвер
-cat /sys/class/drm/card0-*/status
+cat /sys/class/drm/card*/status
 grep -iE 'ozone|drm|gbm|Failed to|Invalid' /var/lib/ash-profile/ash.log
 ```
 
@@ -401,11 +406,13 @@ grep -iE 'ozone|drm|gbm|Failed to|Invalid' /var/lib/ash-profile/ash.log
 | Симптом | Причина | Действие |
 |---|---|---|
 | Бриджи пишут `not allowed to own … due to security policies` | политика не установлена или dbus её отбросил | `sudo ./scripts/setup-system.sh --user "$USER"`, перезапуск dbus/перезагрузка; `make verify` ловит это заранее |
-| `DRM mode: /dev/dri/card0 not found` / `no read/write access` | нет карты или пользователь не в группах `video`/`render` | загрузи драйвер, `sudo usermod -aG video,render,input $USER`, перелогинься |
+| `DRM mode: no usable /dev/dri/card*` / `not found` / `no read/write access` | нет карты, нет прав или автоопределение не нашло коннектор | загрузи драйвер, `sudo usermod -aG video,render,input $USER`, перелогинься; при необходимости задай `ASH_DRM_CARD` вручную |
 | `DRM mode: niri is running and likely holds DRM master` | сессия запущена поверх другого композитора | останови его и запусти с чистой VT |
 | Экран чёрный, Chrome жив | не ChromeOS-режим `lsb-release` или передан `--ash-host-window-bounds` | `sudo ./scripts/setup-system.sh`; проверь аргументы в `chromeos-linux-session` |
-| `Failed to open primary graphics card` в `ash.log` | нет прав на `/dev/dri/card0` или карту держит другой процесс | `fuser /dev/dri/card0`, группы `video`/`render` |
+| `Failed to open primary graphics card` в `ash.log` | нет прав на `/dev/dri/cardN` или карту держит другой процесс | `fuser /dev/dri/card*`, группы `video`/`render` |
 | Linux-приложения не рисуются | нет `Xwayland` в `$PATH` | поставь пакет `xwayland` |
+| Тачпад не двигает курсор, TrackPoint работает | не собран/не загружен шим, либо `ASH_TOUCHPAD_SHIM=0` | `make chrome` (соберёт `dist/chrome/libash-touchpad.so`); проверь `/tmp/ash-touchpad.log` |
+| Не работает прокрутка тачпада и колесо | в снапшоте нет libgestures, `EV_ABS`/`REL_WHEEL` отбрасываются | известное ограничение; шим лечит только указатель, тапы и клики |
 | Chrome вылетает сразу | смотри `ash.log`; либо снапшот не тот (только x86_64, только пин из `chromeos-bin/REVISION`) | сверь пины (`./chromeos-bin/fetch.sh --force` перескачает и напечатает sums; `make fetch` аргументов не принимает) |
 | `Pactl not found` / громкость не регулируется | нет `pulseaudio-utils` | поставь пакет |
 | Яркость не меняется | нет прав на sysfs | `sudo usermod -aG video $USER` и перелогинься |

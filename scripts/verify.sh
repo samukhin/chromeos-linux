@@ -20,7 +20,7 @@ fi
 
 echo "== dist/chrome =="
 for f in chrome chrome_crashpad_handler chrome_crashpad_handler.real \
-         chromeos-ash libminigbm.so; do
+         chromeos-ash libminigbm.so libash-touchpad.so; do
   [ -e "$ASH_ROOT/dist/chrome/$f" ] || fail "dist/chrome/$f missing"
 done
 if [ -e "$ASH_ROOT/dist/chrome/libdisplayfix.so" ]; then

@@ -319,6 +319,17 @@ echo "kept pristine $OUT/libminigbm.so.orig"
   "$ASH_ROOT/scripts/minigbm_shim.c" -ldl
 echo "built minigbm shim -> $OUT/libminigbm.so ($(stat -c%s "$OUT/libminigbm.so") bytes)"
 
+# --- touchpad shim (LD_PRELOAD) -------------------------------------------
+# The generic snapshot has no ChromeOS libgestures/libinput glue, so Ash's
+# evdev backend drops EV_ABS (touchpad) and REL_WHEEL entirely; only REL_X/Y
+# from the TrackPoint survives. This interposer rewrites the touchpad's MT
+# stream into REL_X/REL_Y + tap/click buttons the existing converter already
+# understands. It is preloaded by session/chromeos-linux-session. See
+# scripts/ash_touchpad_shim.c.
+"${CC:-cc}" -shared -fPIC -O2 -o "$OUT/libash-touchpad.so" \
+  "$ASH_ROOT/scripts/ash_touchpad_shim.c" -ldl -pthread -lm
+echo "built touchpad shim -> $OUT/libash-touchpad.so ($(stat -c%s "$OUT/libash-touchpad.so") bytes)"
+
 # --- crashpad handler ------------------------------------------------------
 
 mv "$OUT/chrome_crashpad_handler" "$OUT/chrome_crashpad_handler.real"
