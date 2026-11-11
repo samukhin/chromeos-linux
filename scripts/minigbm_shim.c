@@ -25,6 +25,14 @@
  * a missing export is not a soft failure: the dynamic linker kills every
  * Chrome process with "undefined symbol" before it starts.
  *
+ * It also bridges a Mesa-on-amdgpu quirk: when the GPU process creates its
+ * GBM device on the render node, Mesa's GEM handles live in that file's handle
+ * table only. amdgpu (unlike i915) has per-file handle tables, so the
+ * drmModeAddFB2 that Chrome issues on the card node fails with ENOENT and no
+ * scanout buffer is ever created. The ioctl interposer detects that failure,
+ * exports each plane via PRIME from the render node and re-imports it into the
+ * card node, then retries the same ADDFB2.
+ *
  * Everything is logged to /tmp/gbm-shim.log (cleared by the session script
  * on start) — that file is how the failure chain above was diagnosed.
  *
@@ -35,9 +43,12 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -75,10 +86,29 @@ struct shim_fb_cmd2 {
 #define SHIM_DRM_IOCTL_MODE_ADDFB2 \
   _IOWR('d', 0xb8, struct shim_fb_cmd2)
 
+/* PRIME/GEM ioctls, again kept local to avoid a libdrm build dependency. */
+struct shim_prime_handle {
+  uint32_t handle;
+  uint32_t flags;
+  int32_t fd;
+};
+
+struct shim_gem_close {
+  uint32_t handle;
+  uint32_t pad;
+};
+
+#define SHIM_DRM_IOCTL_PRIME_HANDLE_TO_FD \
+  _IOWR('d', 0x2d, struct shim_prime_handle)
+#define SHIM_DRM_IOCTL_PRIME_FD_TO_HANDLE \
+  _IOWR('d', 0x2e, struct shim_prime_handle)
+#define SHIM_DRM_IOCTL_GEM_CLOSE _IOW('d', 0x09, struct shim_gem_close)
+
 /* Bits Mesa's gbm understands; anything above is minigbm-specific. */
 #define GBM_USAGE_MASK 0x3f
 #define GBM_USAGE_LOW3 0x7 /* SCANOUT | CURSOR | RENDERING */
 #define GBM_BO_USE_RENDERING 0x4
+#define SHIM_GBM_BO_USE_SCANOUT 0x1
 
 /* Resolved against Mesa in the constructor below; NULL when unavailable. */
 static struct gbm_device *(*p_create_device)(int fd);
@@ -245,6 +275,224 @@ static uint32_t alpha_less_format(uint32_t format) {
   }
 }
 
+/* Real path of the DRM device directory shared by all nodes of one GPU, e.g.
+ * /sys/devices/pci.../drm for both card1 and renderD128. */
+static int drm_device_dir(int fd, char *out, size_t out_len) {
+  char link[64];
+  char path[PATH_MAX];
+  char sysfs[PATH_MAX];
+  char resolved[PATH_MAX];
+  const char *base;
+  ssize_t n;
+
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  n = readlink(link, path, sizeof(path) - 1);
+  if (n <= 0)
+    return 0;
+  path[n] = '\0';
+  base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  if (strlen(base) >= 64)
+    return 0;
+  snprintf(sysfs, sizeof(sysfs), "/sys/class/drm/%s/device", base);
+  if (!realpath(sysfs, resolved))
+    return 0;
+  if ((size_t)snprintf(out, out_len, "%s", resolved) >= out_len)
+    return 0;
+  return 1;
+}
+
+/* GBM devices opened by this process. A GEM handle is only meaningful in the
+ * DRM file that created it, so the ADDFB2 fallback must export from the exact
+ * fd Chrome passed to gbm_create_device. Entries are validated against st_rdev
+ * on use in case the number was reused. */
+struct gbm_fd_entry {
+  int fd;
+  dev_t rdev;
+  char device[PATH_MAX];
+  char devpath[64];
+  void *dev;
+};
+
+#define MAX_GBM_FDS 8
+static struct gbm_fd_entry gbm_fds[MAX_GBM_FDS];
+static int gbm_fd_count;
+
+static void register_gbm_fd(int fd, void *dev) {
+  struct stat st;
+  char device[PATH_MAX];
+  char link[64];
+  char devpath[64] = "?";
+  ssize_t n;
+  int i;
+
+  if (fd < 0 || fstat(fd, &st) < 0 ||
+      !drm_device_dir(fd, device, sizeof(device)))
+    return;
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  n = readlink(link, devpath, sizeof(devpath) - 1);
+  if (n > 0)
+    devpath[n] = '\0';
+  for (i = 0; i < gbm_fd_count; i++) {
+    if (gbm_fds[i].fd == fd) {
+      gbm_fds[i].rdev = st.st_rdev;
+      gbm_fds[i].dev = dev;
+      snprintf(gbm_fds[i].device, sizeof(gbm_fds[i].device), "%s", device);
+      snprintf(gbm_fds[i].devpath, sizeof(gbm_fds[i].devpath), "%s", devpath);
+      return;
+    }
+  }
+  if (gbm_fd_count == MAX_GBM_FDS) {
+    memmove(&gbm_fds[0], &gbm_fds[1],
+            sizeof(gbm_fds[0]) * (MAX_GBM_FDS - 1));
+    gbm_fd_count--;
+  }
+  gbm_fds[gbm_fd_count].fd = fd;
+  gbm_fds[gbm_fd_count].rdev = st.st_rdev;
+  gbm_fds[gbm_fd_count].dev = dev;
+  snprintf(gbm_fds[gbm_fd_count].device, sizeof(gbm_fds[gbm_fd_count].device),
+           "%s", device);
+  snprintf(gbm_fds[gbm_fd_count].devpath,
+           sizeof(gbm_fds[gbm_fd_count].devpath), "%s", devpath);
+  gbm_fd_count++;
+}
+
+/* Node name ("card1", "renderD128") for a gbm device, or "?" if unknown. */
+static const char *gbm_dev_name(void *dev) {
+  int i;
+
+  for (i = 0; i < gbm_fd_count; i++) {
+    if (gbm_fds[i].dev == dev) {
+      const char *slash = strrchr(gbm_fds[i].devpath, '/');
+      return slash ? slash + 1 : gbm_fds[i].devpath;
+    }
+  }
+  return "?";
+}
+
+/* Export `handle` from a GBM fd of the same GPU as `card_dev`; returns the
+ * dmabuf or -1. Newest fd first — the scanout device is usually the latest. */
+static int export_handle(const char *card_dev, uint32_t handle) {
+  struct stat st;
+  int i;
+
+  for (i = gbm_fd_count - 1; i >= 0; i--) {
+    struct shim_prime_handle ph;
+
+    if (fstat(gbm_fds[i].fd, &st) < 0 || st.st_rdev != gbm_fds[i].rdev)
+      continue;
+    if (strcmp(gbm_fds[i].device, card_dev) != 0)
+      continue;
+    memset(&ph, 0, sizeof(ph));
+    ph.handle = handle;
+    ph.flags = O_CLOEXEC;
+    if (p_ioctl(gbm_fds[i].fd, SHIM_DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph) == 0 &&
+        ph.fd >= 0)
+      return ph.fd;
+  }
+  return -1;
+}
+
+/* Is `handle` already in the card file's handle table? */
+static int handle_on_fd(int fd, uint32_t handle) {
+  struct shim_prime_handle ph;
+
+  memset(&ph, 0, sizeof(ph));
+  ph.handle = handle;
+  ph.flags = O_CLOEXEC;
+  if (p_ioctl(fd, SHIM_DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph) < 0 || ph.fd < 0)
+    return 0;
+  close(ph.fd);
+  return 1;
+}
+
+/* Move ADDFB2's buffers from the GBM device's handle table into the card
+ * file's, then retry the ioctl in place. amdgpu keeps per-file GEM handle
+ * tables, so handles from a render-node GBM device are unknown to the card
+ * node and the kernel rejects ADDFB2 with ENOENT. i915's handles are global,
+ * which is why the same code worked there. Returns the ioctl result; on an
+ * import failure returns -1 and the caller restores the original errno. */
+static int addfb2_via_prime(int fd, unsigned long request,
+                           struct shim_fb_cmd2 *fb) {
+  uint32_t original[4];
+  uint32_t imported[4] = {0, 0, 0, 0};
+  char card_dev[PATH_MAX];
+  int ret;
+  int i, j;
+  int ok = 1;
+
+  if (!drm_device_dir(fd, card_dev, sizeof(card_dev)))
+    return -1;
+
+  for (i = 0; i < 4; i++)
+    original[i] = fb->handles[i];
+
+  for (i = 0; i < 4 && ok; i++) {
+    struct shim_prime_handle ph;
+    uint32_t handle = original[i];
+    uint32_t moved = 0;
+    int dmabuf;
+
+    if (!handle)
+      continue;
+
+    /* Planes can share one buffer; export it only once. */
+    for (j = 0; j < i; j++) {
+      if (original[j] == handle) {
+        moved = imported[j];
+        break;
+      }
+    }
+    if (j < i) {
+      if (!moved)
+        continue;
+      fb->handles[i] = moved;
+      continue;
+    }
+
+    dmabuf = export_handle(card_dev, handle);
+    if (dmabuf < 0) {
+      /* Already valid on the card node (mixed fb): keep it as is. */
+      if (handle_on_fd(fd, handle))
+        continue;
+      shim_log("[%d] PRIME: cannot export handle %u\n", getpid(), handle);
+      ok = 0;
+      break;
+    }
+
+    memset(&ph, 0, sizeof(ph));
+    ph.fd = dmabuf;
+    if (p_ioctl(fd, SHIM_DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) < 0) {
+      shim_log("[%d] PRIME: dmabuf %d -> handle on fd %d failed (%s)\n",
+               getpid(), dmabuf, fd, strerror(errno));
+      close(dmabuf);
+      ok = 0;
+      break;
+    }
+    close(dmabuf);
+    imported[i] = ph.handle;
+    fb->handles[i] = ph.handle;
+  }
+
+  ret = ok ? p_ioctl(fd, request, fb) : -1;
+
+  /* Restore the caller's handles: the framebuffer holds its own reference. */
+  for (i = 0; i < 4; i++) {
+    fb->handles[i] = original[i];
+    if (imported[i]) {
+      struct shim_gem_close gc;
+      memset(&gc, 0, sizeof(gc));
+      gc.handle = imported[i];
+      for (j = i + 1; j < 4; j++) {
+        if (imported[j] == imported[i])
+          imported[j] = 0;
+      }
+      p_ioctl(fd, SHIM_DRM_IOCTL_GEM_CLOSE, &gc);
+    }
+  }
+  return ret;
+}
+
 /* Interpose ioctl for the scanout-format fallback above. Only ADDFB2 failures
  * are inspected (and only tiled alpha formats are retried); everything else
  * is forwarded verbatim. */
@@ -264,18 +512,42 @@ int ioctl(int fd, unsigned long request, ...) {
   }
 
   int ret = p_ioctl(fd, request, arg);
-  if (ret < 0 && errno == EINVAL && request == SHIM_DRM_IOCTL_MODE_ADDFB2) {
+  if (ret < 0 && request == SHIM_DRM_IOCTL_MODE_ADDFB2) {
     struct shim_fb_cmd2 *fb = (struct shim_fb_cmd2 *)arg;
-    if (fb && fb->modifier[0] != 0) {
+    int original_errno = errno;
+
+    /* amdgpu only: the buffer's handle belongs to the render node, so the
+     * card node does not know it. Import it via PRIME and retry once. */
+    if (fb && original_errno == ENOENT) {
+      int moved = addfb2_via_prime(fd, request, fb);
+      if (moved >= 0) {
+        shim_log("[%d] ADDFB2 recovered via PRIME (fmt=0x%08x '%c%c%c%c')\n",
+                 getpid(), fb->pixel_format, fourcc_char(fb->pixel_format, 0),
+                 fourcc_char(fb->pixel_format, 1),
+                 fourcc_char(fb->pixel_format, 2),
+                 fourcc_char(fb->pixel_format, 3));
+        return moved;
+      }
+      shim_log("[%d] ADDFB2 fd=%d fmt=0x%08x '%c%c%c%c' failed with ENOENT; "
+               "PRIME fallback failed\n",
+               getpid(), fd, fb->pixel_format,
+               fourcc_char(fb->pixel_format, 0),
+               fourcc_char(fb->pixel_format, 1),
+               fourcc_char(fb->pixel_format, 2),
+               fourcc_char(fb->pixel_format, 3));
+      errno = original_errno;
+    }
+
+    if (fb && errno == EINVAL && fb->modifier[0] != 0) {
       uint32_t requested = fb->pixel_format;
       uint32_t fallback = alpha_less_format(requested);
       if (fallback != requested) {
-        int original_errno = errno;
+        int fallback_errno = errno;
         fb->pixel_format = fallback;
         ret = p_ioctl(fd, request, fb);
         if (ret < 0) {
           fb->pixel_format = requested;
-          errno = original_errno;
+          errno = fallback_errno;
         }
       }
     }
@@ -307,7 +579,16 @@ struct shim_import_fd {
 
 struct gbm_device *gbm_create_device(int fd) {
   struct gbm_device *dev = p_create_device ? p_create_device(fd) : NULL;
-  shim_log("[%d] gbm_create_device(fd=%d) -> %s\n", getpid(), fd,
+  char link[64];
+  char path[PATH_MAX] = "?";
+
+  if (dev)
+    register_gbm_fd(fd, dev);
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  ssize_t n = readlink(link, path, sizeof(path) - 1);
+  if (n > 0)
+    path[n] = '\0';
+  shim_log("[%d] gbm_create_device(fd=%d %s) -> %s\n", getpid(), fd, path,
            dev ? "DEVICE" : "NULL");
   return dev;
 }
@@ -351,17 +632,54 @@ struct gbm_bo *gbm_bo_create(struct gbm_device *gbm, uint32_t width,
   return bo;
 }
 
+/* Formats Chrome uses for the primary scanout buffer (packed 32-bit RGB). */
+static int scanout_rgb_format(uint32_t format) {
+  switch (format) {
+    case 0x34325241: /* 'AR24' ARGB8888 */
+    case 0x34325258: /* 'XR24' XRGB8888 */
+    case 0x34324241: /* 'AB24' ABGR8888 */
+    case 0x34324258: /* 'XB24' XBGR8888 */
+    case 0x30335241: /* 'AR30' ARGB2101010 */
+    case 0x30335258: /* 'XR30' XRGB2101010 */
+    case 0x30334241: /* 'AB30' ABGR2101010 */
+    case 0x30334258: /* 'XB30' XBGR2101010 */
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 struct gbm_bo *gbm_bo_create_with_modifiers(struct gbm_device *gbm,
                                              uint32_t width,
                                              uint32_t height,
                                              uint32_t format,
                                              const uint64_t *modifiers,
                                              size_t count) {
-  if (!p_bo_create_with_modifiers) {
-    return NULL;
-  }
-  return p_bo_create_with_modifiers(gbm, width, height, format, modifiers,
+  struct gbm_bo *bo = NULL;
+  size_t i;
+
+  if (p_bo_create_with_modifiers) {
+    bo = p_bo_create_with_modifiers(gbm, width, height, format, modifiers,
                                     count);
+  }
+  /* radeonsi only wires up resource_create_with_modifiers on GFX9+. On older
+   * AMD GPUs (Wani/Carrizo is GFX8) every modifiers request returns NULL, so
+   * Chrome's scanout-buffer creation fails before the first modeset. A plain
+   * scanout BO is linear and its modifier is DRM_FORMAT_MOD_INVALID, which
+   * Chrome then treats as "no modifiers" when it builds the framebuffer. */
+  if (!bo && p_bo_create && scanout_rgb_format(format)) {
+    bo = p_bo_create(gbm, width, height, format, SHIM_GBM_BO_USE_SCANOUT);
+  }
+  shim_log("[%d] gbm_bo_create_with_modifiers(%ux%u fmt=0x%08x '%c%c%c%c' "
+           "nmods=%zu mods=[",
+           getpid(), width, height, format, fourcc_char(format, 0),
+           fourcc_char(format, 1), fourcc_char(format, 2),
+           fourcc_char(format, 3), count);
+  for (i = 0; i < count && i < 8; i++) {
+    shim_log("%s0x%llx", i ? "," : "", (unsigned long long)modifiers[i]);
+  }
+  shim_log("%s]) -> %s\n", count > 8 ? ",..." : "", bo ? "BO" : "NULL");
+  return bo;
 }
 
 void gbm_bo_destroy(struct gbm_bo *bo, struct gbm_device *gbm) {
@@ -370,12 +688,49 @@ void gbm_bo_destroy(struct gbm_bo *bo, struct gbm_device *gbm) {
   }
 }
 
+/* A single bad client buffer can be retried thousands of times per second
+ * (every compositor frame). Log the first few dozen attempts, then sample. */
+static int import_log_budget = 60;
+
+static int import_should_log(void) {
+  static unsigned int seen;
+  seen++;
+  if (import_log_budget > 0) {
+    import_log_budget--;
+    return 1;
+  }
+  return (seen % 500) == 0;
+}
+
+/* Explain a failed gbm_bo_import. Mesa's import path reports EINVAL for nearly
+ * every rejection, so also record what the fd actually is: a dmabuf shows up
+ * as an anonymous inode whose size is the mapping length, while a bogus/closed
+ * fd shows up as an error here too. */
+static void log_import_failure(int fd, const char *stage) {
+  int saved = errno;
+  char link[64];
+  char path[PATH_MAX] = "?";
+  struct stat st;
+  ssize_t n;
+
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  n = readlink(link, path, sizeof(path) - 1);
+  if (n > 0)
+    path[n] = '\0';
+  if (fstat(fd, &st) < 0)
+    st.st_size = -1;
+  shim_log("[%d]   %s: errno=%d (%s) fd=%d path=%s size=%lld ino=%llu\n",
+           getpid(), stage, saved, strerror(saved), fd, path,
+           (long long)st.st_size, (unsigned long long)st.st_ino);
+}
+
 struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
                              const void *buf, uint32_t flags) {
   /* minigbm's GBM_BO_IMPORT_FD_MODIFIER (0x5505) is Mesa's 0x5504. */
   uint32_t mesa_type =
       (type == MINIGBM_IMPORT_FD_MODIFIER) ? MESA_IMPORT_FD_MODIFIER : type;
   uint64_t masked = mask_usage(flags);
+  int log_now = import_should_log();
 
   /* buf's layout depends on the import type: the legacy GBM_BO_IMPORT_FD
    * descriptor is only 20 bytes (shim_import_fd), whereas the modifier
@@ -395,27 +750,59 @@ struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
     struct gbm_bo *bo =
         p_bo_import ? p_bo_import(gbm, mesa_type, buf, (uint32_t)masked) : NULL;
 
-    shim_log("[%d] gbm_bo_import(type=0x%x->0x%x flags=0x%x->0x%llx, "
-             "fmt=0x%08x %ux%u num_fds=%u mod=0x%llx) -> %s\n",
-             getpid(), type, mesa_type, flags, (unsigned long long)masked,
-             m->format, m->width, m->height, m->num_fds,
-             (unsigned long long)m->modifier, bo ? "BO" : "NULL");
+    if (log_now) {
+      shim_log("[%d] gbm_bo_import(type=0x%x->0x%x dev=%s flags=0x%x->0x%llx, "
+               "fmt=0x%08x %ux%u num_fds=%u mod=0x%llx off=%d) -> %s\n",
+               getpid(), type, mesa_type, gbm_dev_name(gbm), flags,
+               (unsigned long long)masked, m->format, m->width, m->height,
+               m->num_fds, (unsigned long long)m->modifier, m->offsets[0],
+               bo ? "BO" : "NULL");
+    }
 
     if (bo || mesa_type != MESA_IMPORT_FD_MODIFIER || !sane) {
+      if (!bo && log_now)
+        log_import_failure(m->fds[0], "import FD_MODIFIER");
       return bo;
+    }
+
+    /* Chrome's GBM build asks for SCANOUT on every import
+     * (GetSupportedGbmFlags() reports SCANOUT|TEXTURING). Mesa creates the
+     * image fine, then dri2_validate_usage() rejects SCANOUT because the
+     * producer allocated a non-displayable surface: Xwayland's glamor on GFX8
+     * picks STANDARD micro-tiling (tiling_info bit 12), so radeonsi reports
+     * is_displayable=false. The compositor only samples these buffers, so
+     * retry without SCANOUT instead of failing the shared image and leaving
+     * the client in an endless CreateBufferFromHandle loop. */
+    if (masked & SHIM_GBM_BO_USE_SCANOUT) {
+      errno = 0;
+      bo = p_bo_import ? p_bo_import(gbm, mesa_type, buf,
+                                     (uint32_t)(masked &
+                                                ~(uint64_t)SHIM_GBM_BO_USE_SCANOUT))
+                       : NULL;
+      if (bo) {
+        if (log_now)
+          shim_log("[%d]   recovered without GBM_BO_USE_SCANOUT "
+                   "(non-displayable producer surface)\n", getpid());
+        return bo;
+      }
     }
 
     /* Retry: vmwgfx rejects DRM_FORMAT_MOD_INVALID imports, LINEAR it accepts. */
     struct shim_import_mod linear = *m;
     linear.modifier = 0;
+    errno = 0;
     bo = p_bo_import ? p_bo_import(gbm, MESA_IMPORT_FD_MODIFIER, &linear,
                                    (uint32_t)masked)
                      : NULL;
-    shim_log("[%d]   fallback modifier=0 -> %s\n", getpid(),
-             bo ? "BO" : "NULL");
     if (bo) {
+      if (log_now)
+        shim_log("[%d]   recovered with modifier=0\n", getpid());
       return bo;
     }
+
+    if (log_now)
+      shim_log("[%d]   modified and LINEAR imports both failed (errno=%d)\n",
+               getpid(), errno);
 
     /* Last resort: the legacy single-plane descriptor, rebuilt from the
      * modifier descriptor's first plane. */
@@ -425,12 +812,18 @@ struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
     legacy.height = m->height;
     legacy.stride = (uint32_t)m->strides[0];
     legacy.format = m->format;
+    errno = 0;
     bo = p_bo_import ? p_bo_import(gbm, MESA_IMPORT_FD, &legacy,
                                    (uint32_t)masked)
                      : NULL;
-    shim_log("[%d]   fallback legacy FD(fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
-             getpid(), legacy.fd, legacy.width, legacy.height, legacy.stride,
-             legacy.format, bo ? "BO" : "NULL");
+    if (log_now) {
+      shim_log("[%d]   legacy FD import(fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
+               getpid(), legacy.fd, legacy.width, legacy.height, legacy.stride,
+               legacy.format, bo ? "BO" : "NULL");
+      if (!bo) {
+        log_import_failure(legacy.fd, "import after all fallbacks");
+      }
+    }
     return bo;
   }
 
@@ -439,11 +832,14 @@ struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
   const struct shim_import_fd *fd_data = (const struct shim_import_fd *)buf;
   struct gbm_bo *bo =
       p_bo_import ? p_bo_import(gbm, mesa_type, buf, (uint32_t)masked) : NULL;
-  shim_log("[%d] gbm_bo_import(fd type=0x%x flags=0x%x->0x%llx, "
-           "fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
-           getpid(), type, flags, (unsigned long long)masked, fd_data->fd,
-           fd_data->width, fd_data->height, fd_data->stride, fd_data->format,
-           bo ? "BO" : "NULL");
+  if (log_now) {
+    shim_log("[%d] gbm_bo_import(fd dev=%s type=0x%x flags=0x%x->0x%llx, "
+             "fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
+             getpid(), gbm_dev_name(gbm), type, flags,
+             (unsigned long long)masked, fd_data->fd, fd_data->width,
+             fd_data->height, fd_data->stride, fd_data->format,
+             bo ? "BO" : "NULL");
+  }
   return bo;
 }
 
