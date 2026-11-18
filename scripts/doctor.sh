@@ -226,7 +226,7 @@ fi
 # setup-system.sh artefact (start-session.sh launches them), so this stays a
 # soft signal that never fails a fresh machine.
 if pgrep -f 'session/chromeos-linux-session' >/dev/null 2>&1; then
-  for name in shill cras session crostini rmad power; do
+  for name in shill cras session crostini rmad stub power; do
     if pgrep -f "dist/bin/${name}-bridge" >/dev/null 2>&1; then
       ps_ok "${name}-bridge" "running"
     else

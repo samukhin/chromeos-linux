@@ -131,6 +131,13 @@ func (p *powerManager) SetScreenBrightnessPercent(percent float64, gradual bool)
 	return nil
 }
 
+// SetIsProjecting(b): ash reports the projector state so that powerd can keep
+// the display awake while mirroring. There is no powerd here, so accept it.
+func (p *powerManager) SetIsProjecting(projecting bool) *dbus.Error {
+	log.Printf("SetIsProjecting: %v (no-op)", projecting)
+	return nil
+}
+
 func (p *powerManager) IncreaseScreenBrightness() *dbus.Error {
 	p.mu.RLock()
 	next := p.screenBrightness + 10

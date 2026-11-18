@@ -57,6 +57,7 @@ Ash сам владеет дисплеем через DRM/KMS и сам же х�
 | `org.chromium.SessionManager`<br>`org.chromium.UserDataAuth` | `session-bridge` | «запущенная сессия», состояние входа, гостевой профиль `/home/chronos/user` |
 | `org.chromium.VmConcierge`, `VmCicerone`,<br>`DlcService`, `ImageLoader`, `debugd` | `crostini-bridge` | локальные `.desktop`-файлы: регистрация в лаунчере и запуск приложений на `:10` |
 | `org.chromium.Rmad` | `rmad-bridge` | заглушка RMA-демона |
+| `org.chromium.ResourceManager`, `TpmManager`, `PermissionBroker`,<br>`UpdateEngine`, `typecd`, `pciguard`, `bluetooth` (media),<br>`Rgbkbd`, `CrosDisks`, `BiometricsDaemon`, `MachineLearning`,<br>`lorgnette`, `VmPluginDispatcher`, `SwapManagement`,<br>`com.ubuntu.Upstart`, `org.freedesktop.fwupd` | `stub-bridge` | заглушки демонов, которых нет на Linux-хосте: вместо `ServiceUnknown` отвечает пустыми/нулевыми результатами с теми сигнатурами, которые ждёт Chrome |
 | `/run/mojo/service_manager.sock` | `mojo-stub` | Mojo service manager (ACCEPT_INVITEE + слив сообщений) |
 | — | `register-apps` | разовый helper: пишет `crostini.registry` в `Preferences`, чтобы `.desktop`-файлы появились в лаунчере |
 
@@ -209,7 +210,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 1. Проверяет системную шину и что профиль (`/var/lib/ash-profile`) записываем — иначе вежливо просит прогнать `setup-system.sh`.
 2. Прогоняет DRM-preflight: карта `/dev/dri/cardN` (выбирается автоматически как первая с подключённым коннектором, rw; `ASH_DRM_CARD` переопределяет), читаемые `/dev/input/event*`, `/run/udev/control`, отсутствие известных композиторов, ChromeOS-режим `/etc/lsb-release`; при провале отказывается стартовать.
-3. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad` (с `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power` и `mojo-stub`. Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
+3. Поднимает бриджи: `shill`, `cras`, `session`, `crostini`, `rmad`, `stub` (с `PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native`), `power` и `mojo-stub`. Каждый — под watchdog-ом: падение → перезапуск через 2 с, пять падений подряд → пауза 30 с (типичная причина — политика D-Bus не применена).
 4. Запускает `session/chromeos-linux-session` и ждёт его; при выходе убивает бриджи и пробрасывает код возврата.
 
 `chromeos-linux-session` (цикл):
@@ -304,7 +305,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 * Ставятся все 24 System Web App, включая Terminal, Files, Settings и Camera.
 * Terminal SWA поднимает настоящий bash через инжектированный UI.
 * Chrome переживает перелогин и ре-экзекуции сессии, не вылетая из дисплейного менеджера.
-* Работают бриджи shill, CRAS, powerd, session_manager, UserDataAuth, Crostini, rmad и совместимость Mojo service manager.
+* Работают бриджи shill, CRAS, powerd, session_manager, UserDataAuth, Crostini, rmad, stub-bridge и совместимость Mojo service manager.
 * NetworkManager отдаёт шилл-бриджу реальное состояние сети.
 * Громкость работает через CRAS-бридж (PulseAudio/PipeWire).
 * UPower кормит бридж питания состоянием батареи.

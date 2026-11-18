@@ -107,7 +107,7 @@ bridge_bin() {
   printf '%s' "$bin"
 }
 
-BRIDGES=(shill cras power session crostini rmad)
+BRIDGES=(shill cras power session crostini rmad stub)
 watchdogs=()
 session_pid=""
 
@@ -216,7 +216,7 @@ fi
 # Bridges other than power talk to the per-user PulseAudio/PipeWire socket.
 PULSE_ENV=(PULSE_SERVER="unix:$XDG_RUNTIME_DIR/pulse/native")
 
-for name in shill cras session crostini rmad; do
+for name in shill cras session crostini rmad stub; do
   start_bridge "$name" "${PULSE_ENV[@]}"
 done
 start_bridge power            # backlight/suspend paths want privileges; see README
