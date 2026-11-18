@@ -189,6 +189,43 @@ else
 fi
 stop_last
 
+echo "== stub (services absent on this host) =="
+start_bridge stub "$XDG_ENV"
+stub_names=(
+  org.chromium.ResourceManager
+  org.chromium.TpmManager
+  org.chromium.PermissionBroker
+  org.chromium.UpdateEngine
+  org.chromium.typecd
+  org.chromium.pciguard
+  org.chromium.bluetooth
+  org.chromium.Rgbkbd
+  org.chromium.CrosDisks
+  org.chromium.BiometricsDaemon
+  org.chromium.MachineLearning
+  org.chromium.lorgnette
+  org.chromium.VmPluginDispatcher
+  org.chromium.SwapManagement
+)
+missing=""
+for n in "${stub_names[@]}"; do
+  if ! wait_for_name "$n" "$TMP/stub.log"; then
+    missing="$missing $n"
+  fi
+done
+if [ -z "$missing" ]; then
+  ok "all stub names owned (${#stub_names[@]})"
+else
+  bad "not owned:$missing — see $TMP/stub.log"
+fi
+if out=$(dbus-send --system --print-reply --dest=org.chromium.Rgbkbd \
+    /org/chromium/Rgbkbd org.chromium.Rgbkbd.GetRgbKeyboardCapabilities 2>&1); then
+  ok "Rgbkbd.GetRgbKeyboardCapabilities -> $(echo "$out" | grep uint32 || echo "$out")"
+else
+  bad "GetRgbKeyboardCapabilities: $out"
+fi
+stop_last
+
 echo "== mojo-stub =="
 if [ -x "$BIN/mojo-stub" ]; then
   "$BIN/mojo-stub" >"$TMP/mojo.log" 2>&1 &

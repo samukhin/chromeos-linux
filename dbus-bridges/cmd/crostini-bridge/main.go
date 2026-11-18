@@ -852,6 +852,15 @@ func (d *dlcService) InstallWithOmaha(req []byte) *dbus.Error {
 
 type debugdStub struct{}
 
+// StopPluginVmDispatcher is called when the VM plugin dispatcher shuts down.
+// Debugd replies with an empty response and the caller only checks that one
+// arrived (DebugDaemonClientImpl::OnStopPluginVmDispatcher), so a void reply
+// is enough.
+func (d *debugdStub) StopVmPluginDispatcher() *dbus.Error {
+	log.Printf("debugd.StopVmPluginDispatcher (no-op)")
+	return nil
+}
+
 func (d *debugdStub) SetSchedulerConfigurationV2(configName string, lockPolicy bool) (bool, uint32, *dbus.Error) {
 	log.Printf("debugd.SetSchedulerConfigurationV2 configName=%q lockPolicy=%v", configName, lockPolicy)
 	return true, 0, nil
