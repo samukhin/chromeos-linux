@@ -224,7 +224,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 1. Готовит профиль: `mkdir`, `CHROMEOS_SESSION_LOG_DIR`, метки «OOBE пройдено» (`.oobe_completed`, `First Run`, `Local State`), чистка токенов входа, JSON-правки `Preferences` (включён Crostini, `exit_type=Normal`).
 2. Прогоняет `register-apps` — пишет Linux-приложения в лаунчер Ash.
-3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), открывает `chrome-untrusted://terminal/`, кладёт `terminal/terminal-ui.js` в `localStorage.t` и перезагружает страницу. Это срабатывает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
+3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), открывает `chrome-untrusted://terminal/`, дожидается, пока в цели действительно загрузится документ терминала (свежий `Target.createTarget` сначала отдаёт `about:blank`, где `localStorage` бросает `SecurityError`), кладёт `terminal/terminal-ui.js` в `localStorage.t`, перезагружает страницу и проверяет, что UI реально смонтировался (`#term`/`#ta`). Всё это пишется в `terminal-inject.log`. Работает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
 4. Поднимает в фоне sommelier + Xwayland на `:10` (ждёт появления `wayland-0` и ответа CDP, выставляет чёрно-белые цвета xterm через `xrdb`).
 5. Определяет границы окна Ash через `xrandr` и запускает Chrome с закреплённым набором флагов (`--enable-wayland-server`, `--ozone-platform=x11`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`, GPU-блок `--ignore-gpu-blocklist` + `--disable-gpu-sandbox` + `--enable-logging=stderr` — последний вместе с no-op `RedirectChromeLogging` и есть то, что кладёт ERROR'ы в `ash.log`).
 6. Когда Chrome вышел — убивает sommelier/Xwayland, ждёт остаточных процессов `chrome` и начинает заново.
@@ -391,6 +391,7 @@ make test             # бриджи на реальной системной ш
 | `/var/lib/ash-profile/ash.log` | stderr Chrome/Ash — первое место, куда смотреть |
 | `/var/lib/ash-profile/sommelier.log` | sommelier и Xwayland |
 | `/var/lib/ash-profile/*-bridge.log` | по одному на бридж |
+| `/var/lib/ash-profile/terminal-inject.log` | шаги инжекта UI терминала: ожидание CDP, загрузка документа, setItem/reload и проверка монтирования (`SUCCESS`/`FAILED`) |
 | `/var/lib/ash-profile/bridges.log` | записи watchdog-ов о перезапусках |
 | `/var/lib/ash-profile/xorg.log` | свой Xorg, если поднимал скрипт |
 | `/var/lib/ash-profile/test-user/log/ash` | собственный сессионный лог Chrome |
@@ -403,6 +404,7 @@ make test             # бриджи на реальной системной ш
 |---|---|---|
 | Бриджи пишут `not allowed to own … due to security policies` | политика не установлена или dbus её отбросил | `sudo ./scripts/setup-system.sh --user "$USER"`, перезапуск dbus/перезагрузка; `make verify` ловит это заранее |
 | `no DISPLAY and no Xorg to start` | запущено не из X-сеанса и нет `xserver-xorg` | запусти из терминала в X или поставь `xserver-xorg` |
+| Терминал открывается белым окном | UI не успел/не смог лечь в `localStorage.t`: старый инжектор писал в свежий `about:blank` (там `localStorage` запрещён), а потом просто перезагружал страницу | смотри `terminal-inject.log`; перезапуск сессии лечит, потому что цель терминала к тому моменту уже загружена. Текущий инжектор ждёт загрузки документа и проверяет монтирование |
 | Linux-приложения не рисуются | нет `Xwayland` в `$PATH` | поставь пакет `xwayland` |
 | Chrome вылетает сразу | смотри `ash.log`; либо снапшот не тот (только x86_64, только пин из `chromeos-bin/REVISION`) | сверь пины (`./chromeos-bin/fetch.sh --force` перескачает и напечатает sums; `make fetch` аргументов не принимает) |
 | `Pactl not found` / громкость не регулируется | нет `pulseaudio-utils` | поставь пакет |
