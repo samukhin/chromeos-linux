@@ -345,22 +345,30 @@ while true; do
       #                           LIBGL_DRIVERS_PATH baked in at build time is
       #                           /opt/google/cros-containers/lib, which does
       #                           not exist here, so Xwayland would find no DRI
-      #                           drivers without this hint.
+      #                           drivers without this hint;
+      #   --glamor                switch Xwayland from -shm to GPU rendering;
+      #                           client buffers then travel as dmabuf through
+      #                           the same path as above.
       #
-      # Deliberately NOT passed: --glamor (it would drop -shm from Xwayland's
-      # command line and switch it to GPU rendering). Bisected as the flicker
-      # switch: without it the OBS preview is stable; adding it back makes the
-      # preview flicker — chrome blends a surface whose alpha byte is 0, so the
-      # xterm shows through and frames accumulate (x2/x3) — and hardware OBS
-      # goes blank. The opaque-region patch in sommelier did not help, so the
-      # trigger sits inside glamor itself. Client-side GPU rendering does NOT
-      # depend on --glamor: OBS and glxgears stay hardware-accelerated here.
+      # --glamor is ENABLED below. It used to leave every X11 window white
+      # because Chrome imported the client buffers with SCANOUT and Mesa
+      # rejected them as non-displayable; the libminigbm shim now retries such
+      # imports without SCANOUT, so xterm/glxgears render correctly.
+      #
+      # Known risk: with glamor the OBS preview may flicker (chrome blends a
+      # surface whose alpha byte is 0, so the xterm shows through and frames
+      # accumulate x2/x3), and hardware OBS may go blank; the opaque-region
+      # patch in sommelier did not help, so the trigger sits inside glamor.
+      # If you hit that or any other rendering artifact, disable glamor by
+      # dropping the flag below: Xwayland falls back to -shm and opaque
+      # XRGB8888 buffers. Client-side GPU rendering does NOT depend on
+      # --glamor: OBS and glxgears stay hardware-accelerated either way.
       SOMMELIER_DISPLAY=wayland-0 \
       WAYLAND_DISPLAY=wayland-0 \
       XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
         "$SOMMELIER" \
           --noop-driver \
-          -X \
+          -X --glamor \
           --socket=wayland-1 \
           --x-display=10 \
           --xwayland-path="$(command -v Xwayland || echo /usr/bin/Xwayland)" \

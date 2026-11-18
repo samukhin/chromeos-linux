@@ -17,7 +17,11 @@
  *   2. import types — minigbm's GBM_BO_IMPORT_FD_MODIFIER is 0x5505 while
  *      Mesa's is 0x5504; anything else falls through to Mesa's default
  *      (NULL). On failure we retry with modifier=0 (LINEAR) and then with
- *      the legacy GBM_BO_IMPORT_FD descriptor.
+ *      the legacy GBM_BO_IMPORT_FD descriptor;
+ *   3. SCANOUT validation — Chrome asks for SCANOUT on every import, but on
+ *      amdgpu GFX8 Xwayland's glamor buffers are render targets and Mesa
+ *      rejects them as non-displayable. The compositor only samples them, so
+ *      retry without SCANOUT (otherwise X11 windows stay white).
  *
  * Everything is logged to /tmp/gbm-shim.log (cleared by the session script
  * on start) — that file is how the failure chain above was diagnosed.
@@ -27,6 +31,7 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -53,6 +58,7 @@ union gbm_bo_handle {
 #define GBM_USAGE_MASK 0x3f
 #define GBM_USAGE_LOW3 0x7 /* SCANOUT | CURSOR | RENDERING */
 #define GBM_BO_USE_RENDERING 0x4
+#define SHIM_GBM_BO_USE_SCANOUT 0x1
 
 /* Resolved against Mesa in the constructor below; NULL when unavailable. */
 static struct gbm_device *(*p_create_device)(int fd);
@@ -261,6 +267,21 @@ void gbm_bo_destroy(struct gbm_bo *bo, struct gbm_device *gbm) {
   }
 }
 
+/* A single bad client buffer is retried on every compositor frame, and a
+ * successful import of a fresh Xwayland buffer is just as frequent. Log the
+ * first attempts, then sample, so /tmp/gbm-shim.log stays readable. */
+static int import_log_budget = 60;
+
+static int import_should_log(void) {
+  static unsigned int seen;
+  seen++;
+  if (import_log_budget > 0) {
+    import_log_budget--;
+    return 1;
+  }
+  return (seen % 500) == 0;
+}
+
 struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
                              const void *buf, uint32_t flags) {
   /* minigbm's GBM_BO_IMPORT_FD_MODIFIER (0x5505) is Mesa's 0x5504. */
@@ -282,28 +303,62 @@ struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
     /* Only meaningful for the modifier descriptor; >= 1 plane and <= 4 planes
      * is what Mesa's gbm_import_fd_modifier_data can address. */
     int sane = (m->num_fds >= 1 && m->num_fds <= 4);
+    int log_now = import_should_log();
 
     struct gbm_bo *bo =
         p_bo_import ? p_bo_import(gbm, mesa_type, buf, (uint32_t)masked) : NULL;
 
-    shim_log("[%d] gbm_bo_import(type=0x%x->0x%x flags=0x%x->0x%llx, "
-             "fmt=0x%08x %ux%u num_fds=%u mod=0x%llx) -> %s\n",
-             getpid(), type, mesa_type, flags, (unsigned long long)masked,
-             m->format, m->width, m->height, m->num_fds,
-             (unsigned long long)m->modifier, bo ? "BO" : "NULL");
+    if (log_now) {
+      shim_log("[%d] gbm_bo_import(type=0x%x->0x%x flags=0x%x->0x%llx, "
+               "fmt=0x%08x %ux%u num_fds=%u mod=0x%llx) -> %s\n",
+               getpid(), type, mesa_type, flags, (unsigned long long)masked,
+               m->format, m->width, m->height, m->num_fds,
+               (unsigned long long)m->modifier, bo ? "BO" : "NULL");
+    }
 
     if (bo || mesa_type != MESA_IMPORT_FD_MODIFIER || !sane) {
       return bo;
     }
 
+    /* Chrome's MINIGBM build asks for SCANOUT on every import (its
+     * GetSupportedGbmFlags() advertises SCANOUT|TEXTURING). Xwayland's glamor
+     * on GFX8 (Wani/Carrizo) allocates client buffers as render targets with
+     * STANDARD micro-tiling, so radeonsi marks the image non-displayable:
+     * Mesa creates it, then dri2_validate_usage() rejects PIPE_BIND_SCANOUT
+     * and gbm_bo_import returns NULL. The compositor only samples these
+     * buffers, so retry the same import without SCANOUT instead of leaving
+     * the client in an endless CreateBufferFromHandle loop (white window).
+     *
+     * Real scanout is unaffected: Ash creates its own buffers with SCANOUT,
+     * and they are displayable. A per-modifier path does not exist on GFX8 —
+     * radeonsi only enables resource_create_with_modifiers from GFX9, so
+     * Xwayland exports DRM_FORMAT_MOD_INVALID. */
+    if (masked & SHIM_GBM_BO_USE_SCANOUT) {
+      errno = 0;
+      bo = p_bo_import ? p_bo_import(gbm, mesa_type, buf,
+                                     (uint32_t)(masked &
+                                                ~(uint64_t)SHIM_GBM_BO_USE_SCANOUT))
+                       : NULL;
+      if (bo) {
+        if (log_now) {
+          shim_log("[%d]   recovered without GBM_BO_USE_SCANOUT "
+                   "(non-displayable producer surface)\n", getpid());
+        }
+        return bo;
+      }
+    }
+
     /* Retry: vmwgfx rejects DRM_FORMAT_MOD_INVALID imports, LINEAR it accepts. */
     struct shim_import_mod linear = *m;
     linear.modifier = 0;
+    errno = 0;
     bo = p_bo_import ? p_bo_import(gbm, MESA_IMPORT_FD_MODIFIER, &linear,
                                    (uint32_t)masked)
                      : NULL;
-    shim_log("[%d]   fallback modifier=0 -> %s\n", getpid(),
-             bo ? "BO" : "NULL");
+    if (log_now) {
+      shim_log("[%d]   fallback modifier=0 -> %s\n", getpid(),
+               bo ? "BO" : "NULL");
+    }
     if (bo) {
       return bo;
     }
@@ -316,12 +371,15 @@ struct gbm_bo *gbm_bo_import(struct gbm_device *gbm, uint32_t type,
     legacy.height = m->height;
     legacy.stride = (uint32_t)m->strides[0];
     legacy.format = m->format;
+    errno = 0;
     bo = p_bo_import ? p_bo_import(gbm, MESA_IMPORT_FD, &legacy,
                                    (uint32_t)masked)
                      : NULL;
-    shim_log("[%d]   fallback legacy FD(fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
-             getpid(), legacy.fd, legacy.width, legacy.height, legacy.stride,
-             legacy.format, bo ? "BO" : "NULL");
+    if (log_now) {
+      shim_log("[%d]   fallback legacy FD(fd=%d %ux%u stride=%u fmt=0x%x) -> %s\n",
+               getpid(), legacy.fd, legacy.width, legacy.height, legacy.stride,
+               legacy.format, bo ? "BO" : "NULL");
+    }
     return bo;
   }
 
