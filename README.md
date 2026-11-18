@@ -129,7 +129,7 @@ scripts/smoke-test.sh         проверка бриджей на живой с
 
 session/start-session.sh      точка входа: бриджи + сессия
 session/chromeos-linux-session основной сессионный цикл
-session/terminal-inject.pl    инжект UI терминала по CDP
+session/terminal-inject.pl    инжект UI терминала и crosh по CDP
 session/chromeos-ash-open-url ручной helper: открывает URL в запущенном Ash через CDP (обработчиком по умолчанию НЕ регистрируется)
 session/dbus-policies/        D-Bus политика (исходник для setup-system.sh)
 session/tmpfiles.d/           шаблон tmpfiles (исходник для setup-system.sh)
@@ -217,7 +217,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 1. Готовит профиль: `mkdir`, `CHROMEOS_SESSION_LOG_DIR`, метки «OOBE пройдено» (`.oobe_completed`, `First Run`, `Local State`), чистка токенов входа, JSON-правки `Preferences` (включён Crostini, `exit_type=Normal`).
 2. Прогоняет `register-apps` — пишет Linux-приложения в лаунчер Ash.
-3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), открывает `chrome-untrusted://terminal/`, дожидается, пока в цели действительно загрузится документ терминала (свежий `Target.createTarget` сначала отдаёт `about:blank`, где `localStorage` бросает `SecurityError`), кладёт `terminal/terminal-ui.js` в `localStorage.t`, перезагружает страницу и проверяет, что UI реально смонтировался (`#term`/`#ta`). Всё это пишется в `terminal-inject.log`. Работает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
+3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), для `chrome-untrusted://terminal/` и `chrome-untrusted://crosh/` дожидается, пока в цели действительно загрузится документ нужного origin'а (свежий `Target.createTarget` сначала отдаёт `about:blank`, где `localStorage` бросает `SecurityError`), кладёт `terminal/terminal-ui.js` в `localStorage.t`, перезагружает страницу и проверяет, что UI реально смонтировался (`#term`/`#ta`). Окно terminal остаётся (это шелл сессии); окно crosh при необходимости создаётся только на время записи и сразу закрывается (в том числе при ошибке), а UI в нём смонтируется, когда пользователь откроет crosh позже. Всё это пишется в `terminal-inject.log`. Работает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
 4. Поднимает в фоне sommelier + Xwayland на `:10` (ждёт появления `wayland-0` и ответа CDP, выставляет чёрно-белые цвета xterm через `xrdb`).
 5. Запускает Chrome с `--ozone-platform=drm --use-angle=gles-egl` (`--enable-wayland-server`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`, GPU-блок `--ignore-gpu-blocklist` + `--disable-gpu-sandbox` + `--enable-logging=stderr` — последний вместе с no-op `RedirectChromeLogging` и есть то, что кладёт ERROR'ы в `ash.log`). `--use-angle=gles-egl` обязателен: на этом снапшоте ANGLE по умолчанию выбирает OpenGL/GLX-бэкенд, который на VT без X-сервера падает с `Could not open the default X display`, после чего Viz убивает браузер (`Software compositing fallback is unavailable`). С `gles-egl` ANGLE работает поверх нативного Mesa EGL/GLES и GBM. `--ash-host-window-bounds` намеренно не передаётся: без него `DisplayManager::InitFromCommandLine()` возвращает false, и Ash выполняет настоящую настройку KMS.
 6. Когда Chrome вышел — убивает sommelier/Xwayland, ждёт остаточных процессов `chrome` и начинает заново.
@@ -257,7 +257,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 ## Патчи бинарника (applied at build time)
 
-Снапшот патчится в `scripts/build-chrome.sh`. Каждый патч сверяет ожидаемые байты и **падает с ошибкой**, если бинарник не совпал — молчаливо «починить» чужой бинарник нельзя.
+Снапшот патчится в `scripts/build-chrome.sh`. Каждый патч сверяет ожидаемые байты и **падает с ошибкой**, если бинарник не совпал — молчаливо «починить» чужой бинарник нельзя. Строка дефолтного CSP для `chrome-untrusted` должна встречаться ровно один раз: если её нет — только warning, если больше одной — сборка падает, потому что непонятно, какую из них патчить.
 
 Важно: патчи, нужные только для старого X11-хоста (`DisplayConfigurator::Init`, `RunPendingConfiguration`, `HasInternalDisplay`, X11-движок раскладки и фикс `GetEventPropertiesFromXEvent`), в этой ветке **не применяются**. На DRM нативный display delegate обязан остаться на месте, а реальная настройка KMS — выполняться; `scripts/verify.sh` проверяет, что оригинальные байты на месте.
 
@@ -265,6 +265,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 |---|---|---|
 | Терминальный стаб | `chrome.terminalPrivate.openVmshellProcess(...)` → `eval(localStorage.t||"")` | Terminal SWA пытается стартовать VM-шелл и падает |
 | Расслабление CSP | `'wasm-unsafe-eval'` → `'unsafe-eval'` (10 мест) | инжектированный UI терминала не выполняется |
+| CSP по умолчанию для `chrome-untrusted` | `script-src chrome-untrusted://resources 'self';` → `script-src chrome-untrusted: 'unsafe-eval';` (47 байт, тот же размер) | `eval(localStorage.t)` на crosh бросает EvalError, страница пустая |
 | `RedirectChromeLogging` | `ret` (no-op) | Chrome уводит логи в ChromeOS-путь |
 | `OnDisconnect` | `ret` (no-op) | крэш при таймауте mojo-канала |
 | `IsSystemBlurEnabled` | всегда `true` | blur панели/шторки гейтится не на GPU, а на ОЗУ: `chromeos::features::IsSystemBlurEnabled()` — это буквально `AmountOfTotalPhysicalMemory() > 4GiB` из `/proc/meminfo`, без FeatureList и без флага. На хостах ≤4 ГБ (гости VirtualBox, типовые Haswell-ноутбуки) панель и шторка рисуются непрозрачными, хотя композитор blur умеет рисовать на чём угодно (`viz::SoftwareRenderer::GetBackdropFilterShader` есть). С патчем — blur при любом объёме RAM; на малорамных хостах это стоит части FPS в анимациях |
@@ -391,7 +392,7 @@ make test             # бриджи на реальной системной ш
 | `/var/lib/ash-profile/ash.log` | stderr Chrome/Ash — первое место, куда смотреть |
 | `/var/lib/ash-profile/sommelier.log` | sommelier и Xwayland |
 | `/var/lib/ash-profile/*-bridge.log` | по одному на бридж |
-| `/var/lib/ash-profile/terminal-inject.log` | шаги инжекта UI терминала: ожидание CDP, загрузка документа, setItem/reload и проверка монтирования (`SUCCESS`/`FAILED`) |
+| `/var/lib/ash-profile/terminal-inject.log` | шаги инжекта UI терминала и crosh: ожидание CDP, загрузка документов, setItem/reload, проверка монтирования (`SUCCESS`/`FAILED`) и закрытие временного окна crosh |
 | `/var/lib/ash-profile/bridges.log` | записи watchdog-ов о перезапусках |
 | `/var/lib/ash-profile/test-user/log/ash` | собственный сессионный лог Chrome |
 | `/tmp/gbm-shim.log` | каждый вызов шима `libminigbm.so` (очищается при старте сессии) |

@@ -1,21 +1,34 @@
 #!/usr/bin/env perl
-# Inject terminal/terminal-ui.js into the Terminal SWA over CDP.
+# Inject terminal/terminal-ui.js into the shell pages over CDP.
 #
-# The Chrome binary is patched so terminalPrivate.openVmshellProcess(...)
-# evaluates localStorage.t instead of spawning a VM shell; this script waits
-# for Chrome's remote debugging port, opens chrome-untrusted://terminal/,
-# stores the UI there and reloads the page.
+# The Chrome binary is patched so the shared js/terminal.js resource does
+# eval(localStorage.t||"") on load (for the Terminal page it is reached via
+# terminalPrivate.openVmshellProcess). Both chrome-untrusted://terminal/ and
+# chrome-untrusted://crosh/ load that resource, but every chrome-untrusted
+# host is its own origin with its own localStorage — so the UI must be stored
+# per origin. This script waits for Chrome's remote debugging port and, for
+# each origin below, stores the UI there and reloads the page.
+#
+# Target handling per origin:
+#   keep => 1 (terminal) — the page is the session shell: create the target
+#           if absent and leave it open.
+#   keep => 0 (crosh)    — a rarely used page: never leave an extra window
+#           behind, on success and on failure alike. If no crosh target
+#           exists, one is created just long enough to store the UI
+#           (localStorage is per-profile and survives the close), then closed
+#           again. The window blinks once per session start; a crosh the user
+#           opens later mounts the UI from storage.
 #
 # Why the polling dance below: a freshly Target.createTarget'd page reports
 # about:blank until the navigation commits, and a Runtime.evaluate issued
 # before the commit lands in the wrong document (the item never reaches the
-# terminal origin) or fails while the browser is still coming up — that was
+# target origin) or fails while the browser is still coming up — that was
 # the "inject silently missed, terminal window stays white" bug. So we
-# (1) retry target lookup/create, (2) wait until the document really is
-# chrome-untrusted://terminal/ and finished loading, (3) read the item back
-# after storing, (4) verify after the reload that the UI actually mounted,
-# re-running the set/reload cycle when it did not. Every step is logged to
-# stderr; chromeos-linux-session appends it to terminal-inject.log.
+# (1) retry target lookup/create, (2) wait until the document really is the
+# origin's page and finished loading, (3) read the item back after storing,
+# (4) verify after the reload that the UI actually mounted, re-running the
+# set/reload cycle when it did not. Every step is logged to stderr;
+# chromeos-linux-session appends it to terminal-inject.log.
 #
 # Usage: terminal-inject.pl <path/to/terminal-ui.js>
 use strict;
@@ -25,6 +38,11 @@ use MIME::Base64;
 use JSON::PP;
 use Encode ();
 use Time::HiRes ();
+
+my @ORIGINS = (
+  { url => "chrome-untrusted://terminal/", keep => 1 },
+  { url => "chrome-untrusted://crosh/",     keep => 0 },
+);
 
 my $ui = shift @ARGV;
 $ui = $ENV{ASH_TERMINAL_UI} unless defined $ui && length $ui;
@@ -126,6 +144,168 @@ sub eval_json {
   return $d;
 }
 
+# Close a target we created for a throwaway origin. No-op for kept pages and
+# for targets that were already open. Under eval: the CDP connection may be
+# the very thing that just failed, and cleanup must not mask the real error.
+sub close_target {
+  my $ctx = shift;
+  return unless $ctx->{tid} && $ctx->{created} && !$ctx->{keep};
+  my $r = eval {
+    cdp($ctx->{s}, "Target.closeTarget", { targetId => $ctx->{tid} });
+  };
+  return unless $@ || ($r && $r->{error});
+  my $why = $@ ? do { my $e = $@; $e =~ s/\s+$//; $e }
+                : encode_json($r->{error});
+  note("closeTarget($ctx->{tid}) failed: $why");
+}
+
+# Report a per-origin failure, close our throwaway target if there is one, and
+# return false so the caller can move on to the next origin.
+sub fail_origin {
+  my ($ctx, $msg) = @_;
+  note($msg);
+  close_target($ctx);
+  note("leaving target $ctx->{tid} open for inspection")
+    if $ctx->{tid} && !($ctx->{created} && !$ctx->{keep});
+  0;
+}
+
+# Inject one origin. Returns 1 on success; note()s the reason on failure.
+# The body runs under eval so an unexpected die (CDP timeout, dead socket)
+# still cleans up instead of leaking the target we created.
+sub inject_origin {
+  my ($s, $spec, $code, $chars, $json_code) = @_;
+  my $ctx = {
+    s       => $s,
+    keep    => $spec->{keep},
+    tid     => undef,
+    created => 0,
+  };
+  my $status = eval { inject_origin_body($ctx, $spec, $code, $chars, $json_code) + 0 };
+  return $status if defined $status;
+
+  my $e = $@ || "unknown error";
+  $e =~ s/\s+$//;
+  note("$spec->{url}: fatal: $e");
+  close_target($ctx);
+  note("leaving target $ctx->{tid} open for inspection")
+    if $ctx->{tid} && !($ctx->{created} && !$ctx->{keep});
+  0;
+}
+
+sub inject_origin_body {
+  my ($ctx, $spec, $code, $chars, $json_code) = @_;
+  my $s = $ctx->{s};
+  my $url = $spec->{url};
+  my $name = $url;
+  $name =~ s!^chrome-untrusted://!!; $name =~ s!/$!!;
+
+  # 1. Find the target, creating it when absent. Retried: right after
+  #    startup createTarget can be rejected while the browser is still
+  #    logging in.
+  my $tid;
+  my $tries = 0;
+  my $comm_fail = 0;
+  for my $try (1 .. 30) {
+    $tries = $try;
+    my $tgts = eval { cdp($s, "Target.getTargets", {}) };
+    if (!$tgts) {
+      my $e = $@ || "no response";
+      $e =~ s/\s+$//;
+      note("getTargets($name) failed (try $try): $e");
+      last if ++$comm_fail >= 3;   # desynced/dead socket: retrying cannot help
+      Time::HiRes::sleep(1);
+      next;
+    }
+    $comm_fail = 0;
+    for my $t (@{$tgts->{result}{targetInfos} // []}) {
+      $tid = $t->{targetId} if !defined $tid && ($t->{url} // "") =~ m!^\Q$url\E!;
+    }
+    last if $tid;
+    my $cr = cdp($s, "Target.createTarget", { url => $url });
+    if ($cr->{error}) {
+      note(sprintf "createTarget(%s) failed (try %d): %s",
+        $name, $try, encode_json($cr->{error}));
+    } elsif ($cr->{result}{targetId}) {
+      $tid = $ctx->{tid} = $cr->{result}{targetId};
+      $ctx->{created} = 1;
+      note("created $name target $tid");
+      last;
+    }
+    Time::HiRes::sleep(1);
+  }
+  return do { note("no $name target after $tries attempt(s)"); 0 } unless $tid;
+  $ctx->{tid} = $tid;
+  note("$name target: $tid" . ($ctx->{created} ? " (created by us)" : ""));
+
+  my $ar = cdp($s, "Target.attachToTarget", { targetId => $tid, flatten => JSON::PP::true });
+  my $sid = $ar->{result}{sessionId};
+  return fail_origin($ctx, "attach to $name failed: " . encode_json($ar))
+    unless $sid;
+
+  # 2. Wait until the attached document is really this origin's page and has
+  #    finished loading — evaluating any earlier writes into the void.
+  my $st;
+  for (1 .. 40) {
+    $st = eval_json($s, $sid, $STATE_JS);
+    if (!$st->{__error} && ($st->{href} // "") =~ m!^\Q$url\E!
+        && ($st->{rs} // "") eq "complete") {
+      last;
+    }
+    note("waiting for $name document: " . encode_json($st));
+    Time::HiRes::sleep(0.5);
+  }
+  return fail_origin($ctx, "$name document never loaded: " . encode_json($st))
+    unless ($st->{href} // "") =~ m!^\Q$url\E! && ($st->{rs} // "") eq "complete";
+  note("document loaded: " . encode_json($st));
+  if (($st->{t} // 0) == $chars && $st->{mounted}) {
+    note("$name: already injected and mounted, nothing to do");
+    close_target($ctx);
+    return 1;
+  }
+
+  # 3. Store the UI, read it back, reload, verify the mount; up to 3 rounds.
+  # ascii => non-ASCII becomes \uXXXX escapes: the expression stays pure
+  # ASCII, so the outer JSON encoder in cdp() cannot double-encode the UTF-8
+  # bytes (which would store mojibake and make the length check fail).
+  my $set_js = '(function(){var c=' . $json_code . ';'
+    . 'try{localStorage.setItem("t",c);'
+    . 'return JSON.stringify({set:localStorage.getItem("t").length})}'
+    . 'catch(e){return JSON.stringify({err:String(e)})}})()';
+
+  for my $attempt (1 .. 3) {
+    my $set = eval_json($s, $sid, $set_js);
+    note(sprintf "setItem(%s) attempt %d -> %s", $name, $attempt, encode_json($set));
+    return fail_origin($ctx, "localStorage rejected the UI: " . encode_json($set))
+      if $set->{__error} || $set->{err};
+    return fail_origin($ctx, sprintf("stored length %d != %d — truncated write",
+        $set->{set} // -1, $chars))
+      if ($set->{set} // -1) != $chars;
+
+    cdp($s, "Page.reload", {}, $sid);
+    note("$name page reloaded, waiting for the UI to mount");
+
+    my $mounted = 0;
+    for (1 .. 40) {
+      Time::HiRes::sleep(0.5);
+      my $s2 = eval_json($s, $sid, $STATE_JS);
+      next if $s2->{__error};    # navigation destroyed the context; keep polling
+      if (($s2->{rs} // "") eq "complete") {
+        note("post-reload state: " . encode_json($s2));
+        $mounted = 1 if $s2->{mounted} && ($s2->{t} // 0) == $chars;
+        last;
+      }
+    }
+    if ($mounted) {
+      note("SUCCESS: $name UI mounted");
+      close_target($ctx);
+      return 1;
+    }
+    note("UI not mounted after reload (attempt $attempt), retrying");
+  }
+  return fail_origin($ctx, "UI still not mounted after 3 set/reload rounds");
+}
+
 sub main {
   my $raw = do {
     open my $fh, "<", $ui or give_up "cannot read $ui: $!";
@@ -168,92 +348,20 @@ sub main {
   give_up "websocket handshake rejected" unless $hs =~ /101/;
   note("websocket connected ($host:$port)");
 
-  # 2. Find the terminal target, creating it when absent. Retried: right
-  #    after startup createTarget can be rejected while the browser is still
-  #    logging in.
-  my $tid;
-  for my $try (1 .. 30) {
-    my $tgts = eval { cdp($s, "Target.getTargets", {}) };
-    for my $t (@{$tgts->{result}{targetInfos} // []}) {
-      $tid = $t->{targetId} if ($t->{url} // "") =~ m!^chrome-untrusted://terminal!;
-    }
-    last if $tid;
-    my $cr = cdp($s, "Target.createTarget", { url => "chrome-untrusted://terminal/" });
-    if ($cr->{error}) {
-      note(sprintf "createTarget failed (try %d): %s", $try, encode_json($cr->{error}));
-    } elsif ($cr->{result}{targetId}) {
-      $tid = $cr->{result}{targetId};
-      note("created terminal target $tid");
-      last;
-    }
-    sleep 1;
-  }
-  give_up "no terminal target after 30 attempts" unless $tid;
-  note("terminal target: $tid");
-
-  my $ar = cdp($s, "Target.attachToTarget", { targetId => $tid, flatten => JSON::PP::true });
-  my $sid = $ar->{result}{sessionId};
-  give_up "attach failed: " . encode_json($ar) unless $sid;
-
-  # 3. Wait until the attached document is really the terminal page and has
-  #    finished loading — evaluating any earlier writes into the void.
-  my $st;
-  for (1 .. 40) {
-    $st = eval_json($s, $sid, $STATE_JS);
-    if (!$st->{__error} && ($st->{href} // "") =~ m!^chrome-untrusted://terminal!
-        && ($st->{rs} // "") eq "complete") {
-      last;
-    }
-    note("waiting for terminal document: " . encode_json($st));
-    sleep 0.5;
-  }
-  give_up "terminal document never loaded: " . encode_json($st)
-    unless ($st->{href} // "") =~ m!^chrome-untrusted://terminal! && ($st->{rs} // "") eq "complete";
-  note("document loaded: " . encode_json($st));
-  if (($st->{t} // 0) == $chars && $st->{mounted}) {
-    note("already injected and mounted, nothing to do");
-    exit 0;
-  }
-
-  # 4. Store the UI, read it back, reload, verify the mount; up to 3 rounds.
-  # ascii => non-ASCII becomes \uXXXX escapes: the expression stays pure
-  # ASCII, so the outer JSON encoder in cdp() cannot double-encode the UTF-8
-  # bytes (which would store mojibake and make the length check fail).
+  # Pure-ASCII JSON encoding of the UI, reused for every origin.
   my $json_code = JSON::PP->new->ascii->allow_nonref->encode($code);
-  my $set_js = '(function(){var c=' . $json_code . ';'
-    . 'try{localStorage.setItem("t",c);'
-    . 'return JSON.stringify({set:localStorage.getItem("t").length})}'
-    . 'catch(e){return JSON.stringify({err:String(e)})}})()';
 
-  for my $attempt (1 .. 3) {
-    my $set = eval_json($s, $sid, $set_js);
-    note(sprintf "setItem attempt %d -> %s", $attempt, encode_json($set));
-    give_up "localStorage rejected the UI: " . encode_json($set)
-      if $set->{__error} || $set->{err};
-    give_up sprintf("stored length %d != %d — truncated write",
-        $set->{set} // -1, $chars) if ($set->{set} // -1) != $chars;
-
-    cdp($s, "Page.reload", {}, $sid);
-    note("page reloaded, waiting for the UI to mount");
-
-    my $mounted = 0;
-    for (1 .. 40) {
-      sleep 0.5;
-      my $s2 = eval_json($s, $sid, $STATE_JS);
-      next if $s2->{__error};    # navigation destroyed the context; keep polling
-      if (($s2->{rs} // "") eq "complete") {
-        note("post-reload state: " . encode_json($s2));
-        $mounted = 1 if $s2->{mounted} && ($s2->{t} // 0) == $chars;
-        last;
-      }
-    }
-    if ($mounted) {
-      note("SUCCESS: terminal UI mounted");
-      exit 0;
-    }
-    note("UI not mounted after reload (attempt $attempt), retrying");
+  # 2. Inject every origin; a failure of one must not skip the others.
+  my @failed;
+  for my $spec (@ORIGINS) {
+    push @failed, $spec->{url}
+      unless inject_origin($s, $spec, $code, $chars, $json_code);
   }
-  give_up "UI still not mounted after 3 set/reload rounds";
+  if (@failed) {
+    note("FAILED origins: " . join(", ", @failed));
+    exit 1;
+  }
+  note("all origins injected");
 }
 
 my $ok = eval { main(); 1 };

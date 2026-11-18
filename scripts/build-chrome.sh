@@ -40,6 +40,15 @@ chmod u+w "$CHROME"
 # printf and count through a pipe instead.
 payload_len() { printf "$1" | wc -c; }
 
+# Hex string -> printf format of \NNN octal escapes. The byte patches below
+# are written with printf, which cannot carry NULs in a shell variable.
+hex_to_fmt() {
+  awk -v h="$1" 'BEGIN {
+    for (i = 1; i <= length(h); i += 2)
+      printf "\\%03o", strtonum("0x" substr(h, i, 2))
+  }'
+}
+
 # verify_and_patch <what> <offset> <expected-hex> <printf-fmt> [soft]
 #   Checks that the binary still has <expected-hex> at <offset> (prefix
 #   compare, same byte counts as the original script), then overwrites with
@@ -116,6 +125,46 @@ while IFS=: read -r csp_offset _; do
     dd of="$CHROME" bs=1 seek="$csp_offset" conv=notrunc 2>/dev/null
   echo "patched CSP wasm-unsafe-eval -> unsafe-eval at $csp_offset"
 done < <(grep -Fboa "'wasm-unsafe-eval'" "$CHROME" || true)
+
+# Default chrome-untrusted CSP: every chrome-untrusted data source that does
+# not override GetContentSecurityPolicy gets `script-src
+# chrome-untrusted://resources 'self';` (content::URLDataSource). Crosh is one
+# of them — TerminalSource only overrides the policy for the SSH terminal,
+# gated on crostini.terminal_ssh_allowed_by_policy — and it loads the same
+# js/terminal.js, whose eval(localStorage.t||"") throws EvalError without
+# 'unsafe-eval' (the page stays blank). The string is fixed-size (47 bytes,
+# NUL-terminated) and cannot grow, so compress the source list to the scheme
+# source `chrome-untrusted:` (a superset of //resources and 'self' for these
+# pages) and spend the freed bytes on 'unsafe-eval'. This loosens script-src
+# for every page using the default policy, not just crosh.
+CROSH_CSP_OLD="script-src chrome-untrusted://resources 'self';"
+[ "${#CROSH_CSP_OLD}" -eq 47 ] ||
+  die "CROSH_CSP_OLD is ${#CROSH_CSP_OLD} bytes, expected 47 — padding would clobber the NUL"
+CROSH_CSP_NEW=$(printf '%-47s' "script-src chrome-untrusted: 'unsafe-eval';")
+[ "$(printf '%s' "$CROSH_CSP_NEW" | wc -c)" -eq 47 ] ||
+  die "CROSH_CSP_NEW is not 47 bytes"
+
+crosh_offset=""
+crosh_count=0
+while IFS=: read -r off _; do
+  [ -n "$off" ] || continue
+  crosh_offset=$off
+  crosh_count=$((crosh_count + 1))
+done < <(grep -Fboa "$CROSH_CSP_OLD" "$CHROME" || true)
+
+case $crosh_count in
+  0)
+    echo "WARNING: chrome-untrusted default CSP not found in chrome binary" >&2
+    ;;
+  1)
+    verify_and_patch "chrome-untrusted default CSP (crosh eval)" "$crosh_offset" \
+      "$(printf '%s' "$CROSH_CSP_OLD" | od -An -v -tx1 | tr -d ' \n')" \
+      "$(hex_to_fmt "$(printf '%s' "$CROSH_CSP_NEW" | od -An -v -tx1 | tr -d ' \n')")"
+    ;;
+  *)
+    die "chrome-untrusted default CSP is not unique: $crosh_count matches"
+    ;;
+esac
 
 # --- symbol patches --------------------------------------------------------
 
