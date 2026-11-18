@@ -217,7 +217,7 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 1. Готовит профиль: `mkdir`, `CHROMEOS_SESSION_LOG_DIR`, метки «OOBE пройдено» (`.oobe_completed`, `First Run`, `Local State`), чистка токенов входа, JSON-правки `Preferences` (включён Crostini, `exit_type=Normal`).
 2. Прогоняет `register-apps` — пишет Linux-приложения в лаунчер Ash.
-3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), открывает `chrome-untrusted://terminal/`, кладёт `terminal/terminal-ui.js` в `localStorage.t` и перезагружает страницу. Это срабатывает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
+3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (до 60 с), открывает `chrome-untrusted://terminal/`, дожидается, пока в цели действительно загрузится документ терминала (свежий `Target.createTarget` сначала отдаёт `about:blank`, где `localStorage` бросает `SecurityError`), кладёт `terminal/terminal-ui.js` в `localStorage.t`, перезагружает страницу и проверяет, что UI реально смонтировался (`#term`/`#ta`). Всё это пишется в `terminal-inject.log`. Работает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
 4. Поднимает в фоне sommelier + Xwayland на `:10` (ждёт появления `wayland-0` и ответа CDP, выставляет чёрно-белые цвета xterm через `xrdb`).
 5. Запускает Chrome с `--ozone-platform=drm --use-angle=gles-egl` (`--enable-wayland-server`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`, GPU-блок `--ignore-gpu-blocklist` + `--disable-gpu-sandbox` + `--enable-logging=stderr` — последний вместе с no-op `RedirectChromeLogging` и есть то, что кладёт ERROR'ы в `ash.log`). `--use-angle=gles-egl` обязателен: на этом снапшоте ANGLE по умолчанию выбирает OpenGL/GLX-бэкенд, который на VT без X-сервера падает с `Could not open the default X display`, после чего Viz убивает браузер (`Software compositing fallback is unavailable`). С `gles-egl` ANGLE работает поверх нативного Mesa EGL/GLES и GBM. `--ash-host-window-bounds` намеренно не передаётся: без него `DisplayManager::InitFromCommandLine()` возвращает false, и Ash выполняет настоящую настройку KMS.
 6. Когда Chrome вышел — убивает sommelier/Xwayland, ждёт остаточных процессов `chrome` и начинает заново.
@@ -391,6 +391,7 @@ make test             # бриджи на реальной системной ш
 | `/var/lib/ash-profile/ash.log` | stderr Chrome/Ash — первое место, куда смотреть |
 | `/var/lib/ash-profile/sommelier.log` | sommelier и Xwayland |
 | `/var/lib/ash-profile/*-bridge.log` | по одному на бридж |
+| `/var/lib/ash-profile/terminal-inject.log` | шаги инжекта UI терминала: ожидание CDP, загрузка документа, setItem/reload и проверка монтирования (`SUCCESS`/`FAILED`) |
 | `/var/lib/ash-profile/bridges.log` | записи watchdog-ов о перезапусках |
 | `/var/lib/ash-profile/test-user/log/ash` | собственный сессионный лог Chrome |
 | `/tmp/gbm-shim.log` | каждый вызов шима `libminigbm.so` (очищается при старте сессии) |
@@ -416,6 +417,7 @@ grep -iE 'ozone|drm|gbm|Failed to|Invalid' /var/lib/ash-profile/ash.log
 | `DRM mode: niri is running and likely holds DRM master` | сессия запущена поверх другого композитора | останови его и запусти с чистой VT |
 | Экран чёрный, Chrome жив | не ChromeOS-режим `lsb-release` или передан `--ash-host-window-bounds` | `sudo ./scripts/setup-system.sh`; проверь аргументы в `chromeos-linux-session` |
 | `Failed to open primary graphics card` в `ash.log` | нет прав на `/dev/dri/cardN` или карту держит другой процесс | `fuser /dev/dri/card*`, группы `video`/`render` |
+| Терминал открывается белым окном | UI не успел/не смог лечь в `localStorage.t`: старый инжектор писал в свежий `about:blank` (там `localStorage` запрещён), а потом просто перезагружал страницу | смотри `terminal-inject.log`; перезапуск сессии лечит, потому что цель терминала к тому моменту уже загружена. Текущий инжектор ждёт загрузки документа и проверяет монтирование |
 | Linux-приложения не рисуются | нет `Xwayland` в `$PATH` | поставь пакет `xwayland` |
 | Тачпад не двигает курсор, TrackPoint работает | не собран/не загружен шим, либо `ASH_TOUCHPAD_SHIM=0` | `make chrome` (соберёт `dist/chrome/libash-touchpad.so`); проверь `/tmp/ash-touchpad.log` |
 | Не работает прокрутка тачпада и колесо | в снапшоте нет libgestures, `EV_ABS`/`REL_WHEEL` отбрасываются | известное ограничение; шим лечит только указатель, тапы и клики |
