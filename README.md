@@ -132,7 +132,7 @@ scripts/smoke-test.sh         проверка бриджей на живой с
 
 session/start-session.sh      точка входа: бриджи + сессия
 session/chromeos-linux-session основной сессионный цикл
-session/terminal-inject.pl    инжект UI терминала по CDP
+session/terminal-inject.pl    инжект UI терминала и crosh по CDP
 session/chromeos-ash-open-url ручной helper: открывает URL в запущенном Ash через CDP (обработчиком по умолчанию НЕ регистрируется)
 session/dbus-policies/        D-Bus политика (исходник для setup-system.sh)
 session/tmpfiles.d/           шаблон tmpfiles (исходник для setup-system.sh)
@@ -220,9 +220,9 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 1. Готовит профиль: `mkdir`, `CHROMEOS_SESSION_LOG_DIR`, метки «OOBE пройдено» (`.oobe_completed`, `First Run`, `Local State`), чистка токенов входа, JSON-правки `Preferences` (включён Crostini, `exit_type=Normal`).
 2. Прогоняет `register-apps` — пишет Linux-приложения в лаунчер Ash.
-3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (цикл из 60 попыток с интервалом 2 с, т.е. до ~120 с), открывает `chrome-untrusted://terminal/`, кладёт `terminal/terminal-ui.js` в `localStorage.t` и перезагружает страницу. Это срабатывает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
+3. Запускает в фоне `terminal-inject.pl`: ждёт CDP на `localhost:9222` (цикл из 60 попыток с интервалом 2 с, т.е. до ~120 с), кладёт `terminal/terminal-ui.js` в `localStorage.t` для `chrome-untrusted://terminal/` и `chrome-untrusted://crosh/` и перезагружает страницы. Окно terminal остаётся (это шелл сессии); окно crosh при необходимости создаётся только на время записи и сразу закрывается (в том числе при ошибке), а UI в нём смонтируется, когда пользователь откроет crosh позже. Это срабатывает потому, что в бинарнике `terminalPrivate.openVmshellProcess(...)` заменён на `eval(localStorage.t||"")`.
 4. Поднимает в фоне sommelier + Xwayland на `:10` (ждёт появления `wayland-0` и ответа CDP, выставляет чёрно-белые цвета xterm через `xrdb`).
-5. Определяет границы окна Ash через `xrandr` и запускает Chrome с закреплённым набором флагов (`--enable-wayland-server`, `--ozone-platform=x11`, `--no-sandbox`, `--enable-features=Crostini`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`).
+5. Определяет границы окна Ash через `xrandr` и запускает Chrome с закреплённым набором флагов (`--enable-wayland-server`, `--ozone-platform=x11`, `--no-sandbox`, `--enable-features=Crostini,CroshSWA`, отключённые sync/гаия/аккаунты, `--remote-debugging-port=9222`, `--user-data-dir=/var/lib/ash-profile`, `--login-user`/`--login-profile`).
 6. Когда Chrome вышел — убивает sommelier/Xwayland, ждёт остаточных процессов `chrome` и начинает заново.
 
 ### Дисплейные режимы
@@ -257,12 +257,13 @@ sudo ./scripts/setup-system.sh --user "$USER"
 
 ## Патчи бинарника (applied at build time)
 
-Снапшот патчится в `scripts/build-chrome.sh`. Каждый патч сверяет ожидаемые байты и **падает с ошибкой**, если бинарник не совпал — молчаливо «починить» чужой бинарник нельзя. Исключения: `HasInternalDisplay` помечен `soft` (найдена не во всех снапшотах — просто предупреждение), отсутствие терминального стаба и CSP-строк даёт только warning, а `WaylandDmabufFeedbackManager` пропускается целиком, если символа в этом снапшоте нет.
+Снапшот патчится в `scripts/build-chrome.sh`. Каждый патч сверяет ожидаемые байты и **падает с ошибкой**, если бинарник не совпал — молчаливо «починить» чужой бинарник нельзя. Исключения: `HasInternalDisplay` помечен `soft` (найдена не во всех снапшотах — просто предупреждение), отсутствие терминального стаба и строки CSP даёт только warning, а `WaylandDmabufFeedbackManager` пропускается целиком, если символа в этом снапшоте нет. Если строка дефолтного CSP для `chrome-untrusted` встречается больше одного раза, сборка падает: непонятно, какую из них патчить.
 
 | Патч | Что делает | Без него |
 |---|---|---|
 | Терминальный стаб | `chrome.terminalPrivate.openVmshellProcess(...)` → `eval(localStorage.t||"")` | Terminal SWA пытается стартовать VM-шелл и падает |
 | Расслабление CSP | `'wasm-unsafe-eval'` → `'unsafe-eval'` (5 мест в бинарнике) | инжектированный UI терминала не выполняется |
+| CSP по умолчанию для `chrome-untrusted` | `script-src chrome-untrusted://resources 'self';` → `script-src chrome-untrusted: 'unsafe-eval';` (47 байт, тот же размер) | `eval(localStorage.t)` на crosh бросает EvalError, страница пустая |
 | `DisplayConfigurator::Init` | прыжок через нативную настройку дисплея | крэш на X11 (нет `NativeDisplayDelegate`) |
 | `WaylandDmabufFeedbackManager` | версия 0, dmabuf-пробы пропускаются | зависания/крэш на не-ChromeOS GPU |
 | `RunPendingConfiguration` | `ret` (no-op) | крэш при смене конфигурации дисплея |
@@ -375,7 +376,7 @@ make test             # бриджи на реальной системной ш
 | `/var/lib/ash-profile/bridges.log` | записи watchdog-ов о перезапусках |
 | `/var/lib/ash-profile/xorg.log` | свой Xorg, если поднимал скрипт |
 | `/var/lib/ash-profile/test-user/log/` | `CHROMEOS_SESSION_LOG_DIR` — сюда Chrome складывает `session_log.txt` (диагностика); обычно пуст |
-| `/var/lib/ash-profile/terminal-inject.log` | ход инжекта UI терминала: ожидание CDP, `localStorage`, монтирование страницы |
+| `/var/lib/ash-profile/terminal-inject.log` | ход инжекта UI терминала и crosh: ожидание CDP, `localStorage`, монтирование страниц, закрытие временного окна crosh |
 | `/tmp/xwrap.log` | случаи, когда `libdisplayfix.so` чинил `DISPLAY` |
 | `/tmp/gbm-shim.log` | каждый вызов шима `libminigbm.so` (очищается при старте сессии) |
 | `/tmp/chromeos-linux/shell-stub.log` | вызовы заглушек `vsh` / `crosh` |

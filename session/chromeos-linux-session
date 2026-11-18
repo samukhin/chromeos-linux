@@ -407,7 +407,7 @@ while true; do
     --disable-mojo-broker \
     --enable-wayland-server \
     --wayland-server-socket=wayland-0 \
-    --enable-features=Crostini \
+    --enable-features=Crostini,CroshSWA \
     --disable-features=SamplingProfiler,AccountConsistency,SigninInterception,SampleSystemWebApp,PhoneHub,PhoneHubCameraRoll,PhoneHubNotifications,PhoneHubTaskContinuation,EcheSWA,NearbyShare \
     --disable-sync \
     --disable-gaia-services \
