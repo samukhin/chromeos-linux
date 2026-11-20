@@ -136,6 +136,13 @@ func (t *typecd) SetPeripheralDataAccess(permitted bool) *dbus.Error {
 	return nil
 }
 
+// SetTypeCPortsUsingDisplays(au) -> void; there are no Type-C ports driven by
+// displays here, so accept the list and drop it.
+func (t *typecd) SetPortsUsingDisplays(ports []uint32) *dbus.Error {
+	log.Printf("typecd.SetPortsUsingDisplays: %v (no-op)", ports)
+	return nil
+}
+
 // --- org.chromium.pciguard --------------------------------------------------
 
 type pciguard struct{}

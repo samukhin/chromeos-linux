@@ -528,9 +528,9 @@ func launchApp(app desktopApp) error {
 		"XDG_RUNTIME_DIR=" + xdgRuntimeDir(),
 	}
 	// Overrides go LAST: os/exec de-duplicates env keys in favour of the final
-	// occurrence, so if these came first the inherited DISPLAY=:0 (etc.) from
-	// os.Environ() would win and apps would land on the host X server instead of
-	// the :10 Xwayland they must render into.
+	// occurrence, so if these came first an inherited DISPLAY=:0 (etc.) from
+	// os.Environ() would win and apps would land on some foreign X server
+	// instead of the :10 Xwayland they must render into.
 	cmd.Env = append(os.Environ(), overrides...)
 	if err := cmd.Start(); err != nil {
 		return err

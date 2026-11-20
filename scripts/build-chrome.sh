@@ -3,8 +3,13 @@
 # stock Linux userspace (ported from the Nix `chromefixed` derivation): the
 # binary patches fail loudly when the binary no longer matches, and nothing
 # is patchelf'ed — the snapshot already uses /lib64/ld-linux-x86-64.so.2 and
-# RUNPATH=$ORIGIN, so it runs on a stock userspace as-is, with
-# libdisplayfix.so injected by the launcher.
+# RUNPATH=$ORIGIN, so it runs on a stock userspace as-is.
+#
+# This branch targets Ash directly on DRM/KMS (--ozone-platform=drm). The
+# X11-only patches (DisplayConfigurator::Init, RunPendingConfiguration,
+# HasInternalDisplay, the X11 keyboard engine and the XEvent key fix) are
+# deliberately NOT applied: on DRM the native display delegate must be
+# installed and the real KMS configuration must run.
 #
 # A failed patch prints its whole site — file offset, VA, nearest
 # symbol, code around it, expected vs actual, payload — enough to fix it in
@@ -325,18 +330,11 @@ esac
 # the new bytes, the nearest symbol and the disassembly, so updating is
 # mechanical.
 
-# Site = Init+0xd: `jne <rel8>` — right after `cmpb $1,0x21(this)` — skips
-# the native display config; the patch makes that skip unconditional. The
-# rel8 is a within-function distance: no symbol to derive it from, so it
-# stays a pinned pristine byte (the fixed `mov %rdi,%rbx; cmpb` behind it
-# is pinned too). The payload's 5-byte jmp replaces the 2-byte jne and
-# must land on the same target, so its displacement is computed from that
-# one number (rel8 - 3): expected and payload cannot drift apart.
-init_skip=$((0x47))  # jne displacement, pinned for the current snapshot
-patch_sym "DisplayConfigurator::Init (skip native display config)" \
-  ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display::NativeDisplayDelegate' \
-  "75$(le_hex "$init_skip" 1)4889fb80bf" \
-  "e9$(le_hex $(( init_skip - 3 )) 4)9090" 0xd
+# DisplayConfigurator::Init and RunPendingConfiguration are intentionally left
+# untouched: on DRM, Shell::InitializeDisplayManager() hands the configurator a
+# DrmNativeDisplayDelegate, ForceInitialConfigure() calls its Initialize(), and
+# the real KMS modeset must run. The X11 branch used to patch both of them out
+# because the X11 delegate is null.
 
 # WaylandDmabufFeedbackManager: the patch that used to live here zeroed the
 # version field at this+8 and skipped the gpu::Capabilities probe that fills
@@ -352,26 +350,11 @@ patch_sym "DisplayConfigurator::Init (skip native display config)" \
 #                crash/hang, restore the patch (git restore this file).
 # Original bytes at constructor+0x70 for reference: e8fdd63d08488bb80001000048
 
-patch_sym "RunPendingConfiguration (no-op)" \
-  ' display::DisplayConfigurator::RunPendingConfiguration\(\)' "55" "c3"
-
 patch_sym "RedirectChromeLogging (no-op)" \
   ' ash::RedirectChromeLogging\(base::CommandLine const&\)' "55" "c3"
 
 patch_sym "OnDisconnect (no-op)" \
   ' ash::mojo_service_manager::.*::OnDisconnect\(' "55" "c3"
-
-# HasInternalDisplay() is a white lie that only stays true while
-# internal_display_ids() holds exactly one entry — filled by
-# MaybeInitInternalDisplay(), gated on display::ForceFirstDisplayInternal(),
-# which on a plain Linux host is true only with --use-first-display-as-internal
-# (passed by session/chromeos-linux-session). Without that flag the patched
-# "true" right below makes DisplayManager::OnNativeDisplaysChanged() call
-# Display::InternalDisplayId(), which CHECKs "1u == ids.size()"
-# (display.cc:309): black screen, restart, die. Keep this patch and that flag
-# in sync — it used to be a ForceFirstDisplayInternal patch here instead.
-patch_sym "HasInternalDisplay (returns true)" \
-  ' display::HasInternalDisplay\(\)' "55" "b001c3" soft
 
 # System UI blur (shelf, quick settings, hotseat) is gated on RAM, not GPU:
 # chromeos::features::IsSystemBlurEnabled() is literally
@@ -382,85 +365,6 @@ patch_sym "HasInternalDisplay (returns true)" \
 # Prologue -> "mov $1,%eax; ret" (no push, so the stack stays balanced).
 patch_sym "IsSystemBlurEnabled (always true, blur on any RAM)" \
   ' chromeos::features::IsSystemBlurEnabled\(\)' "55" "b801000000c3"
-
-# --- keyboard layout engine (RU/EN quick-settings chip drives typing) -------
-# OzonePlatformX11::InitializeUI registers StubKeyboardLayoutEngine, whose
-# Lookup always falls back to the hardcoded US layout, and the input
-# controller's SetCurrentLayoutByName is a no-op stub — switching RU/EN in
-# Ash quick settings only moved the tray indicator. Mirror OzonePlatformDrm:
-# build an XkbEvdevCodes converter plus a real XkbKeyboardLayoutEngine in
-# one block, hand it to KeyboardLayoutEngineManager, and forward the input
-# controller's SetCurrentLayoutByName through a thunk to that engine.
-
-ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(')
-
-# Both sites are symbol+constant, so they live here and move with the function
-# on a snapshot bump: the new[] immediate (+0x1af) and the construction site
-# (+0x1b8) that follows it.
-engine_alloc_site=$(( ui_va + 0x1af ))
-engine_site=$(( ui_va + 0x1b8 ))
-
-# new[] size for the combined block: XkbKeyboardLayoutEngine (0xc8, same as
-# the DRM platform) + XkbEvdevCodes (0x10) = 0xd8, was 0x20. Site: the
-# immediate of `mov $0x20,%edi` feeding that new[] call (the
-# StubKeyboardLayoutEngine allocation).
-patch_va "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-  "$engine_alloc_site" "20" "d8"
-
-# Replace the StubKeyboardLayoutEngine construction with a real Xkb engine
-# (XkbEvdevCodes converter at +0xc8, then XkbKeyboardLayoutEngine) stored to
-# 0x20(%rbx), falling through into the existing SetKeyboardLayoutEngine
-# call. The site must start where rax still holds the fresh block and the 37
-# payload bytes must end exactly on the original `mov %r14,%rdi` —
-# InitializeUI+0x1b8 here. Both call displacements are derived from the
-# constructor symbols, never pasted: a dumped blob goes stale on every
-# snapshot bump.
-evdev_va=$(sym_va ' t ui::XkbEvdevCodes::XkbEvdevCodes\(\)')
-kbengine_va=$(sym_va ' t ui::XkbKeyboardLayoutEngine::XkbKeyboardLayoutEngine\(ui::XkbKeyCodeConverter const&\)')
-stubcstr_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::StubKeyboardLayoutEngine\(')
-# expected = the pristine bytes of the site, with its one address-dependent
-# field — the `call StubKeyboardLayoutEngine ctor` at site+6 — derived from
-# the constructor symbol instead of pasted: that rel32 moves on every
-# snapshot bump even when the site itself does not.
-engine_expected="4989c64889c7e8$(le_hex $(( stubcstr_va - engine_site - 11 )) 4)488b43204c8973204885c0740d488b084889c7ff51084c8b7320"
-patch_va "OzonePlatformX11::InitializeUI (real Xkb engine)" \
-  "$engine_site" \
-  "$engine_expected" \
-  "488db8c80000004989c6e8$(rel32_hex "$evdev_va" $((engine_site + 15)))4c89f7498db6c8000000e8$(rel32_hex "$kbengine_va" $((engine_site + 30)))4c8973204c89f7"
-
-# The X11 InitializeUI patch above replaced the stub's construction, so
-# StubKeyboardLayoutEngine::Lookup is never invoked (we run only the X11
-# platform) — dead code, and a free 0x90-byte executable cave for our
-# 26-byte thunk:
-#   mov rax,[keyboard_layout_engine_]; test; je fallback; mov rdi,rax;
-#   mov rax,[rax]; jmp [rax+0x20]  <- XkbKeyboardLayoutEngine::
-#                                     SetCurrentLayoutByName
-#   fallback: jmp the original SetCurrentLayoutByName body.
-# Slot offsets are relative to vptr (= 'vtable for' symbol + 0x10, because
-# offset-to-top + RTTI precede the virtual functions): the jump target is
-# vptr+0x20; vptr+0x30 would be UsesISOLevel5Shift — a silent no-op that
-# never runs the callback, which hid this bug. keyboard_layout_engine_ is a
-# .bss global ('b'), so the RIP-relative load is correct.
-lookup_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::Lookup\(')
-ke_va=$(sym_va ' b ui::KeyboardLayoutEngineManager::keyboard_layout_engine_')
-fallback_va=$(sym_va ' t ui::StubInputController::SetCurrentLayoutByName\(')
-# expected = the pristine prologue the thunk overwrites: push %rbp;
-# mov %rsp,%rbp; mov 0x10(%rdi),%r9; test %r9,%r9; je — fixed instruction
-# bytes, nothing address-dependent (the je's rel8 operand lies outside the
-# 12 pinned).
-patch_va "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
-  "$lookup_va" \
-  "554889e54c8b4f104d85c974" \
-  "488b05$(rel32_hex "$ke_va" $((lookup_va + 7)))4885c074094889c7488b00ff6020e9$(rel32_hex "$fallback_va" $((lookup_va + 26)))"
-
-# Redirect the real StubInputController vtable slot for SetCurrentLayoutByName
-# (vptr+0x80 = 'vtable for' symbol+0x90) to the thunk: find the .rela.dyn
-# record for that slot, verify the whole 24-byte relocation (r_offset,
-# R_X86_64_RELATIVE, addend = the stub body it points at today), write it
-# back with the new addend (the thunk lives at lookup_va).
-sctrl_vt=$(sym_va ' vtable for ui::StubInputController$')
-patch_rela "StubInputController::SetCurrentLayoutByName -> thunk" \
-  "$(( sctrl_vt + 0x90 ))" "$fallback_va" "$lookup_va"
 
 # --- hide demo system web apps from the launcher ---------------------------
 # SystemWebAppManager::CreateInstallOptionsForSystemApp sets
@@ -592,6 +496,17 @@ echo "kept pristine $OUT/libminigbm.so.orig"
   "$ASH_ROOT/scripts/minigbm_shim.c" -ldl
 echo "built minigbm shim -> $OUT/libminigbm.so ($(stat -c%s "$OUT/libminigbm.so") bytes)"
 
+# --- touchpad shim (LD_PRELOAD) -------------------------------------------
+# The generic snapshot has no ChromeOS libgestures/libinput glue, so Ash's
+# evdev backend drops EV_ABS (touchpad) and REL_WHEEL entirely; only REL_X/Y
+# from the TrackPoint survives. This interposer rewrites the touchpad's MT
+# stream into REL_X/REL_Y + tap/click buttons the existing converter already
+# understands. It is preloaded by session/chromeos-linux-session. See
+# scripts/ash_touchpad_shim.c.
+"${CC:-cc}" -shared -fPIC -O2 -o "$OUT/libash-touchpad.so" \
+  "$ASH_ROOT/scripts/ash_touchpad_shim.c" -ldl -pthread -lm
+echo "built touchpad shim -> $OUT/libash-touchpad.so ($(stat -c%s "$OUT/libash-touchpad.so") bytes)"
+
 # --- crashpad handler ------------------------------------------------------
 
 mv "$OUT/chrome_crashpad_handler" "$OUT/chrome_crashpad_handler.real"
@@ -609,30 +524,15 @@ exec "$(dirname "$0")/chrome_crashpad_handler.real" "$@"
 CWRAP
 chmod +x "$OUT/chrome_crashpad_handler"
 
-# --- libdisplayfix + launcher ---------------------------------------------
-
-"${CC:-cc}" -shared -fPIC -Wl,-soname,libdisplayfix.so \
-  -o "$OUT/libdisplayfix.so" "$ASH_ROOT/scripts/displayfix.c"
+# --- launcher --------------------------------------------------------------
 
 cat > "$OUT/chromeos-ash" <<'WRAP'
 #!/usr/bin/env bash
 # Launcher for the patched Ash Chrome binary.
+#
+# DRM mode: Ash owns the KMS display itself, so there is no DISPLAY or
+# XAUTHORITY to set up here. The session script passes --ozone-platform=drm.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Ash is a ChromeOS build: it expects a live X display and a readable cookie.
-if [ -z "${DISPLAY:-}" ]; then
-  export DISPLAY=:0
-fi
-if [ -z "${XAUTHORITY:-}" ] || [ ! -r "${XAUTHORITY:-}" ]; then
-  if [ -r /tmp/ash-xauth ]; then
-    export XAUTHORITY=/tmp/ash-xauth
-  fi
-fi
-
-# The shim back-fills DISPLAY/XAUTHORITY for processes that bypass this
-# wrapper (Chrome re-execs). It is a no-op when the environment is sane.
-export LD_PRELOAD="$HERE/libdisplayfix.so${LD_PRELOAD:+:$LD_PRELOAD}"
-
 exec "$HERE/chrome" "$@"
 WRAP
 chmod +x "$OUT/chromeos-ash"

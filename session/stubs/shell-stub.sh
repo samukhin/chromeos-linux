@@ -17,12 +17,13 @@ mkdir -p "$log_dir" 2>/dev/null || true
 
 cd "$HOME" 2>/dev/null || cd /tmp
 
-# Linux apps must render into the Xwayland/sommeler stack that Ash actually
+# Linux apps must render into the Xwayland/sommelier stack that Ash actually
 # composites, which lives on display :10 (--x-display=10 in chromeos-linux-session).
-# Ash launches these apps inheriting Chrome's own $DISPLAY (the host Xorg, e.g.
-# :1), so without this override their windows go to the host X server and never
-# appear inside the session. Only override when unset/foreign so an app that was
-# deliberately pointed elsewhere keeps its display.
+# In DRM mode Chrome itself has no DISPLAY at all, but an app can still inherit
+# a stale one from the caller, so without this override its windows would go to
+# that foreign X server and never appear inside the session. Only override when
+# unset/foreign so an app that was deliberately pointed elsewhere keeps its
+# display.
 case "${DISPLAY:-}" in
   :10|:10.*) ;;
   *) DISPLAY=:10; export DISPLAY ;;

@@ -31,9 +31,12 @@ for f in chrome chrome_crashpad_handler chrome_crashpad_handler.real \
          chromeos-ash; do
   [ -x "$ASH_ROOT/dist/chrome/$f" ] || fail "dist/chrome/$f missing or not executable"
 done
-for f in libdisplayfix.so libminigbm.so; do
+for f in libminigbm.so libash-touchpad.so; do
   [ -e "$ASH_ROOT/dist/chrome/$f" ] || fail "dist/chrome/$f missing"
 done
+if [ -e "$ASH_ROOT/dist/chrome/libdisplayfix.so" ]; then
+  fail "dist/chrome/libdisplayfix.so present — this is the DRM branch, X11 shim must be gone"
+fi
 if [ -x "$ASH_ROOT/dist/chrome/chromeos-ash" ]; then
   ok "launcher present"
 fi
@@ -162,7 +165,7 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
     # against this small file.
     SYM_CACHE=$(mktemp "${TMPDIR:-/tmp}/ash-verify-syms.XXXXXX")
     nm -C "$CHROME" | awk '
-      /IsSharedImageFormatSupported|GetNativePixmapSupportType|NativePixmapEGLX11Binding::Create|PopulateMappableDrmFormatsForExo|OzonePlatformX11::InitializeUI|XkbEvdevCodes::XkbEvdevCodes|XkbKeyboardLayoutEngine::XkbKeyboardLayoutEngine|StubKeyboardLayoutEngine::Lookup|keyboard_layout_engine_|StubInputController::SetCurrentLayoutByName|StubInputController$|ShouldShowInLauncher|MediaSystemAppDelegate|SampleSystemAppDelegate|HelpAppSystemAppDelegate|CameraSystemAppDelegate|ProjectorSystemWebAppDelegate|MallSystemAppDelegate/ { print }
+      /IsSharedImageFormatSupported|GetNativePixmapSupportType|NativePixmapEGLX11Binding::Create|PopulateMappableDrmFormatsForExo|DisplayConfigurator::Init|RunPendingConfiguration|HasInternalDisplay|ShouldShowInLauncher|MediaSystemAppDelegate|SampleSystemAppDelegate|HelpAppSystemAppDelegate|CameraSystemAppDelegate|ProjectorSystemWebAppDelegate|MallSystemAppDelegate/ { print }
     ' > "$SYM_CACHE" || true
 
     # ENVIRON instead of awk -v: -v would eat the backslashes in \(...\) — the
@@ -223,38 +226,25 @@ if [ -e "$ASH_ROOT/dist/chrome/chrome" ]; then
         "$((pop_va + 0xd0))" eb13
     fi
 
-    # --- keyboard layout: real Xkb engine + forwarding thunk --------------
-    ui_va=$(sym_va ' t ui::\(anonymous namespace\)::OzonePlatformX11::InitializeUI\(')
-    evdev_va=$(sym_va ' t ui::XkbEvdevCodes::XkbEvdevCodes\(\)')
-    kbengine_va=$(sym_va ' t ui::XkbKeyboardLayoutEngine::XkbKeyboardLayoutEngine\(ui::XkbKeyCodeConverter const&\)')
-    if [ -z "$ui_va" ] || [ -z "$evdev_va" ] || [ -z "$kbengine_va" ]; then
-      fail "keyboard layout patches: symbol(s) not found"
-    else
-      check_bytes_va "OzonePlatformX11::InitializeUI (engine block alloc 0xd8)" \
-        "$((ui_va + 0x1af))" d8
-      engine_site=$(( ui_va + 0x1b8 ))
-      engine_expected="488db8c80000004989c6e8$(rel32_hex "$evdev_va" $((engine_site + 15)))4c89f7498db6c8000000e8$(rel32_hex "$kbengine_va" $((engine_site + 30)))4c8973204c89f7"
-      check_bytes_va "OzonePlatformX11::InitializeUI (real Xkb engine)" \
-        "$engine_site" "$engine_expected"
-    fi
-
-    lookup_va=$(sym_va ' t ui::StubKeyboardLayoutEngine::Lookup\(')
-    ke_va=$(sym_va ' b ui::KeyboardLayoutEngineManager::keyboard_layout_engine_')
-    fallback_va=$(sym_va ' t ui::StubInputController::SetCurrentLayoutByName\(')
-    sctrl_vt=$(sym_va ' vtable for ui::StubInputController$')
-    if [ -z "$lookup_va" ] || [ -z "$ke_va" ] || [ -z "$fallback_va" ]; then
-      fail "keyboard layout thunk: symbol(s) not found"
-    else
-      lookup_expected="488b05$(rel32_hex "$ke_va" $((lookup_va + 7)))4885c074094889c7488b00ff6020e9$(rel32_hex "$fallback_va" $((lookup_va + 26)))"
-      check_bytes_va "StubKeyboardLayoutEngine::Lookup (forwarding thunk)" \
-        "$lookup_va" "$lookup_expected"
-    fi
-    if [ -z "$sctrl_vt" ]; then
-      fail "StubInputController vtable not found"
-    elif [ -n "$lookup_va" ]; then
-      check_rela_addend "StubInputController::SetCurrentLayoutByName -> thunk" \
-        "$((sctrl_vt + 0x90))" "$lookup_va"
-    fi
+    # --- DRM: the X11 display patches must NOT be applied -----------------
+    # On DRM, Shell::InitializeDisplayManager() hands the configurator a
+    # DrmNativeDisplayDelegate, ForceInitialConfigure() calls its Initialize(),
+    # and the real KMS modeset must run. The X11 build patched both Init and
+    # RunPendingConfiguration out; if that survives here the screen stays black.
+    # The pinned bytes are main's snapshot (1749431), not stable_drm's
+    # (1670871): the JNE immediate differs between revisions, so this is
+    # the pristine site main's build script used to overwrite.
+    check_patch "DisplayConfigurator::Init is original (native display config enabled)" \
+      ' display::DisplayConfigurator::Init\(std::__Cr::unique_ptr<display::NativeDisplayDelegate' \
+      0xd 75474889fb80bf
+    check_patch "RunPendingConfiguration is original (push %rbp)" \
+      ' display::DisplayConfigurator::RunPendingConfiguration\(\)' \
+      0 55
+    # HasInternalDisplay must be the real function; forcing it true without
+    # --use-first-display-as-internal would CHECK in Display::InternalDisplayId.
+    check_patch "HasInternalDisplay is original (push %rbp; mov %rsp,%rbp)" \
+      ' display::HasInternalDisplay\(\)' \
+      0 554889
 
     # --- hide demo system web apps from the launcher ----------------------
     swa_false=$(sym_va ' t EcheSystemAppDelegate::ShouldShowInLauncher\(\) const')
@@ -327,6 +317,13 @@ for s in start-session.sh chromeos-linux-session terminal-inject.pl chromeos-ash
     fail "session/$s missing"
   fi
 done
+# Without gles-egl, ANGLE's default GLX backend cannot initialize on a VT
+# (no DISPLAY), the GPU process dies and Viz aborts the browser.
+if grep -q -- '--use-angle=gles-egl' "$ASH_ROOT/session/chromeos-linux-session"; then
+  ok "DRM session forces ANGLE gles-egl backend"
+else
+  fail "session/chromeos-linux-session missing --use-angle=gles-egl (GPU init fails without DISPLAY)"
+fi
 
 echo "== dbus policy =="
 # dbus < 1.15 refuses unknown attributes (e.g. receive_sender_prefix) and then
